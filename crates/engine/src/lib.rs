@@ -251,6 +251,7 @@ pub mod recovery;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
+pub mod scalar_float;
 pub mod scoring_boost;
 pub mod search_engine;
 pub mod sparse;
@@ -260,6 +261,7 @@ pub mod storage;
 pub mod tenant;
 pub mod tiering;
 pub mod txn;
+pub mod uuid;
 pub mod wasm_udf;
 
 /// テスト専用の共通ヘルパ群（Issue #173）。`#[cfg(test)]` 限定・非公開のため

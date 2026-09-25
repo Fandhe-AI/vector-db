@@ -1,0 +1,809 @@
+//! 新スカラー型（`INTEGER`/`BIGINT`/`REAL`/`DOUBLE PRECISION`/`NUMERIC`/`DATE`/
+//! `TIMESTAMP`）の `SUM`/`AVG`/`MIN`/`MAX` 集計・`22003` オーバーフロー契約
+//! （Issue #892）の結合テスト。ポインタ: `docs/spec/04-behavior/table-schema.md`
+//! TABLE-13・`docs/spec/04-behavior/sql-surface.md` SQL-13・SQL-14・
+//! `docs/spec/05-tasks.md` TASK-166・TASK-167・TASK-196・TASK-197。
+//!
+//! `EngineCore::execute_sql`（SQL 経由の集計実行経路。`sql::aggregate`・
+//! `sql::group_by`）を通した既存の集計テスト（`tests/sql_aggregate.rs`・
+//! `tests/sql_group_by.rs`）と同じ流儀（`unique_db_path`＋`CleanupGuard`）で
+//! 検証する。
+
+use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::EngineCore;
+use engine::kernel::CpuScalarProvider;
+use engine::numeric::Decimal;
+use engine::policy::PolicyContext;
+use engine::sql::exec::Cell;
+use engine::sql::mode::SessionState;
+use engine::storage::{Storage, Visibility};
+
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
+
+const TABLE: &str = "docs";
+
+fn schema() -> TableSchema {
+    TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("lang", ColumnType::Text, false),
+            ColumnDef::new("n", ColumnType::Integer, true),
+            ColumnDef::new("b", ColumnType::BigInt, true),
+            ColumnDef::new("r", ColumnType::Real, true),
+            ColumnDef::new("d", ColumnType::Double, true),
+            ColumnDef::new(
+                "price",
+                ColumnType::Numeric {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+            ColumnDef::new("day", ColumnType::Date, true),
+            ColumnDef::new("at", ColumnType::Timestamp, true),
+        ],
+    )
+}
+
+fn new_core() -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("aggregate-scalar-types");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        path,
+    )
+}
+
+fn ctx_for(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+/// `n`/`b`/`r`/`d`/`price`/`day`/`at` のすべてに値を入れる行を挿入する
+/// （NULL にしたい列は呼び出し元が別の SQL を組み立てる）。
+#[allow(clippy::too_many_arguments)]
+fn insert_full_row(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    id: u64,
+    lang: &str,
+    n: i32,
+    b: i64,
+    r: f32,
+    d: f64,
+    price: &str,
+    day: &str,
+    at: &str,
+    op_id: &str,
+) {
+    core.execute_sql_in_session(
+        ctx,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, n, b, r, d, price, day, at) VALUES \
+             ({id}, '[0.1,0.2]', '{lang}', {n}, {b}, {r}, {d}, {price}, '{day}', '{at}') \
+             USING OPERATION_ID '{op_id}'"
+        ),
+    )
+    .expect("insert should succeed");
+}
+
+fn insert_null_row(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str, op_id: &str) {
+    core.execute_sql_in_session(
+        ctx,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang) VALUES ({id}, '[0.1,0.2]', '{lang}') \
+             USING OPERATION_ID '{op_id}'"
+        ),
+    )
+    .expect("insert with all-NULL optional columns should succeed");
+}
+
+// --- 22003: SUM(INTEGER/BIGINT) の桁あふれ ----------------------------------
+
+#[test]
+fn sum_bigint_overflow_is_22003() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    insert_full_row(
+        &core,
+        &alice,
+        1,
+        "ja",
+        1,
+        i64::MAX,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-1",
+    );
+    insert_full_row(
+        &core,
+        &alice,
+        2,
+        "ja",
+        1,
+        1,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-2",
+    );
+
+    let err = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22003");
+}
+
+/// `SUM(INTEGER)` は `i32` の範囲を超えても、`BIGINT` 相当（`i64`）に収まれば
+/// 成功する（D2: 部分和が `i64` を超えても最終値が収まれば成功する契約とは
+/// 別に、まず `INTEGER` 単体の値自体が `i32` 範囲でも合計は `i64` として
+/// 扱われることを固定する）。
+#[test]
+fn sum_integer_multi_row_widens_beyond_i32_range() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    for i in 0..3u64 {
+        insert_full_row(
+            &core,
+            &alice,
+            i + 1,
+            "ja",
+            i32::MAX,
+            1,
+            1.0,
+            1.0,
+            "1.00",
+            "2024-01-01",
+            "2024-01-01 00:00:00",
+            &format!("op-{i}"),
+        );
+    }
+
+    let result = core
+        .execute_sql(&alice, &format!("SELECT SUM(n) FROM {TABLE}"))
+        .expect("SUM(INTEGER) exceeding i32 range but within i64 must succeed");
+    assert_eq!(
+        result.rows[0].cells,
+        vec![Cell::SignedInteger(3 * i64::from(i32::MAX))]
+    );
+}
+
+/// `SUM(<BIGINT>)` の部分和が一時的に `i64` を超えても、最終値が `i64` に
+/// 収まれば成功する（D2 の中核契約。累積は `i128` で行う）。
+#[test]
+fn sum_bigint_transient_overflow_of_partial_sum_still_succeeds_if_final_value_fits() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    insert_full_row(
+        &core,
+        &alice,
+        1,
+        "ja",
+        1,
+        i64::MAX,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-1",
+    );
+    insert_full_row(
+        &core,
+        &alice,
+        2,
+        "ja",
+        1,
+        1,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-2",
+    );
+    insert_full_row(
+        &core,
+        &alice,
+        3,
+        "ja",
+        1,
+        -1,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-3",
+    );
+
+    let result = core
+        .execute_sql(&alice, &format!("SELECT SUM(b) FROM {TABLE}"))
+        .expect("transient overflow of the partial sum must not fail if the final value fits");
+    assert_eq!(result.rows[0].cells, vec![Cell::SignedInteger(i64::MAX)]);
+}
+
+// --- 22003: SUM/AVG(NUMERIC) の 38 桁上限 -----------------------------------
+
+#[test]
+fn sum_numeric_exceeding_38_digits_is_22003() {
+    let path = unique_db_path("aggregate-numeric-overflow");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new(
+                "amount",
+                ColumnType::Numeric {
+                    precision: 38,
+                    scale: 0,
+                },
+                true,
+            ),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let alice = ctx_for("alice");
+
+    let max38 = "9".repeat(38);
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, amount) VALUES (1, '[0.1,0.2]', {max38}) \
+             USING OPERATION_ID 'op-1'"
+        ),
+    )
+    .expect("insert boundary value should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, amount) VALUES (2, '[0.1,0.2]', 1) \
+             USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert should succeed");
+
+    let err = core
+        .execute_sql(&alice, &format!("SELECT SUM(amount) FROM {TABLE}"))
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22003");
+}
+
+// --- AVG の丸め ---------------------------------------------------------
+
+#[test]
+fn avg_integer_divides_and_returns_float() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    insert_full_row(
+        &core,
+        &alice,
+        1,
+        "ja",
+        1,
+        1,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-1",
+    );
+    insert_full_row(
+        &core,
+        &alice,
+        2,
+        "ja",
+        2,
+        1,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-2",
+    );
+
+    let result = core
+        .execute_sql(&alice, &format!("SELECT AVG(n) FROM {TABLE}"))
+        .expect("AVG(INTEGER) must succeed");
+    assert_eq!(result.rows[0].cells, vec![Cell::Float(1.5)]);
+}
+
+/// `AVG(NUMERIC(p,s))` の丸めは half away from zero（D6）。割り切れない値・
+/// 負の値の丸め方向を固定する。
+#[test]
+fn avg_numeric_rounds_half_away_from_zero_including_negative_values() {
+    let path = unique_db_path("aggregate-numeric-avg-rounding");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    // `NUMERIC(38, 2)`: 整数部が 36 桁を占めるため、AVG の結果 scale は
+    // `max(2, min(16, 38-36)) = 2`（列の scale のまま拡張されない）。丸めが
+    // 実際に発生するケースを検証しやすくするため、あえてこの組み合わせを選ぶ
+    // （`NUMERIC(p, s)` で `p - s` が大きいほど AVG の結果 scale は列の scale
+    // に近づく。D6）。
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new(
+                "amount",
+                ColumnType::Numeric {
+                    precision: 38,
+                    scale: 2,
+                },
+                true,
+            ),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let alice = ctx_for("alice");
+
+    // 0.05 / 2 = 0.025 → half away from zero で 0.03。
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, amount) VALUES (1, '[0.1,0.2]', 0.05) \
+             USING OPERATION_ID 'op-1'"
+        ),
+    )
+    .expect("insert should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, amount) VALUES (2, '[0.1,0.2]', 0.00) \
+             USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert should succeed");
+
+    let result = core
+        .execute_sql(&alice, &format!("SELECT AVG(amount) FROM {TABLE}"))
+        .expect("AVG(NUMERIC) must succeed");
+    let expected = Decimal::from_parts(3, 2).expect("valid decimal");
+    assert_eq!(result.rows[0].cells, vec![Cell::Numeric(expected)]);
+
+    // 負の値も絶対値が大きい方へ丸める: -0.05 / 2 = -0.025 → -0.03。
+    let path2 = unique_db_path("aggregate-numeric-avg-rounding-negative");
+    let _cleanup2 = CleanupGuard(path2.clone());
+    let storage2 = Storage::open(&path2).expect("open storage");
+    storage2.create_table(&schema).expect("create table");
+    let core2 = EngineCore::from_storage(storage2, Box::new(CpuScalarProvider));
+    core2
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, amount) VALUES (1, '[0.1,0.2]', -0.05) \
+                 USING OPERATION_ID 'op-1'"
+            ),
+        )
+        .expect("insert should succeed");
+    core2
+        .execute_sql_in_session(
+            &alice,
+            &mut SessionState::default(),
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, amount) VALUES (2, '[0.1,0.2]', 0.00) \
+                 USING OPERATION_ID 'op-2'"
+            ),
+        )
+        .expect("insert should succeed");
+
+    let negative_result = core2
+        .execute_sql(&alice, &format!("SELECT AVG(amount) FROM {TABLE}"))
+        .expect("AVG(NUMERIC) must succeed");
+    let expected_negative = Decimal::from_parts(-3, 2).expect("valid decimal");
+    assert_eq!(
+        negative_result.rows[0].cells,
+        vec![Cell::Numeric(expected_negative)]
+    );
+}
+
+// --- MIN/MAX: 型ごとの順序・NULL 無視・空集合 --------------------------------
+
+#[test]
+fn min_max_skip_null_rows_and_empty_set_is_null_for_all_new_types() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    insert_full_row(
+        &core,
+        &alice,
+        1,
+        "ja",
+        -5,
+        -50,
+        -1.5,
+        -2.5,
+        "-1.50",
+        "2020-01-01",
+        "2020-01-01 00:00:00",
+        "op-1",
+    );
+    insert_full_row(
+        &core,
+        &alice,
+        2,
+        "ja",
+        10,
+        100,
+        3.5,
+        4.5,
+        "3.50",
+        "2025-06-15",
+        "2025-06-15 12:00:00",
+        "op-2",
+    );
+    // NULL 行（すべての新型列が NULL）は MIN/MAX に一切影響しない。
+    insert_null_row(&core, &alice, 3, "ja", "op-3");
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT MIN(n), MAX(n), MIN(b), MAX(b), MIN(r), MAX(r), MIN(d), MAX(d), \
+                 MIN(price), MAX(price), MIN(day), MAX(day), MIN(at), MAX(at) FROM {TABLE}"
+            ),
+        )
+        .expect("MIN/MAX over all new types must succeed");
+    assert_eq!(
+        result.rows[0].cells,
+        vec![
+            Cell::SignedInteger(-5),
+            Cell::SignedInteger(10),
+            Cell::SignedInteger(-50),
+            Cell::SignedInteger(100),
+            Cell::Float(-1.5),
+            Cell::Float(3.5),
+            Cell::Float(-2.5),
+            Cell::Float(4.5),
+            Cell::Numeric(Decimal::from_parts(-150, 2).expect("valid decimal")),
+            Cell::Numeric(Decimal::from_parts(350, 2).expect("valid decimal")),
+            Cell::Date(engine::datetime::parse_date("2020-01-01").expect("valid date")),
+            Cell::Date(engine::datetime::parse_date("2025-06-15").expect("valid date")),
+            Cell::Timestamp(
+                engine::datetime::parse_timestamp("2020-01-01 00:00:00").expect("valid ts")
+            ),
+            Cell::Timestamp(
+                engine::datetime::parse_timestamp("2025-06-15 12:00:00").expect("valid ts")
+            ),
+        ]
+    );
+
+    // 空集合（可視行が 0 件）はすべて NULL。
+    let empty = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT SUM(n), MIN(price), MAX(at) FROM {TABLE} WHERE id = 999"),
+        )
+        .expect("aggregates over an empty result set must still succeed");
+    assert_eq!(
+        empty.rows[0].cells,
+        vec![Cell::Null, Cell::Null, Cell::Null]
+    );
+}
+
+#[test]
+fn count_new_scalar_types_ignores_null_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    insert_full_row(
+        &core,
+        &alice,
+        1,
+        "ja",
+        1,
+        1,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-1",
+    );
+    insert_null_row(&core, &alice, 2, "ja", "op-2");
+
+    let result = core
+        .execute_sql(&alice, &format!("SELECT COUNT(n) FROM {TABLE}"))
+        .expect("COUNT(INTEGER) must succeed");
+    assert_eq!(result.rows[0].cells, vec![Cell::Integer(1)]);
+}
+
+// --- RLS: 他テナント行が集計へ影響しない -------------------------------------
+
+#[test]
+fn rls_isolation_holds_for_sum_min_max_on_new_scalar_types() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    let bob = ctx_for("bob");
+
+    insert_full_row(
+        &core,
+        &alice,
+        1,
+        "ja",
+        1,
+        1,
+        1.0,
+        1.0,
+        "1.00",
+        "2024-01-01",
+        "2024-01-01 00:00:00",
+        "op-1",
+    );
+    insert_full_row(
+        &core,
+        &bob,
+        2,
+        "ja",
+        1000,
+        1000,
+        1000.0,
+        1000.0,
+        "1000.00",
+        "2030-01-01",
+        "2030-01-01 00:00:00",
+        "op-2",
+    );
+
+    let alice_sum = core
+        .execute_sql(&alice, &format!("SELECT SUM(n) FROM {TABLE}"))
+        .expect("alice SUM must succeed");
+    assert_eq!(alice_sum.rows[0].cells, vec![Cell::SignedInteger(1)]);
+
+    let alice_max_price = core
+        .execute_sql(&alice, &format!("SELECT MAX(price) FROM {TABLE}"))
+        .expect("alice MAX(price) must succeed");
+    assert_eq!(
+        alice_max_price.rows[0].cells,
+        vec![Cell::Numeric(
+            Decimal::from_parts(100, 2).expect("valid decimal")
+        )]
+    );
+
+    // 他テナント行を挿入する前後で、bob 不可視のクエリ応答は変わらない
+    // （空集合の応答が他テナント行の有無で変わらない。RLS-9・RLS-10）。
+    let carol = ctx_for("carol");
+    let carol_sum = core
+        .execute_sql(&carol, &format!("SELECT SUM(n) FROM {TABLE}"))
+        .expect("carol SUM over an empty visible set must succeed");
+    assert_eq!(carol_sum.rows[0].cells, vec![Cell::Null]);
+}
+
+// --- GROUP BY: 新スカラー型の集計・HAVING・ORDER BY -------------------------
+
+fn group_by_schema() -> TableSchema {
+    TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("lang", ColumnType::Text, false),
+            ColumnDef::new("n", ColumnType::Integer, true),
+            ColumnDef::new(
+                "price",
+                ColumnType::Numeric {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+        ],
+    )
+}
+
+fn new_group_by_core() -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path("aggregate-scalar-types-group-by");
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&group_by_schema())
+        .expect("create table");
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        path,
+    )
+}
+
+fn insert_group_by_row(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    id: u64,
+    lang: &str,
+    n: i32,
+    price: &str,
+    op_id: &str,
+) {
+    core.execute_sql_in_session(
+        ctx,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, n, price) VALUES \
+             ({id}, '[0.1,0.2]', '{lang}', {n}, {price}) USING OPERATION_ID '{op_id}'"
+        ),
+    )
+    .expect("insert should succeed");
+}
+
+#[test]
+fn group_by_sum_avg_min_per_group_matches_oracle() {
+    let (core, path) = new_group_by_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    insert_group_by_row(&core, &alice, 1, "ja", 1, "1.00", "op-1");
+    insert_group_by_row(&core, &alice, 2, "ja", 3, "3.00", "op-2");
+    insert_group_by_row(&core, &alice, 3, "en", 10, "10.00", "op-3");
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!(
+                "SELECT lang, SUM(n) AS s, MIN(n) AS mn FROM {TABLE} GROUP BY lang \
+                 ORDER BY lang"
+            ),
+        )
+        .expect("GROUP BY with SUM/MIN(INTEGER) must succeed");
+    assert_eq!(result.rows.len(), 2);
+    // `ORDER BY lang` 昇順: "en" < "ja"。
+    assert_eq!(
+        result.rows[0].cells,
+        vec![
+            Cell::Text("en".to_string()),
+            Cell::SignedInteger(10),
+            Cell::SignedInteger(10),
+        ]
+    );
+    assert_eq!(
+        result.rows[1].cells,
+        vec![
+            Cell::Text("ja".to_string()),
+            Cell::SignedInteger(4),
+            Cell::SignedInteger(1),
+        ]
+    );
+}
+
+/// `HAVING SUM(n) > 10` がグループを実際に絞ることを固定する（0 件への退行を
+/// 検出する目的の非 vacuous アサーション）。
+#[test]
+fn group_by_having_on_integer_sum_actually_filters_groups() {
+    let (core, path) = new_group_by_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    insert_group_by_row(&core, &alice, 1, "ja", 1, "1.00", "op-1");
+    insert_group_by_row(&core, &alice, 2, "en", 100, "100.00", "op-2");
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT lang, SUM(n) AS s FROM {TABLE} GROUP BY lang HAVING s > 10"),
+        )
+        .expect("HAVING on SignedInteger sum must succeed");
+    assert_eq!(result.rows.len(), 1, "HAVING must filter out the ja group");
+    assert_eq!(
+        result.rows[0].cells,
+        vec![Cell::Text("en".to_string()), Cell::SignedInteger(100)]
+    );
+}
+
+/// `HAVING` は `Cell::Numeric`（`NUMERIC` 型集計結果）を対象にできない
+/// （D8。`f64` リテラルとの厳密な数値比較に意味論が無いため fail-closed に
+/// `22000`）。
+#[test]
+fn having_on_numeric_aggregate_is_rejected_with_22000() {
+    let (core, path) = new_group_by_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+    insert_group_by_row(&core, &alice, 1, "ja", 1, "1.00", "op-1");
+
+    let err = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT lang, SUM(price) AS s FROM {TABLE} GROUP BY lang HAVING s > 1"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22000");
+}
+
+/// `ORDER BY SUM(n)` が実際に並び替えることを固定する（D9。追加した
+/// `Cell::SignedInteger` の `cmp_cell_values` 対応が欠けていると常に `Equal`
+/// へ落ちて並び替えが黙って効かなくなる）。
+#[test]
+fn group_by_order_by_signed_integer_sum_actually_sorts() {
+    let (core, path) = new_group_by_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    insert_group_by_row(&core, &alice, 1, "a", 5, "1.00", "op-1");
+    insert_group_by_row(&core, &alice, 2, "b", 100, "1.00", "op-2");
+    insert_group_by_row(&core, &alice, 3, "c", 1, "1.00", "op-3");
+
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT lang, SUM(n) AS s FROM {TABLE} GROUP BY lang ORDER BY s DESC"),
+        )
+        .expect("ORDER BY on SignedInteger sum must succeed");
+    let langs: Vec<&Cell> = result.rows.iter().map(|r| &r.cells[0]).collect();
+    assert_eq!(
+        langs,
+        vec![
+            &Cell::Text("b".to_string()),
+            &Cell::Text("a".to_string()),
+            &Cell::Text("c".to_string()),
+        ]
+    );
+}
+
+// --- スカラー列二次索引の候補削減経路（Issue #475）との整合 ------------------
+
+/// `WHERE lang = 'ja'` 付きの `SUM(n)` を 2 回実行し（cold＝索引未構築・
+/// hot＝索引ヒット）、全行走査のオラクルと一致することを固定する
+/// （Issue #475 の索引経路が集計値を変えないことの回帰検出）。
+#[test]
+fn scalar_index_warm_path_sum_matches_full_scan_oracle() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice");
+
+    for i in 0..5u64 {
+        let lang = if i % 2 == 0 { "ja" } else { "en" };
+        insert_full_row(
+            &core,
+            &alice,
+            i + 1,
+            lang,
+            i as i32 + 1,
+            1,
+            1.0,
+            1.0,
+            "1.00",
+            "2024-01-01",
+            "2024-01-01 00:00:00",
+            &format!("op-{i}"),
+        );
+    }
+
+    // オラクル: ja 行は id=1(n=1),3(n=3),5(n=5) → sum=9。
+    for _ in 0..2 {
+        let result = core
+            .execute_sql(
+                &alice,
+                &format!("SELECT SUM(n) FROM {TABLE} WHERE lang = 'ja'"),
+            )
+            .expect("WHERE lang = 'ja' with SUM(n) must succeed on both cold and hot runs");
+        assert_eq!(result.rows[0].cells, vec![Cell::SignedInteger(9)]);
+    }
+}

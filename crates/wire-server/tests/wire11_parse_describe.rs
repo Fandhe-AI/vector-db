@@ -1,5 +1,5 @@
-//! 拡張クエリプロトコルの Parse（'P'）・Describe（'D' 種別 S）の結合テスト
-//! （Issue #933・TASK-71・WIRE-11。`crate::extended_query` が受理する経路）。
+//! 拡張クエリプロトコルの Parse（'P'）・Describe（'D' 種別 S・P）の結合テスト
+//! （Issue #933・#934・TASK-71・WIRE-11。`crate::extended_query` が受理する経路）。
 //!
 //! `engine: None`（`handle_connection_bounded` 経由の後方互換パス）での
 //! Parse・Describe が従来どおり `0A000` + 切断のまま（`crate::extended_query`
@@ -10,6 +10,15 @@
 //! した場合の `RowDescription` と列名が一致すること（受け入れ条件 3）と、
 //! Parse／Describe が実行を伴わない（受け入れ条件 1・簡易クエリ経路の挙動が
 //! 不変であること。受け入れ条件 4）を検証する。
+//!
+//! Issue #934 で Bind／Execute／Sync／Close／Flush が受理されるようになった
+//! ことに伴い、Parse／Describe のエラーはもはや接続を閉じず、ErrorResponse
+//! 送出後は Sync（'S'）まで後続メッセージを読み捨てて `ReadyForQuery` を
+//! 返す「同期回復」へ収束する（`crate::extended_query` モジュールドキュメント
+//! 「エラー後の同期回復」節）。本ファイルの `*_and_recovers` 系テストは
+//! [`assert_error_then_recovers`] でこの契約を固定する。Bind／Execute／
+//! Sync／Close／Flush 自体の受理・実行契約は `tests/wire11_bind_execute_sync.rs`
+//! が担う。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -88,10 +97,34 @@ fn assert_error_response(stream: &mut std::net::TcpStream, expected_sqlstate: &s
     );
 }
 
+/// Issue #934 以降、本ファイルの Parse／Describe エラーは同期回復
+/// （[`assert_error_then_recovers`]）に収束したため直接は使わないが、フレーム
+/// 違反（malformed frame）系の回帰確認に備えて残す。
+#[allow(dead_code)]
 fn assert_connection_closed(stream: &mut std::net::TcpStream) {
     let mut buf = [0u8; 1];
     let n = stream.read(&mut buf).unwrap_or(0);
     assert_eq!(n, 0, "connection must be closed");
+}
+
+/// ErrorResponse を読んだうえで、Sync（'S'）を送って `ReadyForQuery`（'Z'）が
+/// 返ること（＝接続が維持されたまま同期回復すること）を確認する（Issue #934。
+/// モジュールドキュメント「エラー後の同期回復」節）。回復後に簡易クエリが
+/// 通ることまで確認し、接続が実運用可能な状態のまま戻っていることを固定する。
+fn assert_error_then_recovers(stream: &mut std::net::TcpStream, expected_sqlstate: &str) {
+    assert_error_response(stream, expected_sqlstate);
+    send_length_prefixed_message(stream, b'S', b"");
+    let (kind, body) = read_message(stream);
+    assert_eq!(kind, b'Z', "expected ReadyForQuery after Sync");
+    assert_eq!(body, [b'I'], "ReadyForQuery status byte");
+
+    send_simple_query(stream, "SELECT id FROM documents LIMIT 1");
+    loop {
+        let (kind, _) = read_message(stream);
+        if kind == b'Z' {
+            break;
+        }
+    }
 }
 
 /// 許可リスト検証を通過する SQL への Parse は `'1'`（ParseComplete）を返す。
@@ -232,10 +265,10 @@ fn simple_query_response_is_unchanged_when_interleaved_with_parse_and_describe()
     stream.shutdown(Shutdown::Write).ok();
 }
 
-/// 許可リスト外の SQL（`$1` を含む文）は Parse 時点で `42601` を返し接続を
-/// 閉じる（同期回復未実装の暫定契約。モジュールドキュメント参照）。
+/// 許可リスト外の SQL（`$1` を含む文）は Parse 時点で `42601` を返し、Sync で
+/// 同期回復する（Issue #934。モジュールドキュメント参照）。
 #[test]
-fn parse_of_disallowed_sql_returns_42601_and_closes() {
+fn parse_of_disallowed_sql_returns_42601_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
@@ -243,13 +276,12 @@ fn parse_of_disallowed_sql_returns_42601_and_closes() {
 
     let body = parse_body("", "SELECT id FROM documents WHERE id = $1", 0);
     send_length_prefixed_message(&mut stream, b'P', &body);
-    assert_error_response(&mut stream, "42601");
-    assert_connection_closed(&mut stream);
+    assert_error_then_recovers(&mut stream, "42601");
 }
 
-/// 未存在テーブルへの Parse は `42P01` を返し接続を閉じる。
+/// 未存在テーブルへの Parse は `42P01` を返し、Sync で同期回復する。
 #[test]
-fn parse_of_undefined_table_returns_42p01_and_closes() {
+fn parse_of_undefined_table_returns_42p01_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
@@ -257,14 +289,13 @@ fn parse_of_undefined_table_returns_42p01_and_closes() {
 
     let body = parse_body("", "SELECT id FROM missing_table LIMIT 1", 0);
     send_length_prefixed_message(&mut stream, b'P', &body);
-    assert_error_response(&mut stream, "42P01");
-    assert_connection_closed(&mut stream);
+    assert_error_then_recovers(&mut stream, "42P01");
 }
 
-/// パラメータ型宣言（`num_param_types > 0`）は `0A000` で拒否される
-/// （`$n` 束縛は WIRE-12・#935 の担当）。
+/// パラメータ型宣言（`num_param_types > 0`）は `0A000` で拒否され、Sync で
+/// 同期回復する（`$n` 束縛は WIRE-12・#935 の担当）。
 #[test]
-fn parse_with_declared_param_types_returns_0a000_and_closes() {
+fn parse_with_declared_param_types_returns_0a000_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
@@ -273,13 +304,12 @@ fn parse_with_declared_param_types_returns_0a000_and_closes() {
     let mut body = parse_body("", "SELECT id FROM documents LIMIT 1", 1);
     body.extend_from_slice(&23i32.to_be_bytes()); // int4 OID（値自体は読み捨てられる）
     send_length_prefixed_message(&mut stream, b'P', &body);
-    assert_error_response(&mut stream, "0A000");
-    assert_connection_closed(&mut stream);
+    assert_error_then_recovers(&mut stream, "0A000");
 }
 
-/// 名前付きステートメントの重複 Parse は `08P01` で拒否される。
+/// 名前付きステートメントの重複 Parse は `08P01` で拒否され、Sync で同期回復する。
 #[test]
-fn duplicate_named_statement_returns_08p01_and_closes() {
+fn duplicate_named_statement_returns_08p01_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
@@ -291,41 +321,40 @@ fn duplicate_named_statement_returns_08p01_and_closes() {
     assert_eq!(kind, b'1');
 
     send_length_prefixed_message(&mut stream, b'P', &parse_body("dup", sql, 0));
-    assert_error_response(&mut stream, "08P01");
-    assert_connection_closed(&mut stream);
+    assert_error_then_recovers(&mut stream, "08P01");
 }
 
 /// 未定義のステートメント名への Describe は `08P01` で拒否される。
 #[test]
-fn describe_of_unknown_statement_returns_08p01_and_closes() {
+fn describe_of_unknown_statement_returns_08p01_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     send_length_prefixed_message(&mut stream, b'D', &describe_body(b'S', "never-parsed"));
-    assert_error_response(&mut stream, "08P01");
-    assert_connection_closed(&mut stream);
+    assert_error_then_recovers(&mut stream, "08P01");
 }
 
-/// Describe の対象が portal（種別 'P'）の場合は `0A000` で拒否される（portal
-/// はこの Issue の範囲では構築され得ない）。
+/// Describe の対象が未定義の portal（種別 'P'）の場合は `08P01` で拒否され、
+/// Sync で同期回復する（Issue #934 で portal 対象の Describe 自体は受理される
+/// ようになった。portal の構築〔Bind〕・実行契約は `tests/
+/// wire11_bind_execute_sync.rs` の担当）。
 #[test]
-fn describe_of_portal_returns_0a000_and_closes() {
+fn describe_of_unknown_portal_returns_08p01_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
     send_length_prefixed_message(&mut stream, b'D', &describe_body(b'P', ""));
-    assert_error_response(&mut stream, "0A000");
-    assert_connection_closed(&mut stream);
+    assert_error_then_recovers(&mut stream, "08P01");
 }
 
 /// 名前付きステートメントを上限（`MAX_PREPARED_STATEMENTS_PER_SESSION`＝64）
-/// まで Parse できるが、65 件目は `54000` で拒否される。
+/// まで Parse できるが、65 件目は `54000` で拒否され、Sync で同期回復する。
 #[test]
-fn exceeding_named_statement_limit_returns_54000_and_closes() {
+fn exceeding_named_statement_limit_returns_54000_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
@@ -340,14 +369,13 @@ fn exceeding_named_statement_limit_returns_54000_and_closes() {
     }
 
     send_length_prefixed_message(&mut stream, b'P', &parse_body("s64", sql, 0));
-    assert_error_response(&mut stream, "54000");
-    assert_connection_closed(&mut stream);
+    assert_error_then_recovers(&mut stream, "54000");
 }
 
 /// ステートメント名がバイト長上限（`MAX_STATEMENT_NAME_LEN`＝63）を超えると
-/// `54000` で拒否される。
+/// `54000` で拒否され、Sync で同期回復する。
 #[test]
-fn statement_name_too_long_returns_54000_and_closes() {
+fn statement_name_too_long_returns_54000_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
@@ -356,13 +384,14 @@ fn statement_name_too_long_returns_54000_and_closes() {
     let long_name = "a".repeat(64);
     let body = parse_body(&long_name, "SELECT id FROM documents LIMIT 1", 0);
     send_length_prefixed_message(&mut stream, b'P', &body);
-    assert_error_response(&mut stream, "54000");
-    assert_connection_closed(&mut stream);
+    assert_error_then_recovers(&mut stream, "54000");
 }
 
-/// Parse の body 構造不正（NUL 終端欠落）は `08P01` で拒否される。
+/// Parse の body 構造不正（NUL 終端欠落）は `08P01` で拒否され、Sync で
+/// 同期回復する（body 自体はメッセージ境界確定後に判明する不正のため回復可能。
+/// モジュールドキュメント「エラー後の同期回復」節参照）。
 #[test]
-fn malformed_parse_body_returns_08p01_and_closes() {
+fn malformed_parse_body_returns_08p01_and_recovers() {
     let (core, _guard) = new_core_with_documents_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
@@ -370,25 +399,7 @@ fn malformed_parse_body_returns_08p01_and_closes() {
 
     // 終端 NUL の無い名前だけを送る（クエリ文字列・パラメータ件数が続かない）。
     send_length_prefixed_message(&mut stream, b'P', b"no-nul-terminator");
-    assert_error_response(&mut stream, "08P01");
-    assert_connection_closed(&mut stream);
-}
-
-/// Bind（'B'）・Execute（'E'）・Sync（'S'）・Close（'C'）・Flush（'H'）は
-/// engine 接続済みでも従来どおり `0A000` + 切断のまま（WIRE-8 の対象。本 Issue
-/// では受理範囲を広げない）。
-#[test]
-fn bind_execute_sync_close_flush_are_still_rejected_and_closed_with_engine() {
-    let (core, _guard) = new_core_with_documents_table();
-    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-
-    for type_byte in *b"BESCH" {
-        let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
-        let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
-        send_length_prefixed_message(&mut stream, type_byte, b"");
-        assert_error_response(&mut stream, "0A000");
-        assert_connection_closed(&mut stream);
-    }
+    assert_error_then_recovers(&mut stream, "08P01");
 }
 
 /// テナント間で Describe の応答（列メタデータ）がバイト一致すること（RLS-9・

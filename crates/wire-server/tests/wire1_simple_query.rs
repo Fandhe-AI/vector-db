@@ -309,8 +309,9 @@ fn wire1_vector_and_null_cells_are_text_encoded() {
 
 /// BOOLEAN 列（TABLE-13・TASK-196、Issue #883）が簡易クエリ経由で `t`/`f`/
 /// NULL のテキスト表現へ写像されることを固定する（`result_encoder.rs` の
-/// `Cell::Bool` 分岐。RowDescription の OID 公告は Issue #895 の担当のため
-/// 対象外・列自体の値往復のみを検証する）。
+/// `Cell::Bool` 分岐。RowDescription の OID 公告（`bool`・OID 16。WIRE-13・
+/// TASK-200・Issue #895）は `result_encoder::column_wire_type_matrix` で
+/// 固定済みのためここでは対象外・列自体の値往復のみを検証する）。
 #[test]
 fn wire1_boolean_column_is_t_f_null_text_encoded() {
     let path = temp_db::unique_db_path("wire1-boolean");
@@ -667,6 +668,91 @@ fn wire1_three_tenant_visibility_public_shared_own_private_visible() {
         assert_eq!(tag, "SELECT 4");
         read_ready_for_query(&mut stream);
     }
+
+    drop(guard);
+}
+
+/// UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）が簡易クエリ経由で
+/// 正規テキスト表現（小文字 `8-4-4-4-12`。大文字入力の正規化・NULL 区別を含む）
+/// へ写像されることと、厳密文法違反が `22P02` の `ErrorResponse` になることを
+/// 固定する（`wire1_numeric_column_is_canonical_text_encoded_and_overflow_is_22003`
+/// と同じ流儀）。RowDescription の OID（`uuid`・OID 2950。U10・WIRE-13・
+/// TASK-200・Issue #895）公告自体は `result_encoder::column_wire_type_matrix`
+/// で固定済みのためここでは対象外（本テストの `read_row_description` は
+/// 列名のみ取得し OID を検証しない）。
+#[test]
+fn wire1_uuid_column_is_canonical_text_encoded_and_malformed_literal_is_22p02() {
+    let path = temp_db::unique_db_path("wire1-uuid");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("ext_id", ColumnType::Uuid, true),
+            ],
+        ))
+        .expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    for (id, vec_val, ext_id) in [
+        (
+            1u64,
+            [1.0, 0.0],
+            Value::Uuid(
+                engine::uuid::parse_uuid_text("12345678-9ABC-DEF0-1234-56789ABCDEF0")
+                    .expect("valid uuid literal"),
+            ),
+        ),
+        (2, [0.0, 1.0], Value::Null),
+    ] {
+        let op_id =
+            engine::recovery::required_op_id::OperationId::parse(&format!("test-op-uuid-{id}"))
+                .expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(vec_val.to_vec()), ext_id],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "SELECT id, ext_id FROM docs LIMIT 10");
+    let _columns = read_row_description(&mut stream);
+    let mut by_id = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let row = read_data_row(&mut stream);
+        by_id.insert(row[0].clone(), row[1].clone());
+    }
+    // 大文字入力は小文字の正規テキストとして往復する。
+    assert_eq!(
+        by_id.get(&Some("1".to_string())),
+        Some(&Some("12345678-9abc-def0-1234-56789abcdef0".to_string()))
+    );
+    assert_eq!(by_id.get(&Some("2".to_string())), Some(&None));
+    let _tag = read_command_complete(&mut stream);
+    read_ready_for_query(&mut stream);
+
+    // 厳密文法違反（ハイフンなし）は 22P02。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, ext_id) VALUES (3, '[0.1,0.2]', \
+         '123456789abcdef0123456789abcdef01234') USING OPERATION_ID 'op-malformed'",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "22P02");
+    read_ready_for_query(&mut stream);
 
     drop(guard);
 }

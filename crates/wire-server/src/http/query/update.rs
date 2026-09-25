@@ -279,6 +279,21 @@ fn map_set_assignments(
                     "SET VECTOR column value must be a JSON array of numbers",
                 ))
             }
+            // `INTEGER`／`BIGINT` 列の NoSQL SET 対応は Issue #896 の担当。
+            // 本 Issue（#881）では未対応として明示的に拒否する。
+            (ColumnType::Integer | ColumnType::BigInt, _) => {
+                return Err(UpdateError::Set(
+                    "SET integer column is not supported on the NoSQL surface yet",
+                ))
+            }
+            // F10（Issue #882 計画）: REAL/DOUBLE 列の JSON 束縛は #896 の担当。
+            // 現時点では非対応列として一律拒否する（`22000`。既存の型不一致と
+            // 同じ応答形へ合流させる）。
+            (ColumnType::Real | ColumnType::Double, _) => {
+                return Err(UpdateError::Set(
+                    "SET REAL/DOUBLE PRECISION columns are not supported yet",
+                ))
+            }
             // BOOLEAN 列は JSON 真偽値のみ受理する（NOSQL-17 と同じ規則。
             // Issue #883）。
             (ColumnType::Boolean, JsonValue::Bool(b)) => InsertLiteral::Bool(*b),
@@ -366,6 +381,19 @@ fn map_set_assignments(
             (ColumnType::Numeric { .. }, _) => {
                 return Err(UpdateError::Set(
                     "SET NUMERIC column is not supported via the NoSQL surface",
+                ))
+            }
+            // `UUID` 列は JSON string（正規テキストは engine 側
+            // `bind_uuid_literal` が厳密検証する）を受理する（U11。
+            // TABLE-13〔検討中〕・TASK-197、Issue #887。BYTEA・DATE と同型の
+            // 判断で束縛経路を engine 側の 1 本に保つ）。
+            (ColumnType::Uuid, JsonValue::String(s)) => InsertLiteral::String(s.clone()),
+            // JSON `null` かつ nullable 列は SQL `NULL` として扱う
+            // （JSON／JSONB の同型分岐と同じ契約）。
+            (ColumnType::Uuid, JsonValue::Null) if column.nullable => InsertLiteral::Null,
+            (ColumnType::Uuid, _) => {
+                return Err(UpdateError::Set(
+                    "SET UUID column value must be a JSON string",
                 ))
             }
         };

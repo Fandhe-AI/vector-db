@@ -205,6 +205,7 @@ fn scalar_plan_token(plan: ScalarPlan) -> &'static str {
         ScalarPlan::IndexEquality => "index_equality",
         ScalarPlan::IndexPrefix => "index_prefix",
         ScalarPlan::IndexIdRange => "index_id_range",
+        ScalarPlan::IndexTypedRange => "index_typed_range",
         ScalarPlan::IndexConjunction => "index_conjunction",
     }
 }

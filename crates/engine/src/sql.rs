@@ -122,6 +122,7 @@
 pub mod aggregate;
 pub mod allowlist;
 pub(crate) mod arena_cache;
+pub mod copy;
 pub(crate) mod describe;
 pub mod exec;
 pub mod explain;
@@ -131,6 +132,7 @@ pub(crate) mod hnsw_cache;
 pub(crate) mod hnsw_hybrid;
 pub mod lexer;
 pub mod mode;
+pub mod params;
 pub mod parser;
 pub mod plan;
 pub mod returning;

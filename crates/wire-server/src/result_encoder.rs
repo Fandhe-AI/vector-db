@@ -18,12 +18,32 @@
 //!   同一であり、`numeric` として公告することで値域制限なく全 `u64` 値を
 //!   そのまま送出できる
 //! - `ColumnMeta::Scalar{ty: Text}` → `text`（OID 25, typlen -1）
-//! - `ColumnMeta::Scalar{ty: Vector(_)}` → `text`（OID 25。値は `[v1,v2,...]` 形式）
+//! - `ColumnMeta::Scalar{ty: Vector(_)}` → `text`（OID 25。値は `[v1,v2,...]` 形式。
+//!   `VECTOR` 独自のバイナリ表現は定義しないため引き続き text 固定・受入基準 3）
+//! - `ColumnMeta::Scalar{ty: Boolean}` → `bool`（OID 16, typlen 1。値は `t`/`f`。
+//!   WIRE-13・TASK-200・Issue #895）
+//! - `ColumnMeta::Scalar{ty: Integer}` → `int4`（OID 23, typlen 4。TABLE-13・
+//!   TASK-196・Issue #881・#903 レビュー指摘。`Cell::SignedInteger` が送出する
+//!   10進テキストは `int4` の表現とそのまま一致する）
+//! - `ColumnMeta::Scalar{ty: BigInt}` → `int8`（OID 20, typlen 8。同上）
+//! - `ColumnMeta::Scalar{ty: Real}` → `float4`（OID 700, typlen 4。WIRE-13・
+//!   TASK-200・Issue #895）
+//! - `ColumnMeta::Scalar{ty: Double}` → `float8`（OID 701, typlen 8。同上）
+//! - `ColumnMeta::Scalar{ty: Date}` → `date`（OID 1082, typlen 4。同上）
+//! - `ColumnMeta::Scalar{ty: Timestamp}` → `timestamp`（OID 1114, typlen 8。同上）
+//! - `ColumnMeta::Scalar{ty: Bytea}` → `bytea`（OID 17, typlen -1。同上）
+//! - `ColumnMeta::Scalar{ty: Uuid}` → `uuid`（OID 2950, typlen 16。同上）
+//! - `ColumnMeta::Scalar{ty: Json}` → `json`（OID 114, typlen -1。同上）
+//! - `ColumnMeta::Scalar{ty: Jsonb}` → `jsonb`（OID 3802, typlen -1。同上）
+//! - `ColumnMeta::Scalar{ty: Array(_)}`／`Scalar{ty: Enum(_)}` → `text`
+//!   （OID 25。専用 OID は未策定のまま `text` 表現を公告する。受入基準 3
+//!   の対象外＝据え置き判断。WIRE-13・TASK-200・Issue #895）
 //! - `ColumnMeta::Scalar{ty: Numeric{..}}` → `numeric`（OID 1700, typlen -1。
 //!   値は `Cell::Numeric`（`Decimal` の正規テキスト）のテキスト表現。
 //!   バイナリ形式は `supports_binary` が別途 fail-closed に非対応とする
-//!   〔TASK-197・Issue #885・#895 ポインタ〕）
-//! - `ColumnMeta::Computed{..}` → `text`（OID 25。実行時型のため text 固定）
+//!   〔TASK-197・Issue #885〕）
+//! - `ColumnMeta::Computed{..}` → `text`（OID 25。実行時型のため text 固定。
+//!   `Computed` は型情報を持たないため WIRE-13・Issue #895 の対象外）
 //!
 //! バイナリ形式（format code 1・WIRE-14・TASK-218・Issue #936）: 列ごとに
 //! テキスト／バイナリを要求できる（PostgreSQL の Bind 規則。[`ResultFormats`]）。
@@ -32,14 +52,17 @@
 //! はいずれもバイナリ非対応として事前検査（[`validate_binary_formats`]）で
 //! `0A000` に拒否する（spec の WIRE-14 が定める対応範囲。`VECTOR` 列の独自
 //! バイナリ表現は定義しない）。8 型のレイアウト関数（[`binary`]）は
-//! `WireType` 側の対応拡大（#895・NOSQL-13 ポインタ）に備えた部品として先行
-//! 提供するが、本モジュールが実際に結線するのは `Text` のみ。
+//! `WireType` 側の対応拡大（Issue #895 で OID 公告は実施済み。バイナリ表現
+//! の対応拡大は WIRE-14・TASK-218 の後続として別途追跡する）に備えた部品と
+//! して先行提供するが、本モジュールが実際に結線するのは `Text` のみ。
 //!
-//! **本モジュール単独では wire 経由でバイナリ形式を要求する経路が無い**
-//! （拡張クエリプロトコルの Bind／Describe は #933・#934 が未実装。
-//! `protocol_dispatch::classify` が `'B'` を `0A000` で拒否する）。本 Issue の
-//! 範囲は結果側エンコーダの提供までで、Bind の結果形式コードから本 API への
-//! 結線・同期回復（`0A000` 後の接続維持）は #934 の担当。
+//! Bind の結果形式コードから本 API への結線は
+//! [`crate::extended_query::handle_bind`]（[`ResultFormats::resolve`]／
+//! [`validate_binary_formats`] を呼ぶ）・Describe(Portal) の
+//! `RowDescription`（[`encode_row_description_with_formats`]）・Execute の
+//! `DataRow`（[`encode_data_row_into_with_formats`]）が担う（#934・WIRE-11・
+//! WIRE-14）。パラメータ側（Bind が受け取る `$n` の binary 入力）は
+//! `$n` 束縛そのものが WIRE-12・#935 未実装のため対象外のまま。
 //!
 //! サイズ安全: フレーム長は `i32::try_from`/`checked_add` で算出し、超過は
 //! `Err(EncodeError::FrameTooLarge)` とする（`.claude/rules/coding-rust.md`
@@ -223,38 +246,149 @@ pub mod binary {
     }
 }
 
-/// `RowDescription` が公告する PostgreSQL 型（型写像表の単一情報源。
-/// Issue #762・NOSQL-11）。`crate::http::query::response`（NoSQL 表層の JSON
-/// 応答スキーマ `columns[].type`）も本 enum を経由して同じ写像を参照し、
-/// wire 側 `RowDescription` と JSON `columns` の型名が乖離しない構造にする
-/// （2 箇所に写像表を持たない）。`#[deny(clippy::wildcard_enum_match_arm)]`
-/// を付けた網羅 `match`（`http/status.rs` と同方針）で
-/// [`ColumnMeta`] に variant が増えたら両表層が同時にコンパイルエラーになる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WireType {
-    /// `ColumnMeta::Id`。engine の行 ID は `u64` 全域（`u64::MAX` を含む）を
-    /// 有効値とするため、符号付き 64bit の `int8`（OID 20）では表現できない
-    /// 値が生じる（PR #210 レビュー指摘）。`ColumnMeta::Scalar{ty:
-    /// Numeric{..}}`（TASK-197・Issue #885）も同じ OID 1700 を公告する
-    /// （値の実体は別途 `Cell::Numeric` の正規テキスト表現）。
-    Numeric,
-    /// `ColumnMeta::Scalar{ty: Text}`／`Scalar{ty: Vector(_)}`／`Computed{..}`。
-    Text,
+/// [`WireType`] の enum 定義と [`WireType::ALL`]（全 variant 列挙）を単一の
+/// variant トークン列から同時生成するマクロ。手動保守の配列に variant を
+/// 追加し忘れる余地を構造的に無くす（PR #1037 codex-review 指摘の是正。
+/// 旧実装は `ALL: [WireType; 13]` という配列サイズの明示一致だけに頼って
+/// おり、「variant を追加したのに `ALL` への追加を怠る」ケースでも配列長
+/// リテラル `13` を書き換えなければコンパイル・[`wire_type_all_is_exhaustive`]
+/// の双方を素通りしてしまっていた（`docs/design/wire-type-oid-mapping.md`
+/// の同種の誤った保証の記載も本 Issue で修正済み）。`ALL` の要素は enum
+/// 定義に渡した variant トークン列からそのまま生成されるため、enum へ
+/// variant を追加すれば `ALL` にも必ず反映される。
+macro_rules! wire_type_enum {
+    (
+        $(#[$enum_meta:meta])*
+        enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl $name {
+            /// 全 variant の列挙（型写像表の単一情報源）。[`wire_type_enum!`]
+            /// が enum 定義と同一の variant トークン列から生成するため、
+            /// `ALL` だけを更新し忘れる状態が構造的に発生し得ない。
+            /// [`from_oid`]・単体テストの網羅性検査はここから導出する。
+            /// 単体テスト専用のため非テストビルドでは未使用となり
+            /// `#[cfg(test)]` で dead_code を回避する。
+            #[cfg(test)]
+            pub(crate) const ALL: [$name; wire_type_enum!(@count $($variant)+)] =
+                [$($name::$variant),+];
+        }
+    };
+    (@count $($variant:tt)+) => {
+        0usize $(+ wire_type_enum!(@one $variant))+
+    };
+    (@one $variant:tt) => {
+        1usize
+    };
+}
+
+wire_type_enum! {
+    /// `RowDescription` が公告する PostgreSQL 型（型写像表の単一情報源。
+    /// Issue #762・NOSQL-11）。`crate::http::query::response`（NoSQL 表層の JSON
+    /// 応答スキーマ `columns[].type`）も本 enum を経由して同じ写像を参照し、
+    /// wire 側 `RowDescription` と JSON `columns` の型名が乖離しない構造にする
+    /// （2 箇所に写像表を持たない）。`#[deny(clippy::wildcard_enum_match_arm)]`
+    /// を付けた網羅 `match`（`http/status.rs` と同方針）で
+    /// [`ColumnMeta`] に variant が増えたら両表層が同時にコンパイルエラーになる。
+    enum WireType {
+        /// `ColumnMeta::Id`。engine の行 ID は `u64` 全域（`u64::MAX` を含む）を
+        /// 有効値とするため、符号付き 64bit の `int8`（OID 20）では表現できない
+        /// 値が生じる（PR #210 レビュー指摘）。`ColumnMeta::Scalar{ty:
+        /// Numeric{..}}`（TASK-197・Issue #885）も同じ OID 1700 を公告する
+        /// （値の実体は別途 `Cell::Numeric` の正規テキスト表現）。`id` を `int8`
+        /// へ変更しない据え置き判断は WIRE-13・TASK-200・Issue #895 参照。
+        Numeric,
+        /// `ColumnMeta::Scalar{ty: Text}`／`Scalar{ty: Vector(_)}`／
+        /// `Scalar{ty: Array(_)}`／`Scalar{ty: Enum(_)}`／`Computed{..}`。
+        /// 専用 OID を持たない型はすべてここへ写像する（WIRE-13・TASK-200・
+        /// Issue #895 の据え置き判断）。
+        Text,
+        /// `ColumnMeta::Scalar{ty: Integer}`（`INTEGER`。TABLE-13・TASK-196・
+        /// Issue #881・#903 レビュー指摘）。`i32` 全域を表現する。
+        Int4,
+        /// `ColumnMeta::Scalar{ty: BigInt}`（`BIGINT`。同上）。`i64` 全域を表現する。
+        Int8,
+        /// `ColumnMeta::Scalar{ty: Boolean}`（`BOOLEAN`。TABLE-13・TASK-196・
+        /// Issue #883・WIRE-13・TASK-200・Issue #895）。`Cell::Bool` が送出する
+        /// `t`/`f` は `bool` の text 表現とそのまま一致する。
+        Bool,
+        /// `ColumnMeta::Scalar{ty: Real}`（`REAL`。TABLE-13・TASK-196・Issue #882・
+        /// WIRE-13・TASK-200・Issue #895）。単精度浮動小数点。
+        Float4,
+        /// `ColumnMeta::Scalar{ty: Double}`（`DOUBLE PRECISION`。同上）。倍精度。
+        Float8,
+        /// `ColumnMeta::Scalar{ty: Date}`（TABLE-13・TASK-197・Issue #884・
+        /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `engine::datetime` の
+        /// ISO 表記（`YYYY-MM-DD`）。
+        Date,
+        /// `ColumnMeta::Scalar{ty: Timestamp}`（同上）。テキスト表現は
+        /// `engine::datetime` の ISO 表記（`YYYY-MM-DD HH:MM:SS[.ffffff]`）。
+        Timestamp,
+        /// `ColumnMeta::Scalar{ty: Bytea}`（TABLE-13・TASK-197・Issue #886・
+        /// WIRE-13・TASK-200・Issue #895）。テキスト表現は `\x` + 小文字 16 進
+        /// （`engine::bytea::format_hex_text`。PostgreSQL 既定の `bytea_output=hex`
+        /// と同形）。
+        Bytea,
+        /// `ColumnMeta::Scalar{ty: Uuid}`（TABLE-13〔検討中〕・TASK-197・
+        /// Issue #887・WIRE-13・TASK-200・Issue #895）。テキスト表現は小文字
+        /// `8-4-4-4-12`。
+        Uuid,
+        /// `ColumnMeta::Scalar{ty: Json}`（TABLE-14・TASK-198・Issue #889・
+        /// WIRE-13・TASK-200・Issue #895）。テキスト表現は格納テキストそのまま。
+        Json,
+        /// `ColumnMeta::Scalar{ty: Jsonb}`（同上）。テキスト表現は正規化済み
+        /// テキスト。
+        Jsonb,
+    }
 }
 
 impl WireType {
-    /// PostgreSQL 型 OID（`pg_type.oid`）。
+    /// PostgreSQL 型 OID（`pg_type.oid`）。網羅 `match`（ワイルドカード腕
+    /// なし）のため `WireType` に variant が増えると本関数はコンパイル
+    /// エラーで検出する。
     pub(crate) const fn oid(self) -> i32 {
         match self {
             WireType::Numeric => 1700,
             WireType::Text => 25,
+            WireType::Int4 => 23,
+            WireType::Int8 => 20,
+            WireType::Bool => 16,
+            WireType::Float4 => 700,
+            WireType::Float8 => 701,
+            WireType::Date => 1082,
+            WireType::Timestamp => 1114,
+            WireType::Bytea => 17,
+            WireType::Uuid => 2950,
+            WireType::Json => 114,
+            WireType::Jsonb => 3802,
         }
     }
 
-    /// 型長（`pg_type.typlen`）。可変長型のみを扱うためいずれも `-1`。
+    /// 型長（`pg_type.typlen`）。可変長型は `-1`、固定長型は対応バイト数。
     pub(crate) const fn typlen(self) -> i16 {
         match self {
-            WireType::Numeric | WireType::Text => -1,
+            WireType::Numeric
+            | WireType::Text
+            | WireType::Bytea
+            | WireType::Json
+            | WireType::Jsonb => -1,
+            WireType::Int4 | WireType::Float4 | WireType::Date => 4,
+            WireType::Int8 | WireType::Float8 | WireType::Timestamp => 8,
+            WireType::Bool => 1,
+            WireType::Uuid => 16,
         }
     }
 
@@ -264,30 +398,38 @@ impl WireType {
         match self {
             WireType::Numeric => "numeric",
             WireType::Text => "text",
+            WireType::Int4 => "int4",
+            WireType::Int8 => "int8",
+            WireType::Bool => "bool",
+            WireType::Float4 => "float4",
+            WireType::Float8 => "float8",
+            WireType::Date => "date",
+            WireType::Timestamp => "timestamp",
+            WireType::Bytea => "bytea",
+            WireType::Uuid => "uuid",
+            WireType::Json => "json",
+            WireType::Jsonb => "jsonb",
         }
     }
 
-    /// OID からの逆引き（単体テスト専用。結合テスト側は独立の固定表を持つ
-    /// ため非テストビルドでは未使用となり `#[cfg(test)]` で dead_code を
-    /// 回避する）。
+    /// OID からの逆引き。[`ALL`] を線形走査するのみで、逆引き専用の第 2 の
+    /// 写像表は持たない（単一情報源。WIRE-13・TASK-200・Issue #895）。
+    /// 単体テスト専用（結合テスト側は独立の固定表を持つ）ため非テスト
+    /// ビルドでは未使用となり `#[cfg(test)]` で dead_code を回避する。
     #[cfg(test)]
     pub(crate) fn from_oid(oid: i32) -> Option<Self> {
-        match oid {
-            1700 => Some(WireType::Numeric),
-            25 => Some(WireType::Text),
-            _ => None,
-        }
+        Self::ALL.iter().copied().find(|t| t.oid() == oid)
     }
 
     /// この型がバイナリ形式（format code 1）に対応するか（WIRE-14）。
     /// 網羅 `match`（`#[deny(clippy::wildcard_enum_match_arm)]`）にし、
-    /// `WireType` に variant が増えたとき（#895・NOSQL-13 ポインタ）に
-    /// バイナリ可否の決定漏れをコンパイルエラーで検出する。
+    /// `WireType` に variant が増えたときにバイナリ可否の決定漏れを
+    /// コンパイルエラーで検出する。
     #[deny(clippy::wildcard_enum_match_arm)]
     pub(crate) const fn supports_binary(self) -> bool {
         match self {
             // `id` は `numeric` として公告しており、WIRE-14 は `NUMERIC` を
-            // 非対応型としている（#895 で `int8` へ変わったら見直す）。
+            // 非対応型としている。
             WireType::Numeric => false,
             // `text` は UTF-8 生バイトがそのままバイナリ表現（PostgreSQL の
             // text send と同じ）。ただし `ColumnMeta::Scalar{ty: Vector(_)}`・
@@ -295,6 +437,21 @@ impl WireType {
             // あるため、型そのものの対応可否とは別に列種別で判定する
             // （[`column_binary_support`] 参照）。
             WireType::Text => true,
+            // `INTEGER`／`BIGINT`（Issue #881・#903）はバイナリ表現を spec 側で
+            // 未策定のため fail-closed で非対応とする。
+            WireType::Int4 | WireType::Int8 => false,
+            // WIRE-13・TASK-200・Issue #895 で OID 公告を追加した型はいずれも
+            // バイナリ表現が spec 側で未策定のため fail-closed で非対応とする
+            // （対応拡大は WIRE-14・TASK-218 の後続として別途追跡）。
+            WireType::Bool
+            | WireType::Float4
+            | WireType::Float8
+            | WireType::Date
+            | WireType::Timestamp
+            | WireType::Bytea
+            | WireType::Uuid
+            | WireType::Json
+            | WireType::Jsonb => false,
         }
     }
 }
@@ -322,93 +479,139 @@ pub(crate) fn column_binary_support(meta: &ColumnMeta) -> bool {
             ty: engine::catalog::ColumnType::Vector(_),
             ..
         } => false,
-        // `BOOLEAN` 列（TABLE-13・TASK-196・Issue #883）は本 Issue（#936・
-        // WIRE-14）の策定時点では未存在の型のため、バイナリ表現は spec 側で
-        // 未決定。公告 OID（`WireType::Text`）は `supports_binary() == true`
-        // だが、`VECTOR` と同様に値の実体が `Text` の生バイト表現とは異なる
-        // ため fail-closed で非対応とする。
+        // `INTEGER`／`BIGINT`（Issue #881・#903）は `WireType::Int4`／`Int8` を
+        // 公告するが、バイナリ表現は spec 側で未策定のため fail-closed で
+        // 非対応とする（`WireType::supports_binary` と判定を揃える）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Integer | engine::catalog::ColumnType::BigInt,
+            ..
+        } => false,
+        // `BOOLEAN` 列（TABLE-13・TASK-196・Issue #883）は WIRE-13・TASK-200・
+        // Issue #895 で `WireType::Bool`（OID 16）を公告するようになったが、
+        // バイナリ表現は spec 側で未策定のまま（`column_wire_type` の公告
+        // 変更とバイナリ対応可否は独立の判断）。fail-closed で非対応とする
+        // （対応拡大は WIRE-14・TASK-218 の後続）。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Boolean,
             ..
         } => false,
-        // `BYTEA` 列（Issue #886）は本 Issue（#936・WIRE-14）の策定時点では
-        // 未存在の型のため、バイナリ表現は spec 側で未決定。公告 OID
-        // （`WireType::Text`）は `supports_binary() == true` だが、値の実体は
-        // 生バイト列の hex テキスト表現（`Cell::Bytes`）であり `Text` の
-        // UTF-8 生バイト表現とは異なるため、`VECTOR`・`BOOLEAN` と同様に
-        // fail-closed で非対応とする（RowDescription への専用 OID 公告は
-        // Issue #895 の担当）。
+        // `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196・Issue #882）は
+        // Issue #895 で `WireType::Float4`／`Float8` を公告するが、値の実体は
+        // `Cell::Float` の生成テキスト表現でありバイナリ（IEEE 754 ビット列）
+        // とは意味論が異なるため、他の後発型と同様に fail-closed で非対応
+        // とする。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Real | engine::catalog::ColumnType::Double,
+            ..
+        } => false,
+        // `BYTEA` 列（Issue #886）は Issue #895 で `WireType::Bytea`
+        // （OID 17）を公告するが、値の実体は生バイト列の hex テキスト表現
+        // （`Cell::Bytes`）でありバイナリ表現は spec 側で未策定のため
+        // fail-closed で非対応とする。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Bytea,
             ..
         } => false,
-        // `ENUM` 列（TABLE-14・TASK-198、Issue #890）も同様の理由で
-        // fail-closed に非対応とする。値は `Cell::Text`（TEXT と同一表示形）に
-        // 写像されるが、`ColumnMeta::Scalar` としては別 variant であるため
-        // `Text` 分岐へは流れ込まない（多層防御。バイナリ指定は
-        // `BinaryFormatError::UnsupportedType`（`0A000`）で拒否する）。
+        // `ENUM` 列（TABLE-14・TASK-198、Issue #890）は Issue #895 の据え置き
+        // 判断により専用 OID を持たず `WireType::Text` を公告する。値は
+        // `Cell::Text`（TEXT と同一表示形）に写像されるが、`ColumnMeta::Scalar`
+        // としては別 variant であるため `Text` 分岐へは流れ込まない
+        // （多層防御。バイナリ指定は `BinaryFormatError::UnsupportedType`
+        // （`0A000`）で拒否する）。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Enum(_),
             ..
         } => false,
-        // `ARRAY` 列（TABLE-14・Issue #888）も本 Issue（#936・WIRE-14）の
-        // 策定時点では未存在の型のため、バイナリ表現は spec 側で未決定。
-        // `VECTOR`・`BOOLEAN`・`BYTEA` と同様に fail-closed で非対応とする。
+        // `ARRAY` 列（TABLE-14・Issue #888）も Issue #895 の据え置き判断により
+        // 専用 OID を持たず `WireType::Text` を公告する。`VECTOR`・`ENUM` と
+        // 同様に fail-closed で非対応とする。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Array(_),
             ..
         } => false,
-        // `JSON`／`JSONB` 列（TABLE-14・Issue #889）も同じ理由で fail-closed に
-        // 非対応とする（値の実体が `Cell::Json` の格納テキストであり `Text` の
-        // 単純な UTF-8 生バイト表現と意味論が異なるため。RowDescription への
-        // 専用 OID 公告は Issue #895 の担当）。
+        // `JSON`／`JSONB` 列（TABLE-14・Issue #889）は Issue #895 で
+        // `WireType::Json`／`Jsonb` を公告するが、値の実体が `Cell::Json` の
+        // 格納テキストでありバイナリ表現は spec 側で未策定のため
+        // fail-closed で非対応とする。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Json | engine::catalog::ColumnType::Jsonb,
             ..
         } => false,
-        // `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）も本 Issue
-        // （#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
-        // spec 側で未決定。値の実体が `Cell::Numeric`（`Decimal` の正規テキスト）
-        // であり `Text` の単純な UTF-8 生バイト表現とは異なるため、他の後発型と
-        // 同様に fail-closed で非対応とする（RowDescription・HTTP 応答への
-        // OID 1700／`"numeric"` 公告は `column_wire_type` が既に担う。ここで
-        // 非対応とするのはバイナリ表現のみ。#895 に残るのはバイナリ表現の
-        // 対応拡大）。
+        // `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）は値の実体が
+        // `Cell::Numeric`（`Decimal` の正規テキスト）であり `Text` の単純な
+        // UTF-8 生バイト表現とは異なるため、他の後発型と同様に fail-closed
+        // で非対応とする（RowDescription・HTTP 応答への OID 1700／
+        // `"numeric"` 公告は `column_wire_type` が既に担う。ここで非対応と
+        // するのはバイナリ表現のみ）。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Numeric { .. },
             ..
         } => false,
-        // `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）も本 Issue
-        // （#936・WIRE-14）の策定時点では未存在の型のため、バイナリ表現は
-        // spec 側で未決定。`VECTOR`・`BOOLEAN` 等と同様に fail-closed で
-        // 非対応とする。
+        // `DATE`／`TIMESTAMP` 列（TABLE-13・TASK-197、Issue #884）は Issue #895
+        // で `WireType::Date`／`Timestamp` を公告するが、バイナリ表現は
+        // spec 側で未策定のため fail-closed で非対応とする。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Date | engine::catalog::ColumnType::Timestamp,
             ..
         } => false,
-        // 実行時型（Float/Bool/Vector）が静的に決まらないため fail-closed
-        // で非対応とする（#895 で型情報が付いたら見直す）。
+        // `UUID` 列（TABLE-13〔検討中〕・TASK-197、Issue #887）は Issue #895 で
+        // `WireType::Uuid`（OID 2950）を公告するが、バイナリ表現は spec 側で
+        // 未策定のため fail-closed で非対応とする（U10）。
+        ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::Uuid,
+            ..
+        } => false,
+        // 実行時型（式・集計結果）が静的に決まらないため fail-closed で
+        // 非対応とする（`Computed` は WIRE-13・Issue #895 の対象外のまま）。
         ColumnMeta::Computed { .. } => false,
     }
 }
 
 /// `ColumnMeta` 1 個が公告する [`WireType`]（本モジュール先頭の型写像表を参照）。
+/// `ColumnMeta::Scalar` は `ColumnType` ごとに写像を分ける（Issue #903 レビュー
+/// 指摘: `INTEGER`／`BIGINT` を一律 `text` に写像すると `RowDescription`／NoSQL
+/// 表層の JSON 応答が実際の値の型と乖離し、psql・ドライバ・ORM が整数列を
+/// 文字列として扱ってしまう）。
 #[deny(clippy::wildcard_enum_match_arm)]
 pub(crate) fn column_wire_type(meta: &ColumnMeta) -> WireType {
     match meta {
         ColumnMeta::Id => WireType::Numeric, // u64 全域を表現するため int8 ではなく numeric
         // `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）は値の実体が
         // `Cell::Numeric`（`Decimal` の正規テキスト）であり、`supports_binary`
-        // が fail-closed に非対応とするのはバイナリ表現のみ（Issue #895 まで
-        // 未決定）。RowDescription／HTTP 応答の型メタデータ（OID 1700・
-        // `"numeric"`）自体はテキスト形式でも正しく公告できるため、他の
-        // `Scalar` 列（`text` 固定）より先にこの分岐で判定する（PR #1020
-        // codex-review 指摘）。
+        // が fail-closed に非対応とするのはバイナリ表現のみ。RowDescription／
+        // HTTP 応答の型メタデータ（OID 1700・`"numeric"`）自体はテキスト形式
+        // でも正しく公告できるため、他の `Scalar` 列より先にこの分岐で判定
+        // する（PR #1020 codex-review 指摘）。
         ColumnMeta::Scalar {
             ty: engine::catalog::ColumnType::Numeric { .. },
             ..
         } => WireType::Numeric,
-        ColumnMeta::Scalar { .. } => WireType::Text, // Vector も text 表現で返す
+        // 以下は WIRE-13・TASK-200・Issue #895 の型写像表（本モジュール先頭
+        // ドキュメント参照）。`ARRAY`・`ENUM` は専用 OID を持たない据え置き
+        // 判断のため引き続き `text` を公告する。`VECTOR`・`Computed` も同様。
+        ColumnMeta::Scalar { ty, .. } => match ty {
+            engine::catalog::ColumnType::Text => WireType::Text,
+            engine::catalog::ColumnType::Vector(_) => WireType::Text,
+            engine::catalog::ColumnType::Boolean => WireType::Bool,
+            engine::catalog::ColumnType::Integer => WireType::Int4,
+            engine::catalog::ColumnType::BigInt => WireType::Int8,
+            engine::catalog::ColumnType::Real => WireType::Float4,
+            engine::catalog::ColumnType::Double => WireType::Float8,
+            engine::catalog::ColumnType::Date => WireType::Date,
+            engine::catalog::ColumnType::Timestamp => WireType::Timestamp,
+            engine::catalog::ColumnType::Bytea => WireType::Bytea,
+            engine::catalog::ColumnType::Uuid => WireType::Uuid,
+            engine::catalog::ColumnType::Json => WireType::Json,
+            engine::catalog::ColumnType::Jsonb => WireType::Jsonb,
+            // `ARRAY`（Issue #888）・`ENUM`（Issue #890）は据え置き判断
+            // （WIRE-13・TASK-200・Issue #895）により専用 OID を持たず、
+            // text（`RowDescription`）で公告する。`NUMERIC` は本 match の
+            // 外側（`Id` 直後の専用分岐）で先に判定されるため、この
+            // `match ty` には到達しない。
+            engine::catalog::ColumnType::Array(_)
+            | engine::catalog::ColumnType::Enum(_)
+            | engine::catalog::ColumnType::Numeric { .. } => WireType::Text,
+        },
         ColumnMeta::Computed { .. } => WireType::Text,
     }
 }
@@ -486,7 +689,13 @@ pub fn encode_row_description_with_formats(
 /// ような signed 64bit 制約が無い）ため、`i64` への変換は行わず値域制限なく
 /// `to_string()` する（PR #210 レビュー指摘: 旧実装は `i64::try_from` で
 /// `i64::MAX` 超の正当な ID を `EncodeError`/`XX000` にしていた）。
-fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
+///
+/// `pub(crate)`: `crate::copy`（Issue #939・WIRE-17）の `COPY (...) TO STDOUT`
+/// 行エンコーダが、通常の `SELECT` 応答（`DataRow`）と同じ値表現を再利用する
+/// ために公開する（COPY TO の出力と SELECT の text 出力が同一の cell 表現を
+/// 共有することで、`COPY (...) TO STDOUT` の出力を同じテーブルへ
+/// `COPY ... FROM STDIN` で再投入した際に値の往復が保たれる）。
+pub(crate) fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
     match cell {
         Cell::Null => Ok(None),
         Cell::Integer(v) => Ok(Some(v.to_string())),
@@ -501,9 +710,14 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         }
         Cell::Float(f) => Ok(Some(f.to_string())),
         Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
+        // `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
+        // `RowDescription` の OID 写像は `int4`／`int8`（Issue #903 レビュー指摘で
+        // 是正。`column_wire_type` 参照）で、10進テキスト表現はどちらの OID とも
+        // 一致するためここでは値そのものの変換のみ行う。
+        Cell::SignedInteger(v) => Ok(Some(v.to_string())),
         // ISO テキストへ整形する（`engine::datetime` が単一情報源。TABLE-13・
-        // TASK-197、Issue #884。RowDescription の OID は #895 まで既存どおり
-        // `25`（TEXT 相当）のまま不変）。
+        // TASK-197、Issue #884。RowDescription の OID は `date`（1082）／
+        // `timestamp`（1114）を公告する。WIRE-13・TASK-200・Issue #895）。
         Cell::Date(days) => Ok(Some(engine::datetime::format_date(*days))),
         Cell::Timestamp(micros) => Ok(Some(engine::datetime::format_timestamp(*micros))),
         Cell::Array(array_value) => Ok(Some(pg_array_text(array_value))),
@@ -517,6 +731,10 @@ fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
         // NUMERIC 列の text フォーマット表現は正規テキスト（`Decimal::Display`）
         // をそのまま送る（TABLE-13〔検討中〕・TASK-197、Issue #885）。
         Cell::Numeric(d) => Ok(Some(d.to_string())),
+        // UUID 列の text フォーマット表現は正規テキスト（小文字
+        // `8-4-4-4-12`）をそのまま送る（TABLE-13〔検討中〕・TASK-197、
+        // Issue #887・U4）。
+        Cell::Uuid(u) => Ok(Some(u.to_string())),
     }
 }
 
@@ -675,6 +893,7 @@ where
                         out.extend_from_slice(bytes);
                     }
                     Cell::Integer(_)
+                    | Cell::SignedInteger(_)
                     | Cell::Vector(_)
                     | Cell::Float(_)
                     | Cell::Bool(_)
@@ -683,7 +902,8 @@ where
                     | Cell::Array(_)
                     | Cell::Bytes(_)
                     | Cell::Json(_)
-                    | Cell::Numeric(_) => {
+                    | Cell::Numeric(_)
+                    | Cell::Uuid(_) => {
                         return Err(EncodeError);
                     }
                 },
@@ -794,6 +1014,35 @@ pub fn encode_no_data() -> [u8; 5] {
     msg[0] = b'n';
     let len_bytes = 4i32.to_be_bytes();
     msg[1..5].copy_from_slice(&len_bytes);
+    msg
+}
+
+/// `BindComplete`（'2'）。拡張クエリプロトコルの Bind（Issue #934・TASK-71・
+/// WIRE-11）が成功したことを示す固定応答。body なし・長さ固定（4）。
+pub fn encode_bind_complete() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'2';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// `CloseComplete`（'3'）。拡張クエリプロトコルの Close（Issue #934）が
+/// statement／portal いずれかを解放したことを示す固定応答（対象が未存在でも
+/// 同じ応答を返す。PostgreSQL と同じ挙動）。body なし・長さ固定（4）。
+pub fn encode_close_complete() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'3';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// `PortalSuspended`（'s'）。拡張クエリプロトコルの Execute（Issue #934）が
+/// `max_rows` 制限により行の送出を打ち切り、続きを次の Execute へ持ち越す
+/// ことを示す固定応答。body なし・長さ固定（4）。
+pub fn encode_portal_suspended() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b's';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
     msg
 }
 
@@ -955,6 +1204,35 @@ mod tests {
         let first_len = i32_at(&msg, 7) as usize;
         assert_eq!(first_len, 1);
         assert_eq!(slice_at(&msg, 11, first_len), b"t");
+    }
+
+    #[test]
+    fn row_description_encodes_integer_and_bigint_columns_as_int4_int8() {
+        // Issue #903 レビュー指摘: `INTEGER`／`BIGINT` 列を一律 `text`（OID 25）
+        // で公告すると psql・ドライバ・ORM が整数列を文字列として扱ってしまう
+        // ため、`int4`（OID 23）／`int8`（OID 20）へ正しく写像することを固定する。
+        let columns = vec![
+            ColumnMeta::Scalar {
+                name: "n".to_string(),
+                ty: engine::catalog::ColumnType::Integer,
+            },
+            ColumnMeta::Scalar {
+                name: "b".to_string(),
+                ty: engine::catalog::ColumnType::BigInt,
+            },
+        ];
+        assert_eq!(column_wire_type(&columns[0]), WireType::Int4);
+        assert_eq!(column_wire_type(&columns[1]), WireType::Int8);
+        assert_eq!(WireType::Int4.oid(), 23);
+        assert_eq!(WireType::Int8.oid(), 20);
+        assert_eq!(WireType::Int4.typlen(), 4);
+        assert_eq!(WireType::Int8.typlen(), 8);
+        assert_eq!(WireType::Int4.pg_type_name(), "int4");
+        assert_eq!(WireType::Int8.pg_type_name(), "int8");
+
+        let msg = encode_row_description(&columns).expect("encode");
+        // body はインデックス 5 から始まる（'T' + length(4)）。
+        assert_eq!(i16_at(&msg, 5), 2);
     }
 
     #[test]
@@ -1444,6 +1722,50 @@ mod tests {
         assert!(!column_binary_support(&ColumnMeta::Computed {
             name: "expr".to_string(),
         }));
+        // UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887・U10）は
+        // `WireType::Uuid`（OID 2950）を公告するがバイナリは非対応のまま。
+        assert!(!column_binary_support(&ColumnMeta::Scalar {
+            name: "external_id".to_string(),
+            ty: engine::catalog::ColumnType::Uuid,
+        }));
+        // WIRE-13・TASK-200・Issue #895 で専用 OID を公告するようになった
+        // 型は、いずれもバイナリ表現が spec 側で未策定のため fail-closed で
+        // 非対応のまま（`WireType::supports_binary`／`column_binary_support`
+        // の判定を一致させる回帰保護）。
+        for ty in [
+            engine::catalog::ColumnType::Boolean,
+            engine::catalog::ColumnType::Real,
+            engine::catalog::ColumnType::Double,
+            engine::catalog::ColumnType::Date,
+            engine::catalog::ColumnType::Timestamp,
+            engine::catalog::ColumnType::Bytea,
+            engine::catalog::ColumnType::Json,
+            engine::catalog::ColumnType::Jsonb,
+        ] {
+            assert!(
+                !column_binary_support(&ColumnMeta::Scalar {
+                    name: "col".to_string(),
+                    ty: ty.clone(),
+                }),
+                "{ty:?} は binary 非対応のまま"
+            );
+        }
+    }
+
+    /// 新規型（Issue #895）のバイナリ指定が `validate_binary_formats` で
+    /// `0A000`（`UnsupportedType`）に拒否されることを固定する（WIRE-14）。
+    #[test]
+    fn new_scalar_type_binary_request_is_rejected_as_feature_not_supported() {
+        let columns = vec![ColumnMeta::Scalar {
+            name: "flag".to_string(),
+            ty: engine::catalog::ColumnType::Boolean,
+        }];
+        let formats = ResultFormats::new(&[1])
+            .resolve(columns.len())
+            .expect("resolve");
+        let err = validate_binary_formats(&columns, &formats).unwrap_err();
+        assert_eq!(err, BinaryFormatError::UnsupportedType { column_index: 0 });
+        assert_eq!(err.error_class().wire_code(), "0A000");
     }
 
     /// `NUMERIC` 列（TABLE-13〔検討中〕・TASK-197、Issue #885）は値の実体が
@@ -1466,5 +1788,288 @@ mod tests {
         assert_eq!(wire_type.oid(), 1700);
         assert_eq!(wire_type.pg_type_name(), "numeric");
         assert_ne!(wire_type.oid(), WireType::Text.oid());
+    }
+
+    // --- 型 OID 写像の拡張（WIRE-13・TASK-200・Issue #895） ---
+
+    /// [`WireType::ALL`] の全 variant が [`WireType::from_oid`] で往復する
+    /// ことを固定する（単一情報源からの逆引きが正しいことの機械検証）。
+    #[test]
+    fn wire_type_all_round_trips_through_from_oid() {
+        for wire_type in WireType::ALL {
+            assert_eq!(
+                WireType::from_oid(wire_type.oid()),
+                Some(wire_type),
+                "oid={}",
+                wire_type.oid()
+            );
+        }
+    }
+
+    /// [`WireType::ALL`] 内で OID・型名がいずれも重複しないことを固定する
+    /// （2 つの variant が同じ PostgreSQL 型を指してしまう設定ミスの検出）。
+    #[test]
+    fn wire_type_oids_and_names_are_unique() {
+        let oids: Vec<i32> = WireType::ALL.iter().map(|t| t.oid()).collect();
+        let mut sorted_oids = oids.clone();
+        sorted_oids.sort_unstable();
+        sorted_oids.dedup();
+        assert_eq!(sorted_oids.len(), oids.len(), "OID が重複している");
+
+        let names: Vec<&str> = WireType::ALL.iter().map(|t| t.pg_type_name()).collect();
+        let mut sorted_names = names.clone();
+        sorted_names.sort_unstable();
+        sorted_names.dedup();
+        assert_eq!(sorted_names.len(), names.len(), "型名が重複している");
+    }
+
+    /// `WireType::ALL` の要素数が [`WireType`] の variant 数（13）と一致する
+    /// ことを固定する（実測値の回帰検知が目的。`ALL` 自体は
+    /// [`wire_type_enum!`] マクロが enum 定義と同一の variant トークン列から
+    /// 生成するため、`ALL` への追加漏れは PR #1037 codex-review 指摘の是正で
+    /// 構造的に発生し得なくなった。このテストは「13 個という現在の想定数」
+    /// が変わったことを検知する回帰テストであり、`ALL` の網羅性そのものの
+    /// 保証はマクロが担う）。
+    #[test]
+    fn wire_type_all_is_exhaustive() {
+        assert_eq!(WireType::ALL.len(), 13);
+    }
+
+    /// `PostgreSQL` 組み込みカタログの公開値（`pg_type.oid`／`typlen`／
+    /// `typname`）との照合。本モジュールの `oid()`／`typlen()`／
+    /// `pg_type_name()` とは独立にテスト側で固定表を持ち、正引きの値
+    /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
+    #[test]
+    fn wire_type_table_matches_postgres_builtin_catalog() {
+        let expected: [(WireType, i32, i16, &str); 13] = [
+            (WireType::Numeric, 1700, -1, "numeric"),
+            (WireType::Text, 25, -1, "text"),
+            (WireType::Int4, 23, 4, "int4"),
+            (WireType::Int8, 20, 8, "int8"),
+            (WireType::Bool, 16, 1, "bool"),
+            (WireType::Float4, 700, 4, "float4"),
+            (WireType::Float8, 701, 8, "float8"),
+            (WireType::Date, 1082, 4, "date"),
+            (WireType::Timestamp, 1114, 8, "timestamp"),
+            (WireType::Bytea, 17, -1, "bytea"),
+            (WireType::Uuid, 2950, 16, "uuid"),
+            (WireType::Json, 114, -1, "json"),
+            (WireType::Jsonb, 3802, -1, "jsonb"),
+        ];
+        for (wire_type, oid, typlen, name) in expected {
+            assert_eq!(wire_type.oid(), oid, "oid mismatch for {name}");
+            assert_eq!(wire_type.typlen(), typlen, "typlen mismatch for {name}");
+            assert_eq!(wire_type.pg_type_name(), name, "name mismatch for {oid}");
+        }
+    }
+
+    /// 未知の OID は fail-closed に `None` を返す（`0`・負値・PostgreSQL の
+    /// 他の組み込み型〔`varchar` = 1043〕・`i32::MAX` を確認）。
+    #[test]
+    fn from_oid_unknown_is_none() {
+        for oid in [0, -1, 1043, i32::MAX] {
+            assert_eq!(WireType::from_oid(oid), None, "oid={oid}");
+        }
+    }
+
+    /// `column_wire_type` が全 `ColumnType`（`VECTOR`／`ARRAY`／`ENUM`／
+    /// `NUMERIC` を含む）＋`Id`＋`Computed` について期待どおりの `WireType`
+    /// を返すことを固定する。`Id`→`Numeric`・`Text`→`Text`・`Vector`→`Text`
+    /// が不変であること（受入基準 3）を明示アサートする（WIRE-13・
+    /// TASK-200・Issue #895）。
+    #[test]
+    fn column_wire_type_matrix() {
+        use engine::catalog::ColumnType;
+
+        let scalar = |name: &str, ty: ColumnType| ColumnMeta::Scalar {
+            name: name.to_string(),
+            ty,
+        };
+
+        // 受入基準 3: 既存の `id`／`TEXT`／`VECTOR` の公告は不変。
+        assert_eq!(column_wire_type(&ColumnMeta::Id), WireType::Numeric);
+        assert_eq!(
+            column_wire_type(&scalar("lang", ColumnType::Text)),
+            WireType::Text
+        );
+        assert_eq!(
+            column_wire_type(&scalar("embedding", ColumnType::Vector(3))),
+            WireType::Text
+        );
+
+        // 新規 OID 公告（本 Issue の対象）。
+        assert_eq!(
+            column_wire_type(&scalar("flag", ColumnType::Boolean)),
+            WireType::Bool
+        );
+        assert_eq!(
+            column_wire_type(&scalar("n", ColumnType::Integer)),
+            WireType::Int4
+        );
+        assert_eq!(
+            column_wire_type(&scalar("b", ColumnType::BigInt)),
+            WireType::Int8
+        );
+        assert_eq!(
+            column_wire_type(&scalar("r", ColumnType::Real)),
+            WireType::Float4
+        );
+        assert_eq!(
+            column_wire_type(&scalar("d", ColumnType::Double)),
+            WireType::Float8
+        );
+        assert_eq!(
+            column_wire_type(&scalar("dt", ColumnType::Date)),
+            WireType::Date
+        );
+        assert_eq!(
+            column_wire_type(&scalar("ts", ColumnType::Timestamp)),
+            WireType::Timestamp
+        );
+        assert_eq!(
+            column_wire_type(&scalar("blob", ColumnType::Bytea)),
+            WireType::Bytea
+        );
+        assert_eq!(
+            column_wire_type(&scalar("uid", ColumnType::Uuid)),
+            WireType::Uuid
+        );
+        assert_eq!(
+            column_wire_type(&scalar("doc", ColumnType::Json)),
+            WireType::Json
+        );
+        assert_eq!(
+            column_wire_type(&scalar("docb", ColumnType::Jsonb)),
+            WireType::Jsonb
+        );
+        assert_eq!(
+            column_wire_type(&scalar(
+                "price",
+                ColumnType::Numeric {
+                    precision: 5,
+                    scale: 2
+                }
+            )),
+            WireType::Numeric
+        );
+
+        // 据え置き判断（受入基準外）: `ARRAY`／`ENUM` は専用 OID を持たず
+        // `text` のまま。
+        let array_ty = engine::catalog::ArrayType::new(engine::catalog::ArrayElemType::Text, 4)
+            .expect("valid array type");
+        assert_eq!(
+            column_wire_type(&scalar("tags", ColumnType::Array(array_ty))),
+            WireType::Text
+        );
+
+        let db_path = std::env::temp_dir().join(format!(
+            "result-encoder-column-wire-type-matrix-{}-{}.redb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let storage = engine::storage::Storage::open(&db_path).expect("open throwaway storage");
+        let enum_def = storage
+            .create_enum_type("mood", vec!["happy".to_string()])
+            .expect("create enum type");
+        assert_eq!(
+            column_wire_type(&scalar("mood", ColumnType::Enum(enum_def))),
+            WireType::Text
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(&db_path);
+
+        assert_eq!(
+            column_wire_type(&ColumnMeta::Computed {
+                name: "expr".to_string(),
+            }),
+            WireType::Text
+        );
+    }
+
+    /// `RowDescription` が新規スカラー型（BOOLEAN／REAL／DOUBLE
+    /// PRECISION／DATE／TIMESTAMP／BYTEA／UUID／JSON／JSONB）を PostgreSQL
+    /// 組み込み OID・typlen で正しく公告することを、生成バイト列から直接
+    /// 読み取って固定する（WIRE-13・TASK-200・Issue #895）。
+    #[test]
+    fn row_description_encodes_new_scalar_types_with_builtin_oids() {
+        use engine::catalog::ColumnType;
+
+        let columns = vec![
+            ColumnMeta::Scalar {
+                name: "flag".to_string(),
+                ty: ColumnType::Boolean,
+            },
+            ColumnMeta::Scalar {
+                name: "r".to_string(),
+                ty: ColumnType::Real,
+            },
+            ColumnMeta::Scalar {
+                name: "d".to_string(),
+                ty: ColumnType::Double,
+            },
+            ColumnMeta::Scalar {
+                name: "dt".to_string(),
+                ty: ColumnType::Date,
+            },
+            ColumnMeta::Scalar {
+                name: "ts".to_string(),
+                ty: ColumnType::Timestamp,
+            },
+            ColumnMeta::Scalar {
+                name: "blob".to_string(),
+                ty: ColumnType::Bytea,
+            },
+            ColumnMeta::Scalar {
+                name: "uid".to_string(),
+                ty: ColumnType::Uuid,
+            },
+            ColumnMeta::Scalar {
+                name: "doc".to_string(),
+                ty: ColumnType::Json,
+            },
+            ColumnMeta::Scalar {
+                name: "docb".to_string(),
+                ty: ColumnType::Jsonb,
+            },
+        ];
+        let expected: [(i32, i16); 9] = [
+            (16, 1),    // bool
+            (700, 4),   // float4
+            (701, 8),   // float8
+            (1082, 4),  // date
+            (1114, 8),  // timestamp
+            (17, -1),   // bytea
+            (2950, 16), // uuid
+            (114, -1),  // json
+            (3802, -1), // jsonb
+        ];
+
+        let msg = encode_row_description(&columns).expect("encode");
+        assert_eq!(i16_at(&msg, 5), 9);
+
+        // body: 'T' + length(4) + field_count(2) から各フィールドが続く。
+        let mut cursor = 1 + 4 + 2;
+        for (name, (expected_oid, expected_typlen)) in
+            columns.iter().map(column_name).zip(expected.iter())
+        {
+            let name_end = msg[cursor..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("NUL terminator");
+            let actual_name =
+                std::str::from_utf8(slice_at(&msg, cursor, name_end)).expect("utf8 name");
+            assert_eq!(actual_name, name);
+            cursor += name_end + 1;
+            cursor += 4 + 2; // table_oid + attnum
+            let oid = i32_at(&msg, cursor);
+            assert_eq!(oid, *expected_oid, "column={name}");
+            cursor += 4;
+            let typlen = i16_at(&msg, cursor);
+            assert_eq!(typlen, *expected_typlen, "column={name}");
+            cursor += 2 + 4 + 2; // typlen + typmod + format
+        }
     }
 }

@@ -1,6 +1,7 @@
 # バイナリ形式の結果エンコーディング（WIRE-14）の設計判断
 
-- ステータス: **Accepted（Phase A: エンコーダ層のみ。wire 経由の結線は Phase B）**
+- ステータス: **Accepted（Phase A: エンコーダ層。Phase B の wire 経由結線は
+  Issue #934 で実施済み——「Phase B 追記」節参照）**
 - 対応: Issue #936（TASK-218・WIRE-14。ポインタ: `docs/spec/05-tasks.md`
   TASK-218・`docs/spec/04-behavior/wire-protocol.md` WIRE-14）
 - 実装: `crates/wire-server/src/result_encoder.rs`
@@ -16,8 +17,10 @@ wire-server の `RowDescription`／`DataRow` は format code フィールドが 
 
 ## スコープ（Phase A / Phase B）
 
-Bind／Execute（Issue #934）・Parse／Describe（Issue #933）・型 OID の拡張
-（Issue #895・WIRE-13）はいずれも本 Issue 時点では別 Issue の担当（未実装）。
+Bind／Execute（Issue #934）・Parse／Describe（Issue #933）は本 Issue 時点では
+別 Issue の担当（未実装）。型 OID の拡張（Issue #895・WIRE-13）は OID 公告
+自体を実施済みだが、新型のバイナリ表現の対応拡大は引き続き別 Issue の担当
+（「申し送り」節参照）。
 
 - **Phase A（本 Issue）**: `result_encoder.rs` に置く純関数のエンコーダ層
   （形式コードの解決・対応型の事前検査・型ごとのバイナリレイアウト・
@@ -34,6 +37,19 @@ Bind／Execute（Issue #934）・Parse／Describe（Issue #933）・型 OID の�
 組み立てる部分）に限定し、wire 経由で実際にバイナリ形式を要求して値を
 受け取るところまでは対象外とする（詳細は spec のビヘイビア定義 WIRE-14
 参照）。
+
+## Phase B 追記（Issue #934）
+
+Bind（`handle_bind`）が `ResultFormats::resolve`／`validate_binary_formats`
+を呼んで結果 format code を列ごとに解決・事前検査し、Describe(Portal) の
+`RowDescription`（`encode_row_description_with_formats`）と Execute の
+`DataRow`（`encode_data_row_into_with_formats`）が Bind 時点で確定した同じ
+値を参照するよう結線した（`crates/wire-server/src/extended_query.rs`・
+`docs/design/wire-extended-query-bind-execute-sync.md` 参照）。`0A000` 後の
+同期回復（WIRE-11）は既存の `respond_error_and_await_sync` 経路をそのまま
+使う。3 クライアントでのバイナリ受信 e2e（psycopg 3 `binary=True`・
+node pg `binary: true`・生バイト Rust クライアント）は本 Issue の対象外の
+まま別 Issue へ申し送る。
 
 ## 形式コードの列ごとの解決（`ResultFormats::resolve`）
 
@@ -75,19 +91,23 @@ PostgreSQL の Bind 規則に従う。
 `column_binary_support`（列種別を見た最終判定。`Vector`／`Computed` の
 上書きを含む）を分離し、`#[deny(clippy::wildcard_enum_match_arm)]` を付けた
 網羅 `match` にすることで、`ColumnMeta`／`WireType` に variant が増えたとき
-（#895）にバイナリ可否の決定漏れをコンパイルエラーで検出する。
+（Issue #895 で実際に増えた）にバイナリ可否の決定漏れをコンパイルエラーで
+検出する。
 
 ## 型ごとのバイナリ表現（`binary` サブモジュール）
 
 PostgreSQL の send 関数と同じレイアウトで 8 型のバイナリ表現を組み立てる
 純関数を用意した（`int4`／`int8`／`float4`／`float8`／`bool_`／`bytea`／
-`uuid`／`text`）。本 Issue で `WireType` 側に実際に結線されるのは `text`
-のみで、他の型は `WireType`／`Cell` 拡張（#895）が使う部品として先行提供
-する。golden バイト列の単体テストで PostgreSQL 規約との一致を固定した
-（例: `int4(1)` → `00 00 00 01`、`int8(-1)` → `ff` × 8、`float8(1.0)` →
-`3f f0 00 …`、`bool_(true)` → `01`）。
+`uuid`／`text`）。本 Issue 時点で `WireType` 側に実際に結線されるのは `text`
+のみで、他の型は Issue #895 で `WireType` へ OID 公告が追加された後も
+バイナリ表現へは未結線のまま（`column_binary_support`／`supports_binary`
+がいずれも `false` を返す。対応拡大は本 doc「申し送り」節）。golden バイト列
+の単体テストで PostgreSQL 規約との一致を固定した（例: `int4(1)` →
+`00 00 00 01`、`int8(-1)` → `ff` × 8、`float8(1.0)` → `3f f0 00 …`、
+`bool_(true)` → `01`）。
 
-`id` のバイナリ対応拡大は #895 の担当（詳細は WIRE-13 参照）。
+`id`（`numeric`）のバイナリ対応拡大は spec 側で未策定のため引き続き未実施
+（詳細は WIRE-13 参照）。
 
 ## 形式コードを受け取るエンコーダと既存出力の不変性
 
@@ -131,9 +151,17 @@ matches_legacy_encoder`）で固定している。シグネチャは
 ## 申し送り（Phase B 以降）
 
 - Bind の結果形式コードを本 API へ渡す結線・Describe(portal) の
-  `RowDescription` への反映 → #934
-- `0A000` のあと当該文だけを拒否して接続を維持する同期回復 → #934（WIRE-11）
-- パラメータのバイナリ復号（長さ上限検証と `08P01`）→ #935／#934
-- `id`・集計列の型 OID 拡張とバイナリ対応の拡大 → #895
-- 3 クライアントのバイナリ受信モードでの値一致（層 B）→ #934 完了後
+  `RowDescription` への反映 → **#934 で実施済み**（「Phase B 追記」節参照）
+- `0A000` のあと当該文だけを拒否して接続を維持する同期回復 →
+  **#934 で実施済み**（既存の `respond_error_and_await_sync` 経路をそのまま
+  使う）
+- パラメータのバイナリ復号（長さ上限検証と `08P01`）→ #935（`$n` 束縛自体が
+  未実装のため引き続き対象外）
+- 型 OID 拡張（`BOOLEAN`／`REAL`／`DOUBLE PRECISION`／`DATE`／`TIMESTAMP`／
+  `BYTEA`／`UUID`／`JSON`／`JSONB`）→ **Issue #895 で実施済み**
+  （`docs/design/wire-type-oid-mapping.md` 参照）。`id`・これら新型・
+  集計列（`Computed`）のバイナリ対応拡大は spec 側で未策定のため引き続き
+  未実施
+- 3 クライアントのバイナリ受信モードでの値一致（層 B）→ #934 完了後の
+  別 Issue（本 doc の対象外のまま）
 - カーソル（WIRE-15）→ #937

@@ -91,7 +91,14 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
     })?;
     match &column.ty {
         ColumnType::Text => Ok(idx),
+        // F10（Issue #882 計画）: `body` 列に REAL/DOUBLE が宣言されるのは
+        // 通常あり得ないが、VECTOR 列と同じ「TEXT 列でない」拒否へ合流させる
+        // （BOOLEAN も同様。Issue #883）。
         ColumnType::Vector(_)
+        | ColumnType::Integer
+        | ColumnType::BigInt
+        | ColumnType::Real
+        | ColumnType::Double
         | ColumnType::Boolean
         | ColumnType::Date
         | ColumnType::Timestamp
@@ -100,7 +107,8 @@ pub(crate) fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfac
         | ColumnType::Json
         | ColumnType::Jsonb
         | ColumnType::Enum(_)
-        | ColumnType::Numeric { .. } => Err(SqlSurfaceError::invalid_input(format!(
+        | ColumnType::Numeric { .. }
+        | ColumnType::Uuid => Err(SqlSurfaceError::invalid_input(format!(
             "column {BODY_COLUMN_NAME:?} is not a TEXT column"
         ))),
     }
@@ -140,8 +148,13 @@ pub(crate) fn pre_check_bindable(
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
-    let (metadata_filters, expr_filters, _rls_predicate_present) =
-        parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+    let (metadata_filters, expr_filters, _rls_predicate_present) = parser::bind_where_predicates(
+        stmt.where_predicates(),
+        schema,
+        udfs,
+        &mut node_budget,
+        &[],
+    )?;
     // Issue #474・#765: `EXPLAIN` の `scalar_plan:` 行（`sql::explain`）が
     // 要求する静的判定は [`crate::sql::explain::ExplainShape::from_filters`]
     // （`scalar_prefilter: true` 固定。`USING PLAN` は `HINT ORDER` を受理
@@ -210,8 +223,13 @@ pub(crate) fn bind_expansion(
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let projection = parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
-    let (metadata_filters, expr_filters, rls_predicate_present) =
-        parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+    let (metadata_filters, expr_filters, rls_predicate_present) = parser::bind_where_predicates(
+        stmt.where_predicates(),
+        schema,
+        udfs,
+        &mut node_budget,
+        &[],
+    )?;
 
     // `core.rs::EngineCore::execute_sql_in_session` の `USING PLAN` 分岐が
     // `plan_using_plan_expansion`（高コスト I/O）より前に同じ検証

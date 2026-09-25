@@ -82,7 +82,8 @@
 //! - [`tls`]: 自作 TLS 1.3 サーバー側実装の入口（TASK-228・WIRE-9・HTTP-10。
 //!   親 Issue #941 の 2 時間単位 sub-issue 群の 1 つ）。X25519 鍵交換
 //!   （RFC 7748・定数時間。Issue #955）・`tls::record`（レコード層。
-//!   RFC 8446 §5.1。Issue #952）まで実装済み。接続経路（`handshake.rs`・
+//!   RFC 8446 §5.1。Issue #952）・`tls::record_protection`（レコード保護層。
+//!   RFC 8446 §5.2〜§5.5。Issue #959）まで実装済み。接続経路（`handshake.rs`・
 //!   `server.rs`）への結線は #966 以降
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
@@ -98,6 +99,7 @@
 pub mod auth;
 pub mod auth_method_opt;
 pub mod bind_guard;
+pub(crate) mod copy;
 pub mod durability_opt;
 pub mod error_response;
 pub mod extended_query;

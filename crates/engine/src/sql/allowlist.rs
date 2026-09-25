@@ -90,6 +90,19 @@ fn is_where_predicate_boundary_token(token: Option<&Token>) -> bool {
     }
 }
 
+/// `token` が `WHERE` 述語の範囲比較演算子（`< > <= >=`）トークンであれば
+/// 対応する [`CompareOp`] を返す（TABLE-13・TASK-199、Issue #891）。`=` は
+/// 既存の [`WherePredicate::Equality`] 判定が別腕で扱うためここには含めない。
+fn where_compare_op_token(token: &Token) -> Option<CompareOp> {
+    match token {
+        Token::Punct('<') => Some(CompareOp::Lt),
+        Token::Punct('>') => Some(CompareOp::Gt),
+        Token::Le => Some(CompareOp::Le),
+        Token::Ge => Some(CompareOp::Ge),
+        _ => None,
+    }
+}
+
 /// 集計関数（TASK-166・SQL-13）で許可する関数名を照合する（大文字小文字を区別
 /// しない）。未知の名前は fail-closed に拒否する（[`is_allowed_where_predicate_name`]
 /// と同方針）。`sql::udf_call::is_reserved_function_name` から名前空間一本化の
@@ -253,9 +266,10 @@ pub enum SqlSurfaceError {
     /// （`DATETIME_FIELD_OVERFLOW`）へ写像する新規分類。
     DatetimeFieldOverflow { detail: String },
     /// 構文上受理された値が、宣言済み型の表現として不正（TABLE-14・TASK-198、
-    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）が
-    /// 現時点で唯一の発生経路。ERR-2 拡張: `22P02`
-    /// （[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
+    /// Issue #890）。ENUM 列の語彙外ラベル（[`crate::catalog::EnumLabelError`]）に
+    /// 加え、UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の厳密文法違反
+    /// （`sql::parser::bind_uuid_literal`）も同じ発生経路を共有する。ERR-2 拡張:
+    /// `22P02`（[`crate::error_format::ErrorClass::InvalidTextRepresentation`]）。
     InvalidTextRepresentation { detail: String },
 }
 
@@ -516,6 +530,27 @@ pub enum WherePredicate {
     BoolEquality { column: String, value: bool },
     /// BOOLEAN 列の裸参照（`WHERE flag`。`value = true` と同義。同 Issue）。
     BoolColumn { column: String },
+    /// 列と文字列リテラルの範囲比較条件（`< > <= >=`。TABLE-13・TASK-199、
+    /// Issue #891）。`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列向けの
+    /// 宣言的経路（レーン B）で束縛する。`=` は既存の [`WherePredicate::Equality`]
+    /// のまま据え置き、逆向き（`'2024-01-01' < d`）は受理しない（構文段で
+    /// 式フォールバックへ回り `42601` になる。既知の制約）。
+    Compare {
+        column: String,
+        op: CompareOp,
+        value: String,
+    },
+}
+
+/// [`WherePredicate::Compare`] の比較演算子（TABLE-13・TASK-199、Issue #891）。
+/// `crate::declarative_filter::CompareOp` と 1 対 1 に対応する（字句表現から
+/// 意味表現への写像を分離するための構文層専用の複製）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// SELECT リストの 1 項目（TASK-79・SQL-9 で式項目を追加する際の共通表現）。
@@ -1521,7 +1556,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let value = self.expect_string_literal()?;
                     predicates.push(WherePredicate::Equality {
-                        column: name,
+                        column: name.clone(),
                         value,
                     });
                     matched_legacy = true;
@@ -1532,7 +1567,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let pattern = self.expect_string_literal()?;
                     predicates.push(WherePredicate::Prefix {
-                        column: name,
+                        column: name.clone(),
                         pattern,
                     });
                     matched_legacy = true;
@@ -1543,7 +1578,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     self.advance();
                     self.advance();
-                    predicates.push(WherePredicate::PredicateCall { name });
+                    predicates.push(WherePredicate::PredicateCall { name: name.clone() });
                     matched_legacy = true;
                 } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
                     && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false"))
@@ -1563,11 +1598,34 @@ impl<'a> Parser<'a> {
                         }
                     };
                     predicates.push(WherePredicate::BoolEquality {
-                        column: name,
+                        column: name.clone(),
                         value,
                     });
                     matched_legacy = true;
-                } else if is_where_predicate_boundary_token(self.tokens.get(self.pos + 1)) {
+                } else if let Some(op) = self
+                    .tokens
+                    .get(self.pos + 1)
+                    .and_then(where_compare_op_token)
+                {
+                    if matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_))) {
+                        // `<col> (< | > | <= | >=) '<literal>'`（TABLE-13・
+                        // TASK-199、Issue #891・レーン B）。逆向き
+                        // （`'x' < col`）は本腕では扱わず式フォールバックへ回す
+                        // （既知の制約。詳細は `docs/design/scalar-types-predicates.md`）。
+                        self.advance();
+                        self.advance();
+                        let value = self.expect_string_literal()?;
+                        predicates.push(WherePredicate::Compare {
+                            column: name.clone(),
+                            op,
+                            value,
+                        });
+                        matched_legacy = true;
+                    }
+                }
+                if !matched_legacy
+                    && is_where_predicate_boundary_token(self.tokens.get(self.pos + 1))
+                {
                     // BOOLEAN 列の裸参照（`WHERE flag`）。直後のトークンが
                     // WHERE 句の終端（`AND`・`ORDER`・`LIMIT`・`;`・EOF・後続構文
                     // キーワード）である場合に限り受理する。受理範囲の拡大を
@@ -1930,7 +1988,26 @@ impl<'a> Parser<'a> {
 
     /// VALUES リストの 1 要素（文字列リテラルまたは数値リテラルのみ。関数呼び出し・
     /// 括弧・`NULL` キーワード等は許可リスト外）。
+    /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）の負数リテラルを
+    /// 受理するため、`-` の直後に `Number` トークンが続く形（`parse_having` の
+    /// 単項マイナス処理と同じ規範。空白を挟む形も許容）だけを単項マイナスとして
+    /// 認め、`InsertLiteral::Number("-<digits>")` へ正規化する。`- -1`・`-'x'`・
+    /// `+1` はいずれも従来どおり構造的に受理しない（`42601`）。実際の値域検証・
+    /// パースは束縛段（`sql::parser::bind_integer_literal`）が行う。
     fn expect_literal(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        // F7（Issue #882 計画）: `REAL`/`DOUBLE PRECISION` の負リテラル
+        // （`-1.5` 等）も同じ規範で受理する（`HAVING` 述語〔約 L1359〕と同じ
+        // `['-'] <Number>` の文法を先読みで判定）。`Number` 以外（文字列・
+        // ベクトルリテラル）の直前の `-` は許可リスト外のまま拒否する。
+        if matches!(self.peek(), Some(Token::Punct('-'))) {
+            self.advance();
+            return match self.advance() {
+                Some(Token::Number(n)) => Ok(InsertLiteral::Number(format!("-{n}"))),
+                other => Err(SqlSurfaceError::unsupported(format!(
+                    "expected numeric literal after unary minus, got {other:?}"
+                ))),
+            };
+        }
         match self.advance() {
             Some(Token::StringLiteral(s)) => Ok(InsertLiteral::String(s.clone())),
             Some(Token::Number(n)) => Ok(InsertLiteral::Number(n.clone())),
@@ -2701,6 +2778,24 @@ fn parse_create_function(tokens: &[Token]) -> Result<(String, Vec<String>, Expr)
 ///    （不存在は [`SqlSurfaceError::UndefinedTable`]）
 pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
+    validate_sql_tokens(&tokens, lookup)
+}
+
+/// [`validate_sql`] の本体（Issue #939・WIRE-17。COPY プロトコル対応の一環）。
+/// トークン列を受け取ることで、`COPY (<SELECT>) TO STDOUT`
+/// （[`validate_copy_to_tokens`]）の内側 SELECT のように、外側の許可リストが
+/// 括弧で括り出した部分トークン列を再トークナイズせずに検証できる
+/// （`validate_insert_tokens`・Issue #485 と同じ「トークン列を受け取る本体 /
+/// 文字列を受け取り委譲する公開 API」という分割方針）。`validate_sql` は本関数へ
+/// 委譲するだけで挙動・エラー契約は分割前と不変。
+///
+/// `sql::params`（Issue #935・WIRE-12。拡張クエリプロトコルの `$n` 束縛）も、Bind 時に
+/// `Token::Param` を実値のトークンへ置換したトークン列を SQL テキストを経由せず
+/// この関数へ渡し、[`validate_sql`] と同一の判定順序・エラー分類を再利用する。
+pub(crate) fn validate_sql_tokens(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<Statement, SqlSurfaceError> {
     // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
     // （TASK-161・SQL-12 修正と同方針）、statement 先頭という文脈でのみ大文字小文字を
     // 区別せず判定する。
@@ -2732,7 +2827,7 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
             || contains_group_by);
     match tokens.first() {
         Some(Token::Keyword(Keyword::Select)) if is_aggregate_select => {
-            let shape = parse_aggregate_shape(&tokens)?;
+            let shape = parse_aggregate_shape(tokens)?;
             let exists = lookup.table_exists(&shape.table_name)?;
             if !exists {
                 return Err(SqlSurfaceError::undefined_table(shape.table_name));
@@ -2744,7 +2839,7 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
                 group_by: shape.group_by,
             }))
         }
-        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(&tokens)? {
+        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(tokens)? {
             ParsedSelect::Search(shape) => {
                 let exists = lookup.table_exists(&shape.table_name)?;
                 if !exists {
@@ -2777,11 +2872,11 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
             }
         },
         _ if is_set_statement => {
-            let value = parse_set_search_mode(&tokens)?;
+            let value = parse_set_search_mode(tokens)?;
             Ok(Statement::SetSearchMode { value })
         }
         _ if is_create_function_statement => {
-            let (name, params, body) = parse_create_function(&tokens)?;
+            let (name, params, body) = parse_create_function(tokens)?;
             Ok(Statement::CreateFunction { name, params, body })
         }
         // TASK-78（SQL-6）: `EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置
@@ -3166,6 +3261,268 @@ pub(crate) fn validate_truncate_tokens(
         table_name: shape.table_name,
         operation_id: shape.operation_id,
     })
+}
+
+/// `COPY ... FROM STDIN`／`COPY (...) TO STDOUT` の転送形式（Issue #939・
+/// WIRE-17）。`text`（PostgreSQL 互換のタブ区切り・バックスラッシュエスケープ）・
+/// `csv`（RFC4180 風のカンマ区切り・二重引用符エスケープ）の 2 値のみを受理し、
+/// `HEADER`・`DELIMITER`・`NULL`・`QUOTE`・binary 形式（WIRE-14）は許可リスト外
+/// （`42601`）。フィールド分割・エスケープ解決の実体は [`crate::sql::copy`] が
+/// 担う（本モジュールは構文の許可リスト判定のみ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormat {
+    Text,
+    Csv,
+}
+
+/// 許可形状の構造判定を通過した `COPY <table> (<col>[, <col>]*) FROM STDIN
+/// [WITH] [(FORMAT text|csv)] USING OPERATION_ID '<id>'` 文（Issue #939・
+/// WIRE-17・TASK-220）。`ValidatedInsert` と同様、本モジュールが保証するのは
+/// ここまでの構造情報のみで、列名・値の意味論的妥当性・実際のフレーム
+/// デコードは [`crate::sql::copy`] の責務とする。`RETURNING`・`ON CONFLICT`・
+/// ファイル名指定（`FROM '<path>'`）は許可リスト外。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCopyFrom {
+    /// INTO 相当で指定され、カタログ存在確認を通過したテーブル名。
+    pub table_name: String,
+    /// 列リストの宣言順（`id` 疑似列を必ず含む。重複はここで拒否済み）。
+    pub columns: Vec<String>,
+    pub format: CopyFormat,
+    /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
+    /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約。
+    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// 開始前に `23502` で拒否するため、この構成では常に `Some`）。
+    pub operation_id: Option<OperationId>,
+}
+
+/// 許可形状の構造判定を通過した `COPY (<SELECT>) TO STDOUT [[WITH]
+/// (FORMAT text|csv)]` 文（Issue #939・WIRE-17・TASK-220）。内側 `SELECT` は
+/// 広域取得（[`ValidatedScan`]。SQL-15・Issue #454）の形のみを受理し
+/// （順位付け `ORDER BY`／`USING PLAN`・集計は `42601`）、[`validate_sql_tokens`]
+/// と単一の実装を共有する（第 2 の SELECT パーサーを持たない）。テーブル形
+/// `COPY <table> TO STDOUT` は対象外（許可リスト外）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCopyTo {
+    pub inner: Box<ValidatedScan>,
+    pub format: CopyFormat,
+}
+
+/// [`validate_copy`]（Issue #939・WIRE-17）が返す COPY statement 種別。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CopyStatement {
+    From(ValidatedCopyFrom),
+    To(ValidatedCopyTo),
+}
+
+/// `(<items>)` の対応する丸括弧を見つけ、内側・外側後続のトークン列へ分割する
+/// （`COPY (<SELECT>) TO STDOUT` の内側 SELECT を切り出すための唯一の実装。
+/// 文字列リテラル内の `(`/`)` は字句解析時点で既に 1 個の `Token::StringLiteral`
+/// へ吸収されているため、本関数はトークン列上の `Token::Punct('('/')')` だけを
+/// 深さで数えれば安全に対応を取れる）。`tokens` の先頭は必ず `(` であること
+/// （呼び出し元が確認済み）。添字直接アクセス（`coding-rust.md`）を避け
+/// `enumerate`＋`get` で処理する。
+fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurfaceError> {
+    let mut depth: i32 = 0;
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = tokens.get(1..i).ok_or_else(|| {
+                        SqlSurfaceError::unsupported("malformed COPY (...) clause")
+                    })?;
+                    let after = tokens.get(i + 1..).ok_or_else(|| {
+                        SqlSurfaceError::unsupported("malformed COPY (...) clause")
+                    })?;
+                    return Ok((inner, after));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(SqlSurfaceError::unsupported(
+        "unterminated parenthesized expression in COPY statement",
+    ))
+}
+
+/// `[WITH] (FORMAT text|csv)` を受理する（省略時は [`CopyFormat::Text`]）。
+/// `WITH` を書いた場合は直後の `(FORMAT ...)` を必須とし、無ければ `42601` で
+/// 拒否する（値を伴わない `WITH` 句を既定 `Text` として誤受理しない）。
+/// `COPY ... FROM STDIN`・`COPY (...) TO STDOUT` の両方から共有する（Issue #939）。
+fn parse_optional_copy_format(p: &mut Parser) -> Result<CopyFormat, SqlSurfaceError> {
+    // `WITH` を消費したら `(FORMAT ...)` の丸括弧を必須とする。`WITH` の直後に
+    // `(` が続かない場合（値を伴わない不正な `WITH` 句）は許可リスト外として
+    // `42601` で拒否する（WIRE-17 の許可形状〔`FORMAT text|csv` のみ〕・
+    // fail-closed 規約。Issue #939 codex-review 指摘の是正）。
+    let with_seen = p.peek_contextual_keyword("WITH");
+    if with_seen {
+        p.advance();
+    }
+    if !matches!(p.peek(), Some(Token::Punct('('))) {
+        if with_seen {
+            return Err(SqlSurfaceError::unsupported(
+                "COPY WITH clause must be followed by (FORMAT ...)",
+            ));
+        }
+        return Ok(CopyFormat::Text);
+    }
+    p.advance();
+    p.expect_contextual_keyword("FORMAT")?;
+    let raw = p.expect_ident()?;
+    let format = match raw.to_ascii_lowercase().as_str() {
+        "text" => CopyFormat::Text,
+        "csv" => CopyFormat::Csv,
+        _ => {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "unsupported COPY FORMAT: {raw}"
+            )))
+        }
+    };
+    p.expect_punct(')')?;
+    Ok(format)
+}
+
+/// `COPY <table> (<col>[, <col>]*) FROM STDIN [WITH] [(FORMAT text|csv)]
+/// USING OPERATION_ID '<id>' [;]` を構造判定する（Issue #939・WIRE-17）。
+fn validate_copy_from_tokens(
+    rest: &[Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let mut p = Parser::new(rest);
+    let table_name = p.expect_ident()?;
+
+    p.expect_punct('(')?;
+    let mut columns = vec![p.expect_ident()?];
+    while matches!(p.peek(), Some(Token::Punct(','))) {
+        p.advance();
+        if columns.len() >= MAX_INSERT_COLUMNS {
+            return Err(SqlSurfaceError::unsupported("too many COPY columns"));
+        }
+        columns.push(p.expect_ident()?);
+    }
+    p.expect_punct(')')?;
+
+    p.expect_keyword(Keyword::From)?;
+    p.expect_contextual_keyword("STDIN")?;
+
+    let format = parse_optional_copy_format(&mut p)?;
+
+    // 文末専用句の構造パースのみをここで行う（`parse_insert`／`parse_truncate`
+    // と同じ設計。必須化の判定は `mode.require` へ委譲する）。
+    let operation_id = p.parse_operation_id_clause()?;
+    p.expect_end_of_statement()?;
+
+    mode.require(operation_id.as_ref())?;
+
+    let exists = lookup.table_exists(&table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(table_name));
+    }
+
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in &columns {
+        if !seen.insert(c.as_str()) {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "duplicate column in COPY column list: {c}"
+            )));
+        }
+    }
+    if !columns.iter().any(|c| c == "id") {
+        return Err(SqlSurfaceError::invalid_input(
+            "COPY column list must include the id pseudo-column",
+        ));
+    }
+
+    Ok(CopyStatement::From(ValidatedCopyFrom {
+        table_name,
+        columns,
+        format,
+        operation_id,
+    }))
+}
+
+/// `COPY (<SELECT>) TO STDOUT [[WITH] (FORMAT text|csv)] [;]` を構造判定する
+/// （Issue #939・WIRE-17）。`rest` の先頭は必ず `(` であること（呼び出し元
+/// [`validate_copy_tokens`] が確認済み）。内側 `SELECT` は
+/// [`validate_sql_tokens`] が返す [`Statement::Scan`]（広域取得。SQL-15）のみを
+/// 受理する（第 2 の SELECT パーサーを持たない設計。`Select`（順位付き）・
+/// `Aggregate`・`Explain`・`SetSearchMode`・`CreateFunction` はいずれも
+/// `42601` へ落とす）。
+fn validate_copy_to_tokens(
+    rest: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let (inner, after) = split_parenthesized(rest)?;
+    let scan = match validate_sql_tokens(inner, lookup)? {
+        Statement::Scan(v) => v,
+        _ => {
+            return Err(SqlSurfaceError::unsupported(
+                "COPY (...) TO STDOUT only supports a non-ranked SELECT (no ORDER BY / USING PLAN / aggregate)",
+            ))
+        }
+    };
+
+    let mut p = Parser::new(after);
+    p.expect_contextual_keyword("TO")?;
+    p.expect_contextual_keyword("STDOUT")?;
+    let format = parse_optional_copy_format(&mut p)?;
+    p.expect_end_of_statement()?;
+
+    Ok(CopyStatement::To(ValidatedCopyTo {
+        inner: Box::new(scan),
+        format,
+    }))
+}
+
+/// `COPY` 文（`FROM STDIN`／`TO STDOUT` の両形。Issue #939・WIRE-17・TASK-220）を
+/// トークン化し、許可リスト形式で構造検証してから、`FROM STDIN` 形は `lookup` を
+/// 通じて対象テーブルがカタログに実在するかまで確認する公開 API。`validate_sql`・
+/// `validate_insert` と同じく独立したエントリポイントとする（`COPY` は
+/// [`crate::sql::copy::is_copy_statement`] による先頭トークンの覗き見判定を
+/// 経て `core.rs::execute_sql_in_session` から呼ばれる想定であり、`validate_sql`
+/// の許可形状には含めない）。
+///
+/// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）。
+/// `FROM STDIN` 形の `operation_id` 必須化ガード（`mode.require`。TASK-92・
+/// RECOVER-1）はカタログ照会より前に評価する（[`validate_insert`] と同じ理由。
+/// `TO STDOUT` 形は書き込みを伴わないため `operation_id` を持たない）。
+pub fn validate_copy(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_copy_tokens(&tokens, lookup, mode)
+}
+
+/// [`validate_copy`] の本体。トークン列を受け取ることで、呼び出し元
+/// （`core.rs::execute_sql_in_session` が先頭トークン判定のために既に
+/// トークナイズ済みの場合）が同一 SQL 文字列を再トークナイズせずに済む
+/// （`validate_insert_tokens`・Issue #485 と同じ設計）。
+pub(crate) fn validate_copy_tokens(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let (first, rest) = tokens
+        .split_first()
+        .ok_or_else(|| SqlSurfaceError::unsupported("empty COPY statement"))?;
+    match first {
+        Token::Ident(name) if name.eq_ignore_ascii_case("COPY") => {}
+        other => {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "expected COPY, got {other:?}"
+            )))
+        }
+    }
+
+    if matches!(rest.first(), Some(Token::Punct('('))) {
+        validate_copy_to_tokens(rest, lookup)
+    } else {
+        validate_copy_from_tokens(rest, lookup, mode)
+    }
 }
 
 /// `UPDATE` の `WHERE` 句が単一行・id 指定形（SQL-17、TASK-191）か述語形
@@ -4116,6 +4473,89 @@ mod tests {
             stmt.operation_id.as_ref().map(OperationId::as_str),
             Some("op-0001")
         );
+    }
+
+    // --- 単項マイナス（Issue #881・TABLE-13・TASK-196） ---
+
+    /// `-` の直後に数値トークンが続く形は単項マイナスとして受理し、
+    /// `InsertLiteral::Number("-<digits>")` へ正規化する（`INTEGER`／`BIGINT`
+    /// 列の負数リテラルを許可リストの構造段で通すための変更。値域検証・
+    /// パースは束縛段（`sql::parser::bind_integer_literal`）が行う）。
+    #[test]
+    fn accepts_negative_number_literal_in_values() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', -5) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("negative number literal should be accepted");
+        assert_eq!(
+            stmt.rows,
+            vec![vec![
+                InsertLiteral::Number("1".to_string()),
+                InsertLiteral::String("[0.1,0.2]".to_string()),
+                InsertLiteral::Number("-5".to_string()),
+            ]]
+        );
+    }
+
+    /// 空白を挟んだ単項マイナス（`- 5`）も同じ形として受理する。
+    #[test]
+    fn accepts_negative_number_literal_with_whitespace_between_minus_and_digits() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', - 5) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("negative number literal with whitespace should be accepted");
+        assert_eq!(stmt.rows[0][2], InsertLiteral::Number("-5".to_string()));
+    }
+
+    /// `- -1`（二重マイナス）は構造的に受理しない（`42601`）。単項マイナスの
+    /// 直後は数値トークンのみを許すため、2 個目の `-` はそこで構文エラーになる。
+    #[test]
+    fn rejects_double_minus_number_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', - -1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// `+1`（単項プラス）は `NUMERIC` 列の符号付きリテラル（Issue #885・D6・
+    /// PR #1020 codex-review 指摘対応）を許可リストの構造段で通すために現在は
+    /// 受理し、`InsertLiteral::Number("+1")` へ正規化する（本テストでの
+    /// `catalog_with` は列型を持たないため、非 NUMERIC 列に対する拒否
+    /// （束縛段の型不一致・不正値 `22000`）はここでは検証しない。詳細は
+    /// `expect_literal` のドキュメンテーションコメント参照）。
+    #[test]
+    fn accepts_unary_plus_number_literal_structurally() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', +1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("unary plus number literal should be accepted structurally");
+        assert_eq!(stmt.rows[0][2], InsertLiteral::Number("+1".to_string()));
+    }
+
+    /// `-'x'`（マイナスの直後に文字列リテラル）は構造的に受理しない（`42601`）。
+    #[test]
+    fn rejects_minus_followed_by_string_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', -'x') USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     // --- RETURNING（Issue #873・SQL-21） ---

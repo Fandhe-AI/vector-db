@@ -100,6 +100,10 @@ impl ScoringBoost {
         match &column.ty {
             ColumnType::Text => {}
             ColumnType::Vector(_)
+            | ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
             | ColumnType::Boolean
             | ColumnType::Date
             | ColumnType::Timestamp
@@ -108,7 +112,10 @@ impl ScoringBoost {
             | ColumnType::Json
             | ColumnType::Jsonb
             | ColumnType::Enum(_)
-            | ColumnType::Numeric { .. } => {
+            | ColumnType::Numeric { .. }
+            | ColumnType::Uuid => {
+                // F10（Issue #882 計画）: REAL/DOUBLE 列は VECTOR 列と同じ
+                // 「TEXT 列でない」拒否腕へ合流させる（対応は #891 へ申し送り）。
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {:?} is not a TEXT column",
                     self.column

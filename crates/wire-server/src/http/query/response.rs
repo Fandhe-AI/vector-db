@@ -100,6 +100,12 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             let _ = write!(out, "{v}");
             Ok(())
         }
+        // `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
+        // JSON 数値としてそのまま出力する（`Cell::Integer` と同じ infallible 方針）。
+        Cell::SignedInteger(v) => {
+            let _ = write!(out, "{v}");
+            Ok(())
+        }
         Cell::Float(f) => write_finite_f64(out, *f),
         Cell::Bool(b) => {
             out.push_str(if *b { "true" } else { "false" });
@@ -188,6 +194,14 @@ fn write_cell(out: &mut String, cell: &Cell) -> Result<(), ResponseEncodeError> 
             let _ = write!(out, "{d}");
             Ok(())
         }
+        Cell::Uuid(u) => {
+            // 正規テキスト表現（小文字 `8-4-4-4-12`）を JSON string として書く
+            // （U4。TABLE-13〔検討中〕・TASK-197、Issue #887）。
+            out.push('"');
+            escape_json_string_into(out, &u.to_string());
+            out.push('"');
+            Ok(())
+        }
     }
 }
 
@@ -217,9 +231,11 @@ fn write_column(out: &mut String, meta: &ColumnMeta) {
     out.push_str("{\"name\":\"");
     escape_json_string_into(out, crate::result_encoder::column_name(meta));
     out.push_str("\",\"type\":\"");
-    // `pg_type_name()` は固定 ASCII（`"numeric"`／`"text"`）のためエスケープ
-    // 不要だが、型写像表が将来拡張されても安全側に倒れるよう一律エスケーパを
-    // 通す（`error_body.rs::wire_code_and_label_never_require_escaping` と
+    // `pg_type_name()` はいずれの `WireType` variant でも固定 ASCII
+    // （`"numeric"`／`"text"`／`"bool"`／`"int4"` 等。WIRE-13・TASK-200・
+    // Issue #895 で追加した型も同様）のためエスケープ不要だが、型写像表が
+    // 将来拡張されても安全側に倒れるよう一律エスケーパを通す
+    // （`error_body.rs::wire_code_and_label_never_require_escaping` と
     // 同じ考え方）。
     escape_json_string_into(out, column_wire_type(meta).pg_type_name());
     out.push_str("\"}");
@@ -475,6 +491,164 @@ mod tests {
         }
     }
 
+    /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）が `RowDescription`
+    /// の OID と JSON `columns[].type` の双方で `int4`（OID 23）／`int8`（OID 20）
+    /// として一致公告されることを固定する（Issue #903 レビュー指摘: 一律 `text`
+    /// （OID 25）へ写像すると psql・ドライバ・ORM・JSON クライアントが整数列を
+    /// 文字列として扱ってしまうため是正）。
+    #[test]
+    fn integer_and_bigint_columns_announce_int4_int8_oid_and_json_type() {
+        let columns = vec![
+            ColumnMeta::Scalar {
+                name: "n".to_string(),
+                ty: ColumnType::Integer,
+            },
+            ColumnMeta::Scalar {
+                name: "b".to_string(),
+                ty: ColumnType::BigInt,
+            },
+        ];
+        let expected: [(&str, i32, &str); 2] = [("n", 23, "int4"), ("b", 20, "int8")];
+
+        let row_description =
+            crate::result_encoder::encode_row_description(&columns).expect("encode");
+        let result = QueryResult {
+            columns,
+            rows: Vec::new(),
+        };
+        let body = encode(&result).expect("encode");
+        let top = parse_top(&body);
+        let JsonValue::Array(json_columns) = &top["columns"] else {
+            panic!("columns must be an array");
+        };
+
+        let mut cursor = 1 + 4 + 2; // 'T' + length + field_count
+        for (i, (name, expected_oid, expected_type_name)) in expected.iter().enumerate() {
+            let name_end = row_description[cursor..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("NUL terminator");
+            let actual_name = std::str::from_utf8(&row_description[cursor..cursor + name_end])
+                .expect("utf8 name");
+            assert_eq!(&actual_name, name);
+            cursor += name_end + 1;
+            cursor += 4 + 2; // table_oid + attnum
+            let oid_bytes: [u8; 4] = row_description[cursor..cursor + 4]
+                .try_into()
+                .expect("4 bytes");
+            let oid = i32::from_be_bytes(oid_bytes);
+            assert_eq!(oid, *expected_oid, "column={name}");
+            cursor += 4; // type_oid
+            cursor += 2 + 4 + 2; // typlen + typmod + format
+
+            let JsonValue::Object(col_obj) = &json_columns[i] else {
+                panic!("column must be an object");
+            };
+            let JsonValue::String(actual_type) = &col_obj["type"] else {
+                panic!("type must be a string");
+            };
+            assert_eq!(actual_type, expected_type_name, "column={name}");
+        }
+    }
+
+    /// 新規スカラー型（BOOLEAN／REAL／DOUBLE PRECISION／DATE／TIMESTAMP／
+    /// BYTEA／UUID／JSON／JSONB。WIRE-13・TASK-200・Issue #895）が
+    /// `RowDescription` の OID と JSON `columns[].type` の双方で
+    /// 一致公告されることを固定する（NOSQL-17 の意図どおり、JSON 側の
+    /// 型名も `"text"` から各専用型名へ変わる）。
+    #[test]
+    fn new_scalar_type_columns_announce_builtin_oid_and_json_type() {
+        let columns = vec![
+            ColumnMeta::Scalar {
+                name: "flag".to_string(),
+                ty: ColumnType::Boolean,
+            },
+            ColumnMeta::Scalar {
+                name: "r".to_string(),
+                ty: ColumnType::Real,
+            },
+            ColumnMeta::Scalar {
+                name: "d".to_string(),
+                ty: ColumnType::Double,
+            },
+            ColumnMeta::Scalar {
+                name: "dt".to_string(),
+                ty: ColumnType::Date,
+            },
+            ColumnMeta::Scalar {
+                name: "ts".to_string(),
+                ty: ColumnType::Timestamp,
+            },
+            ColumnMeta::Scalar {
+                name: "blob".to_string(),
+                ty: ColumnType::Bytea,
+            },
+            ColumnMeta::Scalar {
+                name: "uid".to_string(),
+                ty: ColumnType::Uuid,
+            },
+            ColumnMeta::Scalar {
+                name: "doc".to_string(),
+                ty: ColumnType::Json,
+            },
+            ColumnMeta::Scalar {
+                name: "docb".to_string(),
+                ty: ColumnType::Jsonb,
+            },
+        ];
+        let expected: [(&str, i32, &str); 9] = [
+            ("flag", 16, "bool"),
+            ("r", 700, "float4"),
+            ("d", 701, "float8"),
+            ("dt", 1082, "date"),
+            ("ts", 1114, "timestamp"),
+            ("blob", 17, "bytea"),
+            ("uid", 2950, "uuid"),
+            ("doc", 114, "json"),
+            ("docb", 3802, "jsonb"),
+        ];
+
+        let row_description =
+            crate::result_encoder::encode_row_description(&columns).expect("encode");
+        let result = QueryResult {
+            columns,
+            rows: Vec::new(),
+        };
+        let body = encode(&result).expect("encode");
+        let top = parse_top(&body);
+        let JsonValue::Array(json_columns) = &top["columns"] else {
+            panic!("columns must be an array");
+        };
+
+        let mut cursor = 1 + 4 + 2; // 'T' + length + field_count
+        for (i, (name, expected_oid, expected_type_name)) in expected.iter().enumerate() {
+            let name_end = row_description[cursor..]
+                .iter()
+                .position(|&b| b == 0)
+                .expect("NUL terminator");
+            let actual_name = std::str::from_utf8(&row_description[cursor..cursor + name_end])
+                .expect("utf8 name");
+            assert_eq!(&actual_name, name);
+            cursor += name_end + 1;
+            cursor += 4 + 2; // table_oid + attnum
+            let oid_bytes: [u8; 4] = row_description[cursor..cursor + 4]
+                .try_into()
+                .expect("4 bytes");
+            let oid = i32::from_be_bytes(oid_bytes);
+            assert_eq!(oid, *expected_oid, "column={name}");
+            cursor += 4; // type_oid
+            cursor += 2 + 4 + 2; // typlen + typmod + format
+
+            let JsonValue::Object(col_obj) = &json_columns[i] else {
+                panic!("column must be an object");
+            };
+            let JsonValue::String(actual_type) = &col_obj["type"] else {
+                panic!("type must be a string");
+            };
+            assert_eq!(actual_type, expected_type_name, "column={name}");
+        }
+    }
+
     #[test]
     fn row_count_equals_rows_len_for_empty_single_and_multiple_rows() {
         for n in [0usize, 1, 3] {
@@ -571,6 +745,33 @@ mod tests {
             body,
             "{\"columns\":[{\"name\":\"price\",\"type\":\"numeric\"}],\
 \"rows\":[[1.50],[-1.50],[null]],\"row_count\":3}"
+        );
+    }
+
+    /// UUID 列（TABLE-13〔検討中〕・TASK-197、Issue #887）の JSON 出力は
+    /// 正規テキスト表現（小文字 `8-4-4-4-12`）を JSON string として書く（U4）。
+    #[test]
+    fn uuid_cell_encodes_as_json_string() {
+        let result = QueryResult {
+            columns: vec![ColumnMeta::Scalar {
+                name: "ext_id".to_string(),
+                ty: ColumnType::Uuid,
+            }],
+            rows: vec![
+                row(vec![Cell::Uuid(
+                    engine::uuid::parse_uuid_text("12345678-9abc-def0-1234-56789abcdef0")
+                        .expect("valid uuid literal"),
+                )]),
+                row(vec![Cell::Null]),
+            ],
+        };
+        let body = encode(&result).expect("encode");
+        // `type` は WIRE-13・TASK-200・Issue #895 で `text`（OID 25）から
+        // 専用 OID `uuid`（OID 2950）へ変わった（値表現〔JSON string〕は不変）。
+        assert_eq!(
+            body,
+            "{\"columns\":[{\"name\":\"ext_id\",\"type\":\"uuid\"}],\
+\"rows\":[[\"12345678-9abc-def0-1234-56789abcdef0\"],[null]],\"row_count\":2}"
         );
     }
 

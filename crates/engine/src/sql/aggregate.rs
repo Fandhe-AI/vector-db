@@ -131,12 +131,23 @@ impl ReferencedColumns {
             match &item.input {
                 AggregateInput::TextColumn(index)
                 | AggregateInput::BooleanColumn(index)
-                | AggregateInput::DatetimeColumn(index)
+                | AggregateInput::DateColumn(index)
+                | AggregateInput::TimestampColumn(index)
                 | AggregateInput::ArrayColumn(index)
                 | AggregateInput::ByteaColumn(index)
                 | AggregateInput::JsonColumn(index)
                 | AggregateInput::EnumColumn(index)
-                | AggregateInput::NumericColumn(index) => {
+                | AggregateInput::UuidColumn(index)
+                | AggregateInput::IntegerColumn(index)
+                | AggregateInput::BigIntColumn(index)
+                | AggregateInput::RealColumn(index)
+                | AggregateInput::DoubleColumn(index) => {
+                    has_scalar_reference = true;
+                    if let Some(slot) = scalar_mask.get_mut(*index) {
+                        *slot = true;
+                    }
+                }
+                AggregateInput::NumericColumn { index, .. } => {
                     has_scalar_reference = true;
                     if let Some(slot) = scalar_mask.get_mut(*index) {
                         *slot = true;
@@ -220,6 +231,32 @@ pub(crate) enum DecodeTier {
     Embedding,
 }
 
+/// 単一行集計（`GROUP BY` なし）の [`DecodeTier`] 選択本体（Issue #894 で
+/// `execute_aggregate_with_cache` のインライン if 連鎖から抽出。判定式・分岐順序は
+/// 抽出前と完全に同一で挙動はビット同一のまま変わらない）。`ReferencedColumns` が
+/// 新スカラー型（INTEGER〜ENUM。TABLE-13・TASK-199）の列参照も `scalar_mask`／
+/// `has_scalar_reference` へ一律に反映するため、本関数は型ごとの分岐を持たず
+/// `DimAndScalar` に収まる（embedding をデコードしない）。
+pub(crate) fn select_decode_tier(
+    referenced: &ReferencedColumns,
+    has_expr_filters: bool,
+) -> DecodeTier {
+    if referenced.needs_embedding {
+        DecodeTier::Embedding
+    } else if referenced.needs_vector_presence
+        || referenced.any_scalar_column_referenced()
+        || has_expr_filters
+    {
+        DecodeTier::DimAndScalar
+    } else {
+        // `WHERE`（`metadata_filters`・`expr_filters` いずれも空）・`VECTOR` 列
+        // 参照・スカラー列参照のいずれも無い場合のみ（`COUNT(*)`・`COUNT(id)`・
+        // `SUM`/`AVG`/`MIN`/`MAX(id)` の組み合わせ）。RLS 可視判定＋TABLE-12 の
+        // キー/ヘッダ tenant 整合検査だけで完結する（受入条件 3）。
+        DecodeTier::Fast
+    }
+}
+
 /// 集計項目 1 つの実行時アキュムレータ（TASK-166・SQL-13）。すべて O(1) 状態
 /// （`TextMin`/`TextMax` のみ、新しい極値を更新するたびに高々 1 本の `String` を
 /// 保持し直す。`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
@@ -248,6 +285,53 @@ pub(crate) enum Accumulator {
     /// `MIN(<TEXT 列>)`。バイト順比較（`str::lt`/`str::gt`）。
     TextMin(Option<String>),
     TextMax(Option<String>),
+    /// `SUM(<INTEGER>/<BIGINT>)`（Issue #892・D2）。`i128` の `checked_add` で
+    /// 正確に累積し、`finish` で `i64` 範囲を検査する（部分和が一時的に
+    /// `i64` を超えても最終値が収まれば成功する契約のため、確定時に検査する）。
+    IntSum(Option<i128>),
+    /// `AVG(<INTEGER>/<BIGINT>)`（D3）。合計は `i128` で正確に保持し、`finish`
+    /// で `f64` 化して除算する（結果は `Cell::Float`。DOUBLE PRECISION 相当）。
+    IntAvg {
+        sum: Option<i128>,
+        count: u64,
+    },
+    /// `MIN`/`MAX(<INTEGER>/<BIGINT>)`。`i64` の全順序で比較する。
+    IntMin(Option<i64>),
+    IntMax(Option<i64>),
+    /// `SUM(<NUMERIC(p,s)>)`（D5）。`unscaled` を `i128`（`checked_add`）で
+    /// 累積し、列の `scale` をそのまま結果の scale とする。`finish` で
+    /// `Decimal::fits_precision(MAX_PRECISION)` を検査する。
+    NumericSum {
+        sum: Option<i128>,
+        scale: u8,
+    },
+    /// `AVG(<NUMERIC(p,s)>)`（D6）。結果 scale は
+    /// `max(s, min(16, 38 - (p - s)))`（`finish` で算出）。除算は
+    /// [`crate::numeric::avg_unscaled`] による長除算（half away from zero）。
+    NumericAvg {
+        sum: Option<i128>,
+        count: u64,
+        precision: u8,
+        scale: u8,
+    },
+    /// `MIN`/`MAX(<NUMERIC(p,s)>)`。同一 scale の unscaled 値を比較する
+    /// （列の scale と一致しない値は `Accumulator::observe` 側で実装バグとして
+    /// 拒否済みのため、ここでは常に一致している前提）。
+    NumericMin {
+        value: Option<i128>,
+        scale: u8,
+    },
+    NumericMax {
+        value: Option<i128>,
+        scale: u8,
+    },
+    /// `MIN`/`MAX(<DATE>)`（D7）。1970-01-01 起点の日数（`i32`）の全順序比較。
+    DateMin(Option<i32>),
+    DateMax(Option<i32>),
+    /// `MIN`/`MAX(<TIMESTAMP>)`。1970-01-01 起点のマイクロ秒（`i64`）の
+    /// 全順序比較。
+    TimestampMin(Option<i64>),
+    TimestampMax(Option<i64>),
 }
 
 impl Accumulator {
@@ -278,6 +362,71 @@ impl Accumulator {
             (Max, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatMax(None),
             (Min, AggregateInput::TextColumn(_)) => Accumulator::TextMin(None),
             (Max, AggregateInput::TextColumn(_)) => Accumulator::TextMax(None),
+            // Issue #892（D2）: `INTEGER`/`BIGINT` 列。`SUM`/`AVG` は `i128` で
+            // 正確に累積し、確定時（`finish`）に `i64` 範囲を検査する。
+            (Sum, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
+                Accumulator::IntSum(None)
+            }
+            (Avg, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
+                Accumulator::IntAvg {
+                    sum: None,
+                    count: 0,
+                }
+            }
+            (Min, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
+                Accumulator::IntMin(None)
+            }
+            (Max, AggregateInput::IntegerColumn(_) | AggregateInput::BigIntColumn(_)) => {
+                Accumulator::IntMax(None)
+            }
+            // Issue #892（D4）: `REAL`/`DOUBLE PRECISION` 列。`ScalarExpr` と
+            // 同じ `f64` 累積アキュムレータを共有する（結果はどちらも
+            // `Cell::Float`）。
+            (Sum, AggregateInput::RealColumn(_) | AggregateInput::DoubleColumn(_)) => {
+                Accumulator::FloatSum(None)
+            }
+            (Avg, AggregateInput::RealColumn(_) | AggregateInput::DoubleColumn(_)) => {
+                Accumulator::FloatAvg {
+                    sum: None,
+                    count: 0,
+                }
+            }
+            (Min, AggregateInput::RealColumn(_) | AggregateInput::DoubleColumn(_)) => {
+                Accumulator::FloatMin(None)
+            }
+            (Max, AggregateInput::RealColumn(_) | AggregateInput::DoubleColumn(_)) => {
+                Accumulator::FloatMax(None)
+            }
+            // Issue #892（D5・D6）: `NUMERIC(p, s)` 列。
+            (Sum, AggregateInput::NumericColumn { scale, .. }) => Accumulator::NumericSum {
+                sum: None,
+                scale: *scale,
+            },
+            (
+                Avg,
+                AggregateInput::NumericColumn {
+                    precision, scale, ..
+                },
+            ) => Accumulator::NumericAvg {
+                sum: None,
+                count: 0,
+                precision: *precision,
+                scale: *scale,
+            },
+            (Min, AggregateInput::NumericColumn { scale, .. }) => Accumulator::NumericMin {
+                value: None,
+                scale: *scale,
+            },
+            (Max, AggregateInput::NumericColumn { scale, .. }) => Accumulator::NumericMax {
+                value: None,
+                scale: *scale,
+            },
+            // Issue #892（D7）: `DATE`/`TIMESTAMP` 列は `MIN`/`MAX` のみ
+            // （`SUM`/`AVG` は `resolve_aggregate_input` が既に拒否済み）。
+            (Min, AggregateInput::DateColumn(_)) => Accumulator::DateMin(None),
+            (Max, AggregateInput::DateColumn(_)) => Accumulator::DateMax(None),
+            (Min, AggregateInput::TimestampColumn(_)) => Accumulator::TimestampMin(None),
+            (Max, AggregateInput::TimestampColumn(_)) => Accumulator::TimestampMax(None),
             _ => return Err(accumulator_bug("unsupported (func, input) combination")),
         })
     }
@@ -337,15 +486,91 @@ impl Accumulator {
                     Ok(())
                 }
             }
-            // `DATE`／`TIMESTAMP` 列の裸参照も COUNT（非 NULL 行数）専用
-            // （`resolve_aggregate_input` が SUM/AVG/MIN/MAX を型不整合として
-            // 拒否済み。TABLE-13・TASK-197、Issue #884）。`BooleanColumn` と
-            // 同じく値そのものは問わず「NULL でない」ことだけを数える。
-            AggregateInput::DatetimeColumn(index) => {
-                if scanned.get(*index).copied().flatten().is_some() {
-                    self.observe_present()
-                } else {
-                    Ok(())
+            // `DATE`／`TIMESTAMP` 列の裸参照は `COUNT`・`MIN`/`MAX` を受理する
+            // （TABLE-13・TASK-197、Issue #884・#892）。`resolve_aggregate_input`
+            // が `SUM`/`AVG` を型不整合として既に拒否済みのため、`observe_date`/
+            // `observe_timestamp` が到達する `Accumulator` は `Count`／
+            // `DateMin`/`DateMax`（`TimestampMin`/`TimestampMax`）のいずれか。
+            AggregateInput::DateColumn(index) => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(v) => Some(v.as_date().ok_or_else(|| {
+                        accumulator_bug("DateColumn observed a ScalarRef that is not Date")
+                    })?),
+                    None => None,
+                };
+                self.observe_date(value)
+            }
+            AggregateInput::TimestampColumn(index) => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(v) => Some(v.as_timestamp().ok_or_else(|| {
+                        accumulator_bug(
+                            "TimestampColumn observed a ScalarRef that is not Timestamp",
+                        )
+                    })?),
+                    None => None,
+                };
+                self.observe_timestamp(value)
+            }
+            // `INTEGER`／`BIGINT` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` の
+            // すべてを受理する（TABLE-13・TASK-196、Issue #881・#892）。`SUM`/
+            // `AVG` は `i128` で累積し、確定時（`finish`）に `i64` 範囲を
+            // 検査する（D2）。
+            AggregateInput::IntegerColumn(index) => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(row_codec::ScalarRef::Integer(v)) => Some(i64::from(v)),
+                    Some(_) => {
+                        return Err(accumulator_bug(
+                            "IntegerColumn observed a ScalarRef that is not Integer",
+                        ))
+                    }
+                    None => None,
+                };
+                self.observe_int(value)
+            }
+            AggregateInput::BigIntColumn(index) => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(row_codec::ScalarRef::BigInt(v)) => Some(v),
+                    Some(_) => {
+                        return Err(accumulator_bug(
+                            "BigIntColumn observed a ScalarRef that is not BigInt",
+                        ))
+                    }
+                    None => None,
+                };
+                self.observe_int(value)
+            }
+            // `REAL`／`DOUBLE PRECISION` 列も `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
+            // のすべてを受理する（Issue #892・D4）。既存の `ScalarExpr` と同じ
+            // `f64` 累積アキュムレータへ観測する（`observe_float` は
+            // `is_finite()` 検査込みで累積・非有限化は `22003`）。
+            AggregateInput::RealColumn(index) => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(row_codec::ScalarRef::Real(v)) => Some(f64::from(v)),
+                    Some(_) => {
+                        return Err(accumulator_bug(
+                            "RealColumn observed a ScalarRef that is not Real",
+                        ))
+                    }
+                    None => None,
+                };
+                match value {
+                    Some(v) => self.observe_float(v),
+                    None => Ok(()),
+                }
+            }
+            AggregateInput::DoubleColumn(index) => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(row_codec::ScalarRef::Double(v)) => Some(v),
+                    Some(_) => {
+                        return Err(accumulator_bug(
+                            "DoubleColumn observed a ScalarRef that is not Double",
+                        ))
+                    }
+                    None => None,
+                };
+                match value {
+                    Some(v) => self.observe_float(v),
+                    None => Ok(()),
                 }
             }
             // ARRAY 列の裸参照も BOOLEAN と同じく COUNT（非 NULL 行数）専用
@@ -387,10 +612,34 @@ impl Accumulator {
                     Ok(())
                 }
             }
-            // NUMERIC 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
+            // `NUMERIC(p, s)` 列は `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のすべてを
+            // 受理する（TABLE-13〔検討中〕・TASK-197、Issue #885・#892）。
+            // 格納された `Decimal` の scale は常に列の scale と一致する契約
+            // （`row_codec`/`catalog` の TABLE-13 検証）のため、不一致は
+            // デコード側の実装バグとして fail-closed に拒否する。
+            AggregateInput::NumericColumn { index, scale, .. } => {
+                let value = match scanned.get(*index).copied().flatten() {
+                    Some(row_codec::ScalarRef::Numeric(d)) => {
+                        if d.scale() != *scale {
+                            return Err(accumulator_bug(
+                                "NumericColumn observed a Decimal whose scale does not match the column",
+                            ));
+                        }
+                        Some(d.unscaled())
+                    }
+                    Some(_) => {
+                        return Err(accumulator_bug(
+                            "NumericColumn observed a ScalarRef that is not Numeric",
+                        ))
+                    }
+                    None => None,
+                };
+                self.observe_numeric(value)
+            }
+            // UUID 列の裸参照も COUNT（非 NULL 行数）専用（`resolve_aggregate_input`
             // が SUM/AVG/MIN/MAX を型不整合として拒否済み。TABLE-13〔検討中〕・
-            // TASK-197、Issue #885。`SUM`/`AVG`/`MIN`/`MAX` は別 Issue #892 の担当）。
-            AggregateInput::NumericColumn(index) => {
+            // TASK-197、Issue #887）。
+            AggregateInput::UuidColumn(index) => {
                 if scanned.get(*index).copied().flatten().is_some() {
                     self.observe_present()
                 } else {
@@ -615,6 +864,205 @@ impl Accumulator {
         }
     }
 
+    /// `value` が `None`（`INTEGER`/`BIGINT` 列 NULL）の行は無視する
+    /// （Issue #892・D2）。`SUM`/`AVG` は `i128` の `checked_add` で正確に
+    /// 累積し、`i64` 範囲の検査は `finish` の確定時まで遅延させる（部分和が
+    /// 一時的に `i64` を超えても最終値が収まれば成功する契約のため）。
+    /// `MIN`/`MAX` は `i64` のまま全順序で比較する。
+    fn observe_int(&mut self, value: Option<i64>) -> Result<(), SqlSurfaceError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        match self {
+            Accumulator::Count(n) => {
+                *n = n.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::IntSum(s) => {
+                let widened = i128::from(value);
+                let next = match s {
+                    None => widened,
+                    Some(cur) => cur.checked_add(widened).ok_or_else(|| {
+                        SqlSurfaceError::numeric_out_of_range(
+                            "SUM(INTEGER/BIGINT) intermediate accumulation overflowed",
+                        )
+                    })?,
+                };
+                *s = Some(next);
+                Ok(())
+            }
+            Accumulator::IntAvg { sum, count } => {
+                let widened = i128::from(value);
+                let next = match sum {
+                    None => widened,
+                    Some(cur) => cur.checked_add(widened).ok_or_else(|| {
+                        SqlSurfaceError::numeric_out_of_range(
+                            "AVG(INTEGER/BIGINT) intermediate accumulation overflowed",
+                        )
+                    })?,
+                };
+                *sum = Some(next);
+                *count = count.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range(
+                        "AVG(INTEGER/BIGINT) row count exceeds u64 range",
+                    )
+                })?;
+                Ok(())
+            }
+            Accumulator::IntMin(m) => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.min(*cur),
+                });
+                Ok(())
+            }
+            Accumulator::IntMax(m) => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.max(*cur),
+                });
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "observe_int on an incompatible accumulator",
+            )),
+        }
+    }
+
+    /// `value` が `None`（`NUMERIC` 列 NULL）の行は無視する（Issue #892・
+    /// D5・D6）。`value` は呼び出し元（[`Self::observe`]）が列の scale と
+    /// 一致することを検証済みの unscaled 値。`SUM`/`AVG` は `i128` の
+    /// `checked_add` で累積し、桁あふれ（38 桁超過）の検査は `finish` の
+    /// 確定時まで遅延させる。`MIN`/`MAX` は同一 scale の unscaled 値を直接
+    /// 比較する（scale が同一な限り数値としての大小関係と一致する）。
+    fn observe_numeric(&mut self, value: Option<i128>) -> Result<(), SqlSurfaceError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        match self {
+            Accumulator::Count(n) => {
+                *n = n.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::NumericSum { sum, .. } => {
+                let next = match sum {
+                    None => value,
+                    Some(cur) => cur.checked_add(value).ok_or_else(|| {
+                        SqlSurfaceError::numeric_out_of_range(
+                            "SUM(NUMERIC) intermediate accumulation overflowed",
+                        )
+                    })?,
+                };
+                *sum = Some(next);
+                Ok(())
+            }
+            Accumulator::NumericAvg { sum, count, .. } => {
+                let next = match sum {
+                    None => value,
+                    Some(cur) => cur.checked_add(value).ok_or_else(|| {
+                        SqlSurfaceError::numeric_out_of_range(
+                            "AVG(NUMERIC) intermediate accumulation overflowed",
+                        )
+                    })?,
+                };
+                *sum = Some(next);
+                *count = count.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range(
+                        "AVG(NUMERIC) row count exceeds u64 range",
+                    )
+                })?;
+                Ok(())
+            }
+            Accumulator::NumericMin { value: m, .. } => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.min(*cur),
+                });
+                Ok(())
+            }
+            Accumulator::NumericMax { value: m, .. } => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.max(*cur),
+                });
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "observe_numeric on an incompatible accumulator",
+            )),
+        }
+    }
+
+    /// `value` が `None`（`DATE` 列 NULL）の行は無視する（Issue #892・D7）。
+    /// `resolve_aggregate_input` が `SUM`/`AVG` を既に拒否済みのため、ここで
+    /// 到達するのは `Count`／`DateMin`/`DateMax` のいずれか。
+    fn observe_date(&mut self, value: Option<i32>) -> Result<(), SqlSurfaceError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        match self {
+            Accumulator::Count(n) => {
+                *n = n.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::DateMin(m) => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.min(*cur),
+                });
+                Ok(())
+            }
+            Accumulator::DateMax(m) => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.max(*cur),
+                });
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "observe_date on an incompatible accumulator",
+            )),
+        }
+    }
+
+    /// `TIMESTAMP` 版の [`Self::observe_date`]（同じ契約）。
+    fn observe_timestamp(&mut self, value: Option<i64>) -> Result<(), SqlSurfaceError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        match self {
+            Accumulator::Count(n) => {
+                *n = n.checked_add(1).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::TimestampMin(m) => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.min(*cur),
+                });
+                Ok(())
+            }
+            Accumulator::TimestampMax(m) => {
+                *m = Some(match m {
+                    None => value,
+                    Some(cur) => value.max(*cur),
+                });
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "observe_timestamp on an incompatible accumulator",
+            )),
+        }
+    }
+
     /// `TextMin`/`TextMax` が現在保持している文字列のバイト数（未保持なら 0、
     /// それ以外の集計種別は常に 0）。呼び出し元（`sql::group_by`）が `observe`
     /// 前後でこの値を比較し、`GROUP BY` 全体での TEXT アキュムレータ累計バイト数を
@@ -633,8 +1081,12 @@ impl Accumulator {
 
     /// 空集合契約: `COUNT` は `0`、それ以外は `NULL`（PostgreSQL 互換。TASK-166・
     /// SQL-13）。`AVG` は合計を保持したまま `finish` の時点で除算する。
-    pub(crate) fn finish(self) -> Cell {
-        match self {
+    ///
+    /// Issue #892（D2・D5・D6）: `SUM(INTEGER/BIGINT)` の `i64` 範囲検査、
+    /// `SUM`/`AVG(NUMERIC)` の 38 桁上限検査をここで確定的に行うため
+    /// `Result` を返す（`22003`＝[`SqlSurfaceError::numeric_out_of_range`]）。
+    pub(crate) fn finish(self) -> Result<Cell, SqlSurfaceError> {
+        Ok(match self {
             Accumulator::Count(n) => Cell::Integer(n),
             Accumulator::IdSum(s) => s.map(Cell::Integer).unwrap_or(Cell::Null),
             Accumulator::IdAvg { sum, count } => match sum {
@@ -652,8 +1104,108 @@ impl Accumulator {
             Accumulator::FloatMax(m) => m.map(Cell::Float).unwrap_or(Cell::Null),
             Accumulator::TextMin(m) => m.map(Cell::Text).unwrap_or(Cell::Null),
             Accumulator::TextMax(m) => m.map(Cell::Text).unwrap_or(Cell::Null),
-        }
+            // Issue #892（D2）: 部分和は `i128` で正確に保持し、ここで初めて
+            // `i64`（BIGINT）範囲を検査する（走査順に依存しない確定的判定）。
+            Accumulator::IntSum(s) => match s {
+                None => Cell::Null,
+                Some(sum) => {
+                    let narrowed = i64::try_from(sum).map_err(|_| {
+                        SqlSurfaceError::numeric_out_of_range(
+                            "SUM(INTEGER/BIGINT) exceeds BIGINT range",
+                        )
+                    })?;
+                    Cell::SignedInteger(narrowed)
+                }
+            },
+            Accumulator::IntAvg { sum, count } => match sum {
+                None => Cell::Null,
+                Some(s) => Cell::Float(s as f64 / count as f64),
+            },
+            Accumulator::IntMin(m) => m.map(Cell::SignedInteger).unwrap_or(Cell::Null),
+            Accumulator::IntMax(m) => m.map(Cell::SignedInteger).unwrap_or(Cell::Null),
+            // Issue #892（D5）: `unscaled` は列の scale のまま保持しているため
+            // `Decimal::from_parts` の scale 検証は必ず通る（列の scale は
+            // カタログ検証済みで常に `<= MAX_PRECISION`）。桁あふれ（38 桁超過）
+            // は `fits_precision` で確定的に検査する。
+            Accumulator::NumericSum { sum, scale } => match sum {
+                None => Cell::Null,
+                Some(unscaled) => {
+                    let decimal = crate::numeric::Decimal::from_parts(unscaled, scale)
+                        .map_err(|_| accumulator_bug("SUM(NUMERIC) produced an invalid scale"))?;
+                    if !decimal.fits_precision(crate::numeric::MAX_PRECISION) {
+                        return Err(SqlSurfaceError::numeric_out_of_range(
+                            "SUM(NUMERIC) exceeds the maximum supported precision",
+                        ));
+                    }
+                    Cell::Numeric(decimal)
+                }
+            },
+            // Issue #892（D6）: 結果 scale は列の `precision`/`scale` から
+            // `numeric_avg_result_scale` で決め、除算は
+            // `crate::numeric::avg_unscaled`（長除算・half away from zero）に
+            // 委譲する。丸め後の桁あふれは防御的に再検査する。
+            Accumulator::NumericAvg {
+                sum,
+                count,
+                precision,
+                scale,
+            } => match sum {
+                None => Cell::Null,
+                Some(unscaled_sum) => {
+                    let result_scale = numeric_avg_result_scale(precision, scale);
+                    let avg =
+                        crate::numeric::avg_unscaled(unscaled_sum, count, scale, result_scale)
+                            .map_err(|_| {
+                                SqlSurfaceError::numeric_out_of_range(
+                                    "AVG(NUMERIC) exceeds the maximum supported precision",
+                                )
+                            })?;
+                    let decimal = crate::numeric::Decimal::from_parts(avg, result_scale)
+                        .map_err(|_| accumulator_bug("AVG(NUMERIC) produced an invalid scale"))?;
+                    if !decimal.fits_precision(crate::numeric::MAX_PRECISION) {
+                        return Err(SqlSurfaceError::numeric_out_of_range(
+                            "AVG(NUMERIC) exceeds the maximum supported precision",
+                        ));
+                    }
+                    Cell::Numeric(decimal)
+                }
+            },
+            // `MIN`/`MAX` は observe 時点で列の scale と一致する値のみを保持
+            // するため、`from_parts` は常に成功する想定（不一致は実装バグとして
+            // `accumulator_bug` で fail-closed に拒否する）。
+            Accumulator::NumericMin { value, scale } => match value {
+                None => Cell::Null,
+                Some(unscaled) => Cell::Numeric(
+                    crate::numeric::Decimal::from_parts(unscaled, scale).map_err(|_| {
+                        accumulator_bug("MIN(NUMERIC) holds a value with an invalid scale")
+                    })?,
+                ),
+            },
+            Accumulator::NumericMax { value, scale } => match value {
+                None => Cell::Null,
+                Some(unscaled) => Cell::Numeric(
+                    crate::numeric::Decimal::from_parts(unscaled, scale).map_err(|_| {
+                        accumulator_bug("MAX(NUMERIC) holds a value with an invalid scale")
+                    })?,
+                ),
+            },
+            Accumulator::DateMin(m) => m.map(Cell::Date).unwrap_or(Cell::Null),
+            Accumulator::DateMax(m) => m.map(Cell::Date).unwrap_or(Cell::Null),
+            Accumulator::TimestampMin(m) => m.map(Cell::Timestamp).unwrap_or(Cell::Null),
+            Accumulator::TimestampMax(m) => m.map(Cell::Timestamp).unwrap_or(Cell::Null),
+        })
     }
+}
+
+/// `AVG(<NUMERIC(p,s)>)` の結果 scale（Issue #892・D6）。列の scale `s` を
+/// 下限とし、整数部（`p - s` 桁）と合わせて `crate::numeric::MAX_PRECISION`
+/// （38 桁）以内に収まるよう最大 16 桁まで拡張する
+/// （`max(s, min(16, MAX_PRECISION - (p - s)))`）。`p >= s` は列宣言時の
+/// カタログ検証済み契約。
+fn numeric_avg_result_scale(precision: u8, scale: u8) -> u8 {
+    let integer_digits = precision.saturating_sub(scale);
+    let budget = crate::numeric::MAX_PRECISION.saturating_sub(integer_digits);
+    scale.max(budget.min(16))
 }
 
 /// `TextMin`/`TextMax` が新しい極値を保持し直す際にのみ呼ぶ（1 項目あたり高々
@@ -756,7 +1308,10 @@ pub(crate) fn execute_aggregate_with_cache(
 
     // Issue #350: クエリが実際に参照する列集合から、可視行 1 件あたりの最小限の
     // デコード段階（[`DecodeTier`]）を一度だけ決める（`GROUP BY` なしなので
-    // `extra_scalar_index` は無し）。
+    // `extra_scalar_index` は無し）。新スカラー型（INTEGER〜ENUM。TABLE-13・
+    // TASK-199）の列参照も `ReferencedColumns::derive` が `scalar_mask` へ
+    // 反映済みのため、以下の判定式は型を問わず「スカラー列参照の有無」だけを見る
+    // （新型ごとの分岐は増えない。#894 で判定式自体の網羅性を確認済み）。
     let referenced = ReferencedColumns::derive(
         schema,
         &bound.items,
@@ -764,20 +1319,7 @@ pub(crate) fn execute_aggregate_with_cache(
         &bound.expr_filters,
         None,
     );
-    let tier = if referenced.needs_embedding {
-        DecodeTier::Embedding
-    } else if referenced.needs_vector_presence
-        || referenced.any_scalar_column_referenced()
-        || !bound.expr_filters.is_empty()
-    {
-        DecodeTier::DimAndScalar
-    } else {
-        // `WHERE`（`metadata_filters`・`expr_filters` いずれも空）・`VECTOR` 列
-        // 参照・スカラー列参照のいずれも無い場合のみ（`COUNT(*)`・`COUNT(id)`・
-        // `SUM`/`AVG`/`MIN`/`MAX(id)` の組み合わせ）。RLS 可視判定＋TABLE-12 の
-        // キー/ヘッダ tenant 整合検査だけで完結する（受入条件 3）。
-        DecodeTier::Fast
-    };
+    let tier = select_decode_tier(&referenced, !bound.expr_filters.is_empty());
 
     // Issue #475: `WHERE` が索引対応述語のみ（`classify_scalar_plan` が
     // `PlainScan` 以外）で構成される場合、`user_rows/{table}` の全行走査
@@ -845,7 +1387,7 @@ pub(crate) fn execute_aggregate_with_cache(
                         )?;
                     }
                 }
-                return Ok(finish_aggregate_result(accumulators, bound));
+                return finish_aggregate_result(accumulators, bound);
             }
         }
     }
@@ -1082,29 +1624,35 @@ pub(crate) fn execute_aggregate_with_cache(
         }
     }
 
-    Ok(finish_aggregate_result(accumulators, bound))
+    finish_aggregate_result(accumulators, bound)
 }
 
 /// 確定した [`Accumulator`] 群から単一行の [`QueryResult`] を組み立てる
 /// （キャッシュヒット経路・従来の走査経路の両方が共有する終端処理。Issue #478）。
-fn finish_aggregate_result(accumulators: Vec<Accumulator>, bound: &BoundAggregate) -> QueryResult {
+/// Issue #892: `Accumulator::finish` が `Result` を返すようになった
+/// （`SUM(INTEGER/BIGINT)` の `i64` 範囲検査・`SUM`/`AVG(NUMERIC)` の 38 桁上限
+/// 検査を確定時に行うため）ため、本関数も `Result` を返す。
+fn finish_aggregate_result(
+    accumulators: Vec<Accumulator>,
+    bound: &BoundAggregate,
+) -> Result<QueryResult, SqlSurfaceError> {
     let mut columns = Vec::with_capacity(bound.items.len());
     let mut cells = Vec::with_capacity(bound.items.len());
     for (accumulator, item) in accumulators.into_iter().zip(&bound.items) {
         columns.push(ColumnMeta::Computed {
             name: item.name.clone(),
         });
-        cells.push(accumulator.finish());
+        cells.push(accumulator.finish()?);
     }
 
-    QueryResult {
+    Ok(QueryResult {
         columns,
         rows: vec![ResultRow {
             id: 0,
             score: 0.0,
             cells,
         }],
-    }
+    })
 }
 
 /// Issue #475: `GROUP BY` なし・索引対応述語のみの `WHERE` を持つ集計を、
@@ -1189,6 +1737,10 @@ fn try_scalar_index_aggregate(
         .iter()
         .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
         .collect();
+    // 数値・日時・`NUMERIC`・`UUID` 列の範囲述語（`FilterOp::TypedCompare`。
+    // Issue #891・TASK-199 で production 結線済み）は `bound.metadata_filters`
+    // に混在したまま渡り、`ScalarIndex::candidates_for` が内部で振り分ける
+    // （Issue #893 production 接続）。
     let slots = match index.resolve_candidates(&bound.metadata_filters, &id_preds) {
         crate::sql::scalar_index::CandidateResolution::Use(slots) => slots,
         crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
@@ -1225,7 +1777,7 @@ fn try_scalar_index_aggregate(
         )?;
     }
     scalar_access.cache.record_aggregate_index_scan();
-    Ok(Some(finish_aggregate_result(accumulators, bound)))
+    Ok(Some(finish_aggregate_result(accumulators, bound)?))
 }
 
 /// Issue #475: `WHERE` なし・索引対応述語のみの `WHERE` を持つ `GROUP BY` の
@@ -1870,13 +2422,13 @@ mod tests {
     #[test]
     fn count_empty_set_is_zero() {
         let acc = count_acc();
-        assert_eq!(acc.finish(), Cell::Integer(0));
+        assert_eq!(acc.finish().unwrap(), Cell::Integer(0));
     }
 
     #[test]
     fn sum_id_empty_set_is_null() {
         let acc = Accumulator::new(AggregateFunc::Sum, &AggregateInput::IdU64).unwrap();
-        assert_eq!(acc.finish(), Cell::Null);
+        assert_eq!(acc.finish().unwrap(), Cell::Null);
     }
 
     #[test]
@@ -1892,7 +2444,7 @@ mod tests {
         let mut acc = Accumulator::new(AggregateFunc::Avg, &AggregateInput::IdU64).unwrap();
         acc.observe_id(2).unwrap();
         acc.observe_id(4).unwrap();
-        assert_eq!(acc.finish(), Cell::Float(3.0));
+        assert_eq!(acc.finish().unwrap(), Cell::Float(3.0));
     }
 
     #[test]
@@ -1911,14 +2463,14 @@ mod tests {
             min.observe_text(v).unwrap();
             max.observe_text(v).unwrap();
         }
-        assert_eq!(min.finish(), Cell::Text("apple".to_string()));
-        assert_eq!(max.finish(), Cell::Text("cherry".to_string()));
+        assert_eq!(min.finish().unwrap(), Cell::Text("apple".to_string()));
+        assert_eq!(max.finish().unwrap(), Cell::Text("cherry".to_string()));
     }
 
     #[test]
     fn text_min_max_empty_set_is_null() {
         let min = Accumulator::TextMin(None);
-        assert_eq!(min.finish(), Cell::Null);
+        assert_eq!(min.finish().unwrap(), Cell::Null);
     }
 
     #[test]
@@ -1929,8 +2481,114 @@ mod tests {
             min.observe_float(v).unwrap();
             max.observe_float(v).unwrap();
         }
-        assert_eq!(min.finish(), Cell::Float(-1.5));
-        assert_eq!(max.finish(), Cell::Float(42.0));
+        assert_eq!(min.finish().unwrap(), Cell::Float(-1.5));
+        assert_eq!(max.finish().unwrap(), Cell::Float(42.0));
+    }
+
+    // --- Issue #892: 新スカラー型のアキュムレータ単体テスト ------------------
+
+    #[test]
+    fn int_sum_finish_rejects_values_exceeding_i64_range() {
+        let mut acc = Accumulator::IntSum(None);
+        acc.observe_int(Some(i64::MAX)).unwrap();
+        acc.observe_int(Some(1)).unwrap();
+        let err = acc.finish().unwrap_err();
+        assert_eq!(err.wire_code(), "22003");
+    }
+
+    #[test]
+    fn int_sum_finish_succeeds_when_partial_overflow_cancels_out() {
+        // 部分和が一時的に `i64` を超えても最終値が収まれば成功する（D2）。
+        let mut acc = Accumulator::IntSum(None);
+        acc.observe_int(Some(i64::MAX)).unwrap();
+        acc.observe_int(Some(1)).unwrap();
+        acc.observe_int(Some(-1)).unwrap();
+        assert_eq!(acc.finish().unwrap(), Cell::SignedInteger(i64::MAX));
+    }
+
+    #[test]
+    fn int_min_max_null_rows_are_ignored() {
+        let mut min = Accumulator::IntMin(None);
+        let mut max = Accumulator::IntMax(None);
+        min.observe_int(None).unwrap();
+        max.observe_int(None).unwrap();
+        min.observe_int(Some(-3)).unwrap();
+        max.observe_int(Some(-3)).unwrap();
+        min.observe_int(Some(5)).unwrap();
+        max.observe_int(Some(5)).unwrap();
+        assert_eq!(min.finish().unwrap(), Cell::SignedInteger(-3));
+        assert_eq!(max.finish().unwrap(), Cell::SignedInteger(5));
+    }
+
+    #[test]
+    fn numeric_sum_finish_rejects_values_exceeding_38_digits() {
+        let near_max = 99_999_999_999_999_999_999_999_999_999_999_999_999i128;
+        let mut acc = Accumulator::NumericSum {
+            sum: None,
+            scale: 0,
+        };
+        acc.observe_numeric(Some(near_max)).unwrap();
+        acc.observe_numeric(Some(1)).unwrap();
+        let err = acc.finish().unwrap_err();
+        assert_eq!(err.wire_code(), "22003");
+    }
+
+    #[test]
+    fn numeric_min_max_compare_unscaled_values_at_the_same_scale() {
+        let mut min = Accumulator::NumericMin {
+            value: None,
+            scale: 2,
+        };
+        let mut max = Accumulator::NumericMax {
+            value: None,
+            scale: 2,
+        };
+        for v in [150i128, -50, 300] {
+            min.observe_numeric(Some(v)).unwrap();
+            max.observe_numeric(Some(v)).unwrap();
+        }
+        assert_eq!(
+            min.finish().unwrap(),
+            Cell::Numeric(crate::numeric::Decimal::from_parts(-50, 2).unwrap())
+        );
+        assert_eq!(
+            max.finish().unwrap(),
+            Cell::Numeric(crate::numeric::Decimal::from_parts(300, 2).unwrap())
+        );
+    }
+
+    #[test]
+    fn date_and_timestamp_min_max_ignore_null_rows() {
+        let mut day_min = Accumulator::DateMin(None);
+        let mut day_max = Accumulator::DateMax(None);
+        day_min.observe_date(None).unwrap();
+        day_max.observe_date(None).unwrap();
+        for v in [100i32, -50, 300] {
+            day_min.observe_date(Some(v)).unwrap();
+            day_max.observe_date(Some(v)).unwrap();
+        }
+        assert_eq!(day_min.finish().unwrap(), Cell::Date(-50));
+        assert_eq!(day_max.finish().unwrap(), Cell::Date(300));
+
+        let mut ts_min = Accumulator::TimestampMin(None);
+        let mut ts_max = Accumulator::TimestampMax(None);
+        for v in [1_000i64, -500, 3_000] {
+            ts_min.observe_timestamp(Some(v)).unwrap();
+            ts_max.observe_timestamp(Some(v)).unwrap();
+        }
+        assert_eq!(ts_min.finish().unwrap(), Cell::Timestamp(-500));
+        assert_eq!(ts_max.finish().unwrap(), Cell::Timestamp(3_000));
+    }
+
+    #[test]
+    fn numeric_avg_result_scale_expands_scale_up_to_16_within_the_38_digit_budget() {
+        // `NUMERIC(5, 2)`: 整数部 3 桁 → budget = 38-3 = 35 → min(16,35)=16。
+        assert_eq!(numeric_avg_result_scale(5, 2), 16);
+        // `NUMERIC(38, 2)`: 整数部 36 桁 → budget = 38-36 = 2 → 列の scale のまま。
+        assert_eq!(numeric_avg_result_scale(38, 2), 2);
+        // `NUMERIC(38, 38)`: 整数部 0 桁 → budget = 38 → min(16,38)=16 だが
+        // 列の scale（38）自体が下限のため、拡張されず 38 のまま。
+        assert_eq!(numeric_avg_result_scale(38, 38), 38);
     }
 
     // --- Issue #475: piggyback 索引採取の soft-fail 契約 ------------------
@@ -2186,5 +2844,289 @@ mod tests {
             failures_after_second, failures_after_first,
             "a generation already known to be unbuildable must not retry the build"
         );
+    }
+
+    // --- Issue #894: 新スカラー型（TABLE-13・TASK-199）の DecodeTier 選択 ------
+    //
+    // `select_decode_tier` は Issue #350 の判定式をインライン if 連鎖から抽出した
+    // ものであり、`ReferencedColumns` が新型の列参照をどう反映するかにさえ依存
+    // しない（`scalar_mask`／`has_scalar_reference` を見るだけで型を区別しない）。
+    // ここでは (a) 関数単体を直接構成した `ReferencedColumns` で固定し、
+    // (b) 新型 `AggregateInput` を実際に `ReferencedColumns::derive` へ通した
+    // 経路でも `DimAndScalar` に収まり `needs_embedding() == false` になることを
+    // 固定する（受入条件 3）。
+
+    fn referenced_columns_for_test(
+        scalar_mask: Vec<bool>,
+        needs_embedding: bool,
+        needs_vector_presence: bool,
+        has_scalar_reference: bool,
+    ) -> ReferencedColumns {
+        ReferencedColumns {
+            scalar_mask,
+            needs_embedding,
+            needs_vector_presence,
+            has_scalar_reference,
+        }
+    }
+
+    #[test]
+    fn select_decode_tier_no_reference_is_fast() {
+        let referenced =
+            referenced_columns_for_test(vec![false, false, false], false, false, false);
+        assert_eq!(select_decode_tier(&referenced, false), DecodeTier::Fast);
+    }
+
+    #[test]
+    fn select_decode_tier_scalar_reference_is_dim_and_scalar() {
+        let referenced = referenced_columns_for_test(vec![false, true, false], false, false, true);
+        assert_eq!(
+            select_decode_tier(&referenced, false),
+            DecodeTier::DimAndScalar
+        );
+    }
+
+    #[test]
+    fn select_decode_tier_vector_presence_is_dim_and_scalar() {
+        let referenced = referenced_columns_for_test(vec![false, false, false], false, true, false);
+        assert_eq!(
+            select_decode_tier(&referenced, false),
+            DecodeTier::DimAndScalar
+        );
+    }
+
+    #[test]
+    fn select_decode_tier_expr_filter_is_dim_and_scalar() {
+        let referenced =
+            referenced_columns_for_test(vec![false, false, false], false, false, false);
+        assert_eq!(
+            select_decode_tier(&referenced, true),
+            DecodeTier::DimAndScalar
+        );
+    }
+
+    #[test]
+    fn select_decode_tier_needs_embedding_wins_over_scalar_reference() {
+        // `needs_embedding` は `scalar_mask`／`has_scalar_reference` の状態を問わず
+        // 最優先で `Embedding` を選ぶ（判定式の分岐順序を固定する）。
+        let referenced = referenced_columns_for_test(vec![true, true], true, true, true);
+        assert_eq!(select_decode_tier(&referenced, true), DecodeTier::Embedding);
+    }
+
+    /// 新スカラー型（TABLE-13・TASK-199）を多数含むスキーマ。`ReferencedColumns::
+    /// derive` が型ごとに分岐せず一律に `scalar_mask` を立てることを確認する
+    /// ための固定 fixture（列順は本 Issue のスコープと無関係で任意）。
+    fn many_new_scalar_types_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true), // 0
+                ColumnDef::new("u", ColumnType::Uuid, true),              // 1
+                ColumnDef::new("bo", ColumnType::Boolean, true),          // 2
+                ColumnDef::new(
+                    "n",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ), // 3
+                ColumnDef::new("dt", ColumnType::Date, true),             // 4
+                ColumnDef::new("ts", ColumnType::Timestamp, true),        // 5
+                ColumnDef::new("i", ColumnType::Integer, true),           // 6
+                ColumnDef::new("bi", ColumnType::BigInt, true),           // 7
+                ColumnDef::new("r", ColumnType::Real, true),              // 8
+                ColumnDef::new("d", ColumnType::Double, true),            // 9
+            ],
+        )
+    }
+
+    #[test]
+    fn derive_and_select_decode_tier_new_type_count_is_dim_and_scalar_without_embedding() {
+        let schema = many_new_scalar_types_schema();
+        for (input, label) in [
+            (AggregateInput::UuidColumn(1), "uuid"),
+            (AggregateInput::BooleanColumn(2), "boolean"),
+            (
+                AggregateInput::NumericColumn {
+                    index: 3,
+                    precision: 10,
+                    scale: 2,
+                },
+                "numeric",
+            ),
+            (AggregateInput::DateColumn(4), "date"),
+            (AggregateInput::TimestampColumn(5), "timestamp"),
+            (AggregateInput::IntegerColumn(6), "integer"),
+            (AggregateInput::BigIntColumn(7), "bigint"),
+            (AggregateInput::RealColumn(8), "real"),
+            (AggregateInput::DoubleColumn(9), "double"),
+        ] {
+            let items = vec![BoundAggregateItem {
+                func: AggregateFunc::Count,
+                input: input.clone(),
+                name: "result".to_string(),
+            }];
+            let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+            assert!(
+                !referenced.needs_embedding(),
+                "COUNT({label}) must not require embedding decode"
+            );
+            let tier = select_decode_tier(&referenced, false);
+            assert_eq!(
+                tier,
+                DecodeTier::DimAndScalar,
+                "COUNT({label}) must select DimAndScalar (TABLE-13・TASK-199)"
+            );
+            let col_index = match &input {
+                AggregateInput::UuidColumn(i)
+                | AggregateInput::BooleanColumn(i)
+                | AggregateInput::DateColumn(i)
+                | AggregateInput::TimestampColumn(i)
+                | AggregateInput::IntegerColumn(i)
+                | AggregateInput::BigIntColumn(i)
+                | AggregateInput::RealColumn(i)
+                | AggregateInput::DoubleColumn(i) => *i,
+                AggregateInput::NumericColumn { index, .. } => *index,
+                _ => unreachable!(),
+            };
+            assert!(
+                referenced.scalar_mask()[col_index],
+                "COUNT({label}) must mark its own column in scalar_mask"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_and_select_decode_tier_count_star_on_new_type_schema_is_fast() {
+        // `WHERE`・スカラー列参照・`VECTOR` 列参照のいずれも無い `COUNT(*)` は、
+        // 新型列を多数持つスキーマでも `Fast` のまま（受入条件 3）。
+        let schema = many_new_scalar_types_schema();
+        let items = vec![BoundAggregateItem {
+            func: AggregateFunc::Count,
+            input: AggregateInput::AllVisible,
+            name: "result".to_string(),
+        }];
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+        assert_eq!(select_decode_tier(&referenced, false), DecodeTier::Fast);
+    }
+
+    #[test]
+    fn derive_and_select_decode_tier_count_embedding_on_new_type_schema_is_dim_and_scalar() {
+        // `COUNT(<VECTOR 列>)`（次元のみ必要・embedding 本体は不要）は、新型列を
+        // 多数持つスキーマでも従来どおり `DimAndScalar`。
+        let schema = many_new_scalar_types_schema();
+        let items = vec![BoundAggregateItem {
+            func: AggregateFunc::Count,
+            input: AggregateInput::VectorColumnPresence,
+            name: "result".to_string(),
+        }];
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+        assert!(!referenced.needs_embedding());
+        assert_eq!(
+            select_decode_tier(&referenced, false),
+            DecodeTier::DimAndScalar
+        );
+    }
+
+    /// 新型列を持つスキーマでの TABLE-12（キー側／ヘッダ側 tenant 不一致）が、
+    /// `Fast`／`DimAndScalar` いずれの tier でも fail-closed（`XX000`）で
+    /// 拒否されることを固定する（受入条件 2。`key_tenant_header_tenant_mismatch_
+    /// is_rejected_fail_closed` の新型版）。
+    #[test]
+    fn key_tenant_header_tenant_mismatch_is_rejected_fail_closed_on_new_type_schema_fast_and_dim_and_scalar(
+    ) {
+        let path = unique_db_path("agg-table12-mismatch-new-types");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = many_new_scalar_types_schema();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_with_mismatched_key_tenant(
+            &storage,
+            "docs",
+            "tenant-a",
+            "tenant-b",
+            1,
+            &[1.0, 2.0, 3.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-b").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        // Fast tier: COUNT(*)
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
+                .expect_err("Fast tier must reject key/header tenant mismatch");
+        assert_eq!(err.wire_code(), "XX000");
+
+        // DimAndScalar tier: COUNT(<UUID 列>)（新型列参照）
+        let bound_uuid = bound_single(AggregateFunc::Count, AggregateInput::UuidColumn(1));
+        let err =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_uuid, None, None, None)
+                .expect_err(
+                    "DimAndScalar tier (new-type column) must reject key/header tenant mismatch",
+                );
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    /// `Fast` tier（`COUNT(*)`・新型列は非参照）でも、可視行の新型スカラー列
+    /// メタデータが破損していれば fail-closed に拒否する（受入条件 2。
+    /// `count_star_still_fails_closed_on_corrupted_metadata_with_no_scalar_
+    /// reference` の新型版。REAL 列に NaN のビットパターンを直接書き込む）。
+    #[test]
+    fn count_star_still_fails_closed_on_corrupted_new_type_metadata_with_no_scalar_reference() {
+        let path = unique_db_path("agg-metadata-corrupt-new-type-no-scalar-ref");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true),
+                ColumnDef::new("score", ColumnType::Real, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let mut metadata = row_codec::encode_scalar_columns(
+            &schema,
+            &[row_codec::Value::Null, row_codec::Value::Real(1.0)],
+        )
+        .expect("encode scalar columns");
+        // presence タグはそのまま、REAL 値のバイト列だけを NaN へ書き換える
+        // （末尾 4 バイトが REAL の値フィールド。`SCALAR_REAL_ENTRY_LEN` = 5 =
+        // presence(1) + f32(4)）。
+        let value_offset = metadata.len() - 4;
+        metadata[value_offset..].copy_from_slice(&f32::NAN.to_le_bytes());
+
+        let buf = crate::storage::encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0],
+            metadata: &metadata,
+        })
+        .expect("encode row");
+        write_row_raw(&storage, "docs", "tenant-a", 1, &buf);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_star,
+            None,
+            None,
+            None,
+        )
+        .expect_err(
+            "COUNT(*) must fail closed on corrupted REAL metadata even with no scalar column referenced",
+        );
+        assert_eq!(err.wire_code(), "XX000");
     }
 }

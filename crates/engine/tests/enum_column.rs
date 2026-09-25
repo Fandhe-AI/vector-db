@@ -171,7 +171,9 @@ fn create_enum_type_rejects_builtin_type_name_collision_case_insensitive() {
     // "numeric" は main 側で既に予約済みの型名。"decimal"（NUMERIC の別名）は
     // 本 Issue（#885）で `RESERVED_TYPE_NAMES` へ追加したため、既存の型名衝突
     // 検査に追随させる。
-    for reserved in ["text", "VECTOR", "Boolean", "bytea", "numeric", "DECIMAL"] {
+    for reserved in [
+        "text", "VECTOR", "Boolean", "bytea", "numeric", "DECIMAL", "UUID",
+    ] {
         assert!(
             matches!(
                 storage

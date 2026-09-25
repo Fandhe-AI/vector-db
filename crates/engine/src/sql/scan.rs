@@ -197,6 +197,10 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                     match &column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
                         ColumnType::Text
+                        | ColumnType::Integer
+                        | ColumnType::BigInt
+                        | ColumnType::Real
+                        | ColumnType::Double
                         | ColumnType::Boolean
                         | ColumnType::Date
                         | ColumnType::Timestamp
@@ -205,7 +209,8 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                         | ColumnType::Json
                         | ColumnType::Jsonb
                         | ColumnType::Enum(_)
-                        | ColumnType::Numeric { .. } => {
+                        | ColumnType::Numeric { .. }
+                        | ColumnType::Uuid => {
                             has_scalar_reference = true;
                             if let Some(slot) = scalar_mask.get_mut(*index) {
                                 *slot = true;
@@ -484,30 +489,78 @@ pub fn execute_scan(
                                 }
                             }
                             ColumnType::Text => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_text() {
-                                    Some(t) => {
-                                        cells.push(Cell::Text(try_alloc_text_for_budget(
-                                            t,
-                                            &mut byte_budget,
-                                            MAX_SCAN_RESULT_BYTES,
-                                        )?));
-                                    }
-                                    None => {
-                                        return Err(scan_bug(
-                                            "TEXT column scan yielded a non-Text scalar value",
-                                        ))
-                                    }
-                                },
+                                Some(Some(row_codec::ScalarRef::Text(t))) => {
+                                    cells.push(Cell::Text(try_alloc_text_for_budget(
+                                        t,
+                                        &mut byte_budget,
+                                        MAX_SCAN_RESULT_BYTES,
+                                    )?))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
+                            },
+                            // F8（Issue #882 計画）: REAL/DOUBLE は `Cell::Float`
+                            // （REAL は f64 への無損失拡大）へ投影する。
+                            ColumnType::Real => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Real(v))) => {
+                                    cells.push(Cell::Float(f64::from(*v)))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
+                            },
+                            ColumnType::Double => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Double(v))) => {
+                                    cells.push(Cell::Float(*v))
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
+                            },
+                            ColumnType::Integer => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Integer(v))) => {
+                                    cells.push(Cell::SignedInteger(i64::from(*v)))
+                                }
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scanned scalar type mismatch for INTEGER column"
+                                            .to_string(),
+                                    })
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::BigInt => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::BigInt(v))) => {
+                                    cells.push(Cell::SignedInteger(*v))
+                                }
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scanned scalar type mismatch for BIGINT column"
+                                            .to_string(),
+                                    })
+                                }
                                 Some(None) | None => cells.push(Cell::Null),
                             },
                             ColumnType::Boolean => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_bool() {
-                                    Some(b) => cells.push(Cell::Bool(b)),
-                                    None => return Err(scan_bug(
-                                        "BOOLEAN column scan yielded a non-Boolean scalar value",
-                                    )),
-                                },
+                                Some(Some(row_codec::ScalarRef::Bool(b))) => {
+                                    cells.push(Cell::Bool(*b))
+                                }
                                 Some(None) | None => cells.push(Cell::Null),
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scalar payload type mismatch".to_string(),
+                                    })
+                                }
                             },
                             ColumnType::Date => match scanned.get(*index) {
                                 Some(Some(v)) => match v.as_date() {
@@ -601,6 +654,15 @@ pub fn execute_scan(
                                     Some(d) => cells.push(Cell::Numeric(d)),
                                     None => return Err(scan_bug(
                                         "NUMERIC column scan yielded a non-Numeric scalar value",
+                                    )),
+                                },
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::Uuid => match scanned.get(*index) {
+                                Some(Some(v)) => match v.as_uuid() {
+                                    Some(u) => cells.push(Cell::Uuid(u)),
+                                    None => return Err(scan_bug(
+                                        "UUID column scan yielded a non-Uuid scalar value",
                                     )),
                                 },
                                 Some(None) | None => cells.push(Cell::Null),
@@ -1023,5 +1085,92 @@ mod tests {
                 try_accumulate_budget(cell_only_budget, cell_struct_bytes, MAX_SCAN_RESULT_BYTES)
                     .expect("cell_struct_bytes alone must not exceed the cap at this row count");
         }
+    }
+
+    // --- Issue #894: 新スカラー型（TABLE-13・TASK-199）の DecodeTier 選択 ------
+
+    /// 新スカラー型を多数含むスキーマ（`sql::aggregate` モジュール内テストの
+    /// `many_new_scalar_types_schema` と同型の列構成）。
+    fn many_new_scalar_types_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true), // 0
+                ColumnDef::new("u", ColumnType::Uuid, true),              // 1
+                ColumnDef::new("bo", ColumnType::Boolean, true),          // 2
+                ColumnDef::new(
+                    "n",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ), // 3
+                ColumnDef::new("dt", ColumnType::Date, true),             // 4
+            ],
+        )
+    }
+
+    #[test]
+    fn decode_tier_for_new_type_projection_is_dim_and_scalar() {
+        let schema = many_new_scalar_types_schema();
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Column {
+                    index: 1,
+                    name: "u".to_string(),
+                },
+                ProjectedColumn::Column {
+                    index: 4,
+                    name: "dt".to_string(),
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            limit: 10,
+        };
+        let (tier, mask) = decode_tier_for(&schema, &bound);
+        assert_eq!(tier, DecodeTier::DimAndScalar);
+        assert_eq!(mask, vec![false, true, false, false, true]);
+    }
+
+    #[test]
+    fn decode_tier_for_id_only_projection_on_new_type_schema_is_fast() {
+        let schema = many_new_scalar_types_schema();
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![ProjectedColumn::Id],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            limit: 10,
+        };
+        let (tier, mask) = decode_tier_for(&schema, &bound);
+        assert_eq!(tier, DecodeTier::Fast);
+        assert!(mask.iter().all(|&wanted| !wanted));
+    }
+
+    #[test]
+    fn decode_tier_for_vector_projection_is_embedding() {
+        let schema = many_new_scalar_types_schema();
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Column {
+                    index: 0,
+                    name: "embedding".to_string(),
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            limit: 10,
+        };
+        let (tier, _mask) = decode_tier_for(&schema, &bound);
+        assert_eq!(tier, DecodeTier::Embedding);
     }
 }
