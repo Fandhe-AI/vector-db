@@ -3352,6 +3352,10 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         TenantWriteError::TooManyRowsScanned => {
             SqlSurfaceError::payload_too_large("too many rows scanned")
         }
+        // UNIQUE 制約違反（TABLE-16・TASK-204、Issue #905）。`_` 節（`XX000`）へ
+        // 丸めると `23505` を失い、クライアントが再送不能なエラーとして
+        // 誤って再試行判断してしまう。
+        TenantWriteError::UniqueViolation => SqlSurfaceError::UniqueViolation,
         // 同じく commit 前 abort の内部事象版（型不整合等。untrusted 入力起因では
         // ないため `XX000`。`_` 節と同じ分類だが意図を明示する）。
         TenantWriteError::ReturningProjectionFailed(_) => SqlSurfaceError::Internal {

@@ -271,6 +271,8 @@ pub enum CatalogError {
         from: String,
         to: String,
     },
+    InvalidUniqueConstraint(String),
+    UniqueConstraintViolation,
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError
