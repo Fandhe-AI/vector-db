@@ -14,7 +14,7 @@
 //! `unwrap`/`expect`/添字アクセス `[]` を使わず `get()`・`checked_*` で untrusted な
 //! リテラル文字列を解析する（`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
 
-use crate::catalog::{ColumnType, TableSchema};
+use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, TableSchema};
 use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
     FunctionArg, InsertLiteral, OnConflictAction, OrderByForm, Projection, UpsertValue,
@@ -1650,6 +1650,94 @@ pub fn bind_insert(
 /// `stmt.rows[0]` のみを見る）と [`bind_insert_form`] の複数行分岐の双方から
 /// 共有する。`table_name`・`operation_id` は行に依存しないため呼び出し元が
 /// 1 度だけ渡す。
+/// 省略列への `DEFAULT` 補完・非 nullable 検査を一括して行う唯一の適用点
+/// （TABLE-16・TASK-204、Issue #904）。`bind_insert_row`（SQL `INSERT`・
+/// NoSQL `insert` op が経由する `bind_insert`）・`bind_file_insert`
+/// （ファイル形 `INSERT`）・`bind_upsert_form`（`UPSERT` の挿入側提案行）が
+/// 共有する。`provided[i]` が立っている列（明示的に値または `NULL` が
+/// 与えられた列）はここでは一切触らない——`DEFAULT` は「省略」にのみ適用し、
+/// 明示的な `NULL` には適用しない契約（TABLE-16）はこの呼び分けで担保する。
+pub(crate) fn fill_omitted_columns(
+    columns: &[ColumnDef],
+    bound_values: &mut [crate::row_codec::Value],
+    provided: &[bool],
+) -> Result<(), SqlSurfaceError> {
+    for (idx, column) in columns.iter().enumerate() {
+        let is_provided = provided.get(idx).copied().unwrap_or(false);
+        if is_provided {
+            continue;
+        }
+        match &column.default {
+            Some(default) => {
+                let value = bind_column_default(column, default)?;
+                if let Some(slot) = bound_values.get_mut(idx) {
+                    *slot = value;
+                }
+            }
+            None => {
+                if !column.nullable {
+                    return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`ColumnDefault`] を実際の列型の [`crate::row_codec::Value`] へ束縛する
+/// （TABLE-16・TASK-204、Issue #904）。カタログ層
+/// （`catalog::ColumnDefault::compatible_with`。`validate_schema` 経由で
+/// 既に検証済み）が型の大分類の整合を保証するが、数値の精度・範囲検証は
+/// 既存の `INSERT` リテラル束縛ヘルパーへ委譲し、第 2 の実装を作らない。
+fn bind_column_default(
+    column: &ColumnDef,
+    default: &ColumnDefault,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let literal = match default {
+        ColumnDefault::Text(s) => InsertLiteral::String(s.clone()),
+        ColumnDefault::Number(s) => InsertLiteral::Number(s.clone()),
+        ColumnDefault::Bool(b) => InsertLiteral::Bool(*b),
+    };
+    let incompatible = || {
+        SqlSurfaceError::invalid_input(format!(
+            "column {:?} DEFAULT is not compatible with its type",
+            column.name
+        ))
+    };
+    match &column.ty {
+        ColumnType::Text => match &literal {
+            InsertLiteral::String(s) => Ok(crate::row_codec::Value::Text(s.clone())),
+            _ => Err(incompatible()),
+        },
+        ColumnType::Integer | ColumnType::BigInt => {
+            bind_integer_literal(&column.name, column.ty.clone(), &literal)
+        }
+        ColumnType::Real => match &literal {
+            InsertLiteral::Number(n) => Ok(crate::row_codec::Value::Real(bind_real_literal(n)?)),
+            _ => Err(incompatible()),
+        },
+        ColumnType::Double => match &literal {
+            InsertLiteral::Number(n) => {
+                Ok(crate::row_codec::Value::Double(bind_double_literal(n)?))
+            }
+            _ => Err(incompatible()),
+        },
+        ColumnType::Boolean => match &literal {
+            InsertLiteral::Bool(b) => Ok(crate::row_codec::Value::Bool(*b)),
+            _ => Err(incompatible()),
+        },
+        ColumnType::Numeric { precision, scale } => {
+            bind_numeric_literal(&literal, &column.name, *precision, *scale)
+        }
+        // `VECTOR` は `DEFAULT` 自体が構文段階（`sql::allowlist::
+        // parse_create_table_column`）で拒否されるため到達しない。他の型
+        // （配列・日時・ENUM 等）は `catalog::ColumnDefault::compatible_with`
+        // が `false` を返しカタログに永続化できないため同様に到達しない。
+        // 到達した場合も fail-closed に拒否する。
+        _ => Err(incompatible()),
+    }
+}
+
 fn bind_insert_row(
     table_name: &str,
     columns: &[String],
@@ -1839,16 +1927,16 @@ fn bind_insert_row(
                 )))
             }
             // `InsertLiteral::Null`（Issue #889 レビュー指摘）は SQL テキストの
-            // `INSERT ... VALUES` 構文からは構築されない到達不能パス
-            // （`sql::allowlist` の VALUES リテラルパーサーは `NULL` トークンを
-            // 生成しない）。この分岐は match の網羅性のためだけに存在し、
-            // 到達した場合も fail-closed に拒否する（列を省略すれば
-            // nullable 列は `Value::Null` で埋まる既存契約と役割が重複するため、
-            // `INSERT` に明示 `NULL` リテラルを追加で受理する必要はない）。
+            // `INSERT ... VALUES` 構文からは構築されない（`sql::allowlist` の
+            // VALUES リテラルパーサーは `NULL` トークンを生成しない）が、NoSQL
+            // 表層 `insert` op（Issue #904 D5）が JSON `null` を本 variant として
+            // 渡すため到達する。TABLE-16 の確定契約: 明示 `NULL` には `DEFAULT`
+            // を適用せず、nullable 列は `Value::Null`、非 nullable 列は
+            // `NotNullViolation`（`23502`）へ倒す（省略時の `DEFAULT` 補完とは
+            // 独立の経路。下の省略列補完ループ参照）。
+            (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
             (_, InsertLiteral::Null) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} does not accept an explicit NULL literal in INSERT"
-                )))
+                return Err(SqlSurfaceError::not_null_violation(name.clone()))
             }
             (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
             (
@@ -1871,15 +1959,7 @@ fn bind_insert_row(
         }
     }
 
-    for (idx, column) in schema.columns.iter().enumerate() {
-        let is_provided = provided.get(idx).copied().unwrap_or(false);
-        if !is_provided && !column.nullable {
-            return Err(SqlSurfaceError::invalid_input(format!(
-                "column {:?} is not nullable but was not provided",
-                column.name
-            )));
-        }
-    }
+    fill_omitted_columns(&schema.columns, &mut bound_values, &provided)?;
 
     Ok(BoundInsert {
         table: table_name.to_string(),
@@ -2256,9 +2336,7 @@ fn bind_set_assignments(
             // リテラルの字句規則が追加された場合）でも同じ扱いを共有する。
             (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
             (_, InsertLiteral::Null) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} is not nullable"
-                )))
+                return Err(SqlSurfaceError::not_null_violation(name.clone()))
             }
             (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
             (
@@ -2688,10 +2766,14 @@ fn bind_upsert_form(
                             .get(*src_idx)
                             .map(|c| c.name.as_str())
                             .unwrap_or("?");
-                        return Err(SqlSurfaceError::invalid_input(format!(
-                            "column {target_name:?} is not nullable but EXCLUDED.{src_name} is NULL for row id {}",
-                            row.id
-                        )));
+                        // 文言に行 `id` を含めていた旧実装から、他分類
+                        // （`NotNullViolation`・`23502`）との一貫性のため列名の
+                        // みを含む固定形式へ変更（TABLE-16・TASK-204、
+                        // Issue #904。src_name は EXCLUDED 修飾子の参照先の
+                        // ため引き続きログ的に有用だが `client_message` の
+                        // 一般文言と型を揃える）。
+                        let _ = (src_name, row.id);
+                        return Err(SqlSurfaceError::not_null_violation(target_name));
                     }
                 }
             }
@@ -2876,12 +2958,11 @@ fn bind_upsert_assignments(
                     }
                     // `InsertLiteral::Null`（Issue #889 レビュー指摘）は
                     // `ON CONFLICT ... DO UPDATE SET` の SQL 構文からは構築
-                    // されない到達不能パス（match の網羅性のためだけの分岐。
-                    // `bind_set_assignments` のドキュメント参照）。
+                    // されない到達不能パス（match の網羅性のためだけの分岐）。
+                    // 到達した場合も明示 NULL の確定契約（TABLE-16）へ倒す。
+                    (_, InsertLiteral::Null) if column.nullable => crate::row_codec::Value::Null,
                     (_, InsertLiteral::Null) => {
-                        return Err(SqlSurfaceError::invalid_input(format!(
-                            "column {name:?} does not accept an explicit NULL literal in ON CONFLICT DO UPDATE SET"
-                        )))
+                        return Err(SqlSurfaceError::not_null_violation(name.clone()))
                     }
                     (ColumnType::Uuid, InsertLiteral::String(s)) => bind_uuid_literal(s, name)?,
                     (ColumnType::Uuid, InsertLiteral::Number(_) | InsertLiteral::Bool(_) | InsertLiteral::Vector(_)) => {
@@ -2987,11 +3068,13 @@ fn bind_file_insert(
             }
             // `InsertLiteral::Null`（Issue #889 レビュー指摘）はファイル形
             // `INSERT` の VALUES 構文からは構築されない到達不能パス（match の
-            // 網羅性のためだけの分岐。`bind_set_assignments` のドキュメント参照）。
+            // 網羅性のためだけの分岐）。到達した場合も明示 NULL の確定契約
+            // （TABLE-16。nullable なら NULL・非 nullable なら `23502`）へ倒す。
+            (ColumnType::Text, InsertLiteral::Null) if column.nullable => {
+                crate::row_codec::Value::Null
+            }
             (ColumnType::Text, InsertLiteral::Null) => {
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} does not accept an explicit NULL literal in file-form INSERT"
-                )))
+                return Err(SqlSurfaceError::not_null_violation(name.clone()))
             }
             // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
             // 前提だが、防御的に拒否する（各チャンクのベクトルはサーバー側が
@@ -3090,17 +3173,31 @@ fn bind_file_insert(
         }
     }
 
+    // 省略列への `DEFAULT` 補完・非 nullable 検査（TABLE-16・TASK-204、
+    // Issue #904）。VECTOR 列はクライアントが指定しない（埋め込み結果で後から
+    // 埋める）ため、この判定自体の対象外として読み飛ばす
+    // （`fill_omitted_columns` を素朴に適用すると VECTOR 列が
+    // 「省略・DEFAULT なし・非 nullable」として誤って拒否されるため専用ループを保つ）。
     for (idx, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
-            // VECTOR 列はクライアントが指定しない（埋め込み結果で後から埋める）。
             continue;
         }
         let is_provided = provided.get(idx).copied().unwrap_or(false);
-        if !is_provided && !column.nullable {
-            return Err(SqlSurfaceError::invalid_input(format!(
-                "column {:?} is not nullable but was not provided",
-                column.name
-            )));
+        if is_provided {
+            continue;
+        }
+        match &column.default {
+            Some(default) => {
+                let value = bind_column_default(column, default)?;
+                if let Some(slot) = template_values.get_mut(idx) {
+                    *slot = value;
+                }
+            }
+            None => {
+                if !column.nullable {
+                    return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
+                }
+            }
         }
     }
 
@@ -4844,7 +4941,7 @@ mod tests {
             "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2,0.3]') USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "23502");
     }
 
     #[test]
@@ -5510,7 +5607,7 @@ mod tests {
             &file_docs_schema(),
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "23502");
     }
 
     #[test]
@@ -5628,7 +5725,7 @@ mod tests {
             &schema,
         )
         .unwrap_err();
-        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(err.wire_code(), "23502");
     }
 
     #[test]

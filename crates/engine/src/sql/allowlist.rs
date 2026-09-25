@@ -10,7 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
-use crate::catalog::{ColumnDef, ColumnType};
+use crate::catalog::{ColumnDef, ColumnDefault, ColumnType, MAX_COLUMN_DEFAULT_LEN};
 use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
@@ -331,6 +331,15 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// 列に `NOT NULL` 制約が宣言されているにもかかわらず、値が省略された、
+    /// または明示的に `NULL` として書き込まれた（TABLE-16・TASK-204、
+    /// Issue #904）。`DEFAULT` 句を持つ列は省略時に既定値が補われるため
+    /// 本 variant にならない（明示 `NULL` は `DEFAULT` を適用せずこちらへ
+    /// 倒す。TABLE-16 の確定契約）。ERR-6: `23502`
+    /// （[`crate::error_format::ErrorClass::NotNullViolation`]。`wire_code` は
+    /// [`SqlSurfaceError::MissingOperationId`] と共有し `code` ラベルでのみ
+    /// 区別する）。
+    NotNullViolation { column: String },
     /// `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約に
     /// 違反した（[`crate::tenant::TenantWriteError::UniqueViolation`] の写像。
     /// ERR-6: `23505`）。行キー衝突（[`SqlSurfaceError::IdConflict`]。物理キー
@@ -451,6 +460,16 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::parser`（`bind_literal_for_column`・`fill_omitted_columns`
+    /// 等）が NOT NULL 制約違反（列の省略・明示 NULL）を報告するために使う
+    /// （TABLE-16・TASK-204、Issue #904）。他テナントの情報・値そのものは
+    /// 含めず列名のみを保持する（security.md P0）。
+    pub(crate) fn not_null_violation(column: impl Into<String>) -> Self {
+        SqlSurfaceError::NotNullViolation {
+            column: truncate_for_error(&column.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::exec::map_write_error` が
     /// [`crate::tenant::TenantWriteError::UniqueViolation`] を写像するために使う
     /// （TABLE-16・TASK-204、Issue #903）。
@@ -492,6 +511,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
+            SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
         }
     }
@@ -578,6 +598,13 @@ impl std::fmt::Display for SqlSurfaceError {
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied for DDL statement")
+            }
+            // 値そのもの・他テナントの情報を含めない固定形式（security.md P0）。
+            SqlSurfaceError::NotNullViolation { column } => {
+                write!(
+                    f,
+                    "null value in column {column:?} violates not-null constraint"
+                )
             }
             // 行キー衝突（`IdConflict`）とは別の固定文言（`TenantWriteError::
             // UniqueViolation` の `Display` と同じ考え方）。キー値・行 id・
@@ -1119,6 +1146,15 @@ impl ValidatedScan {
     }
 }
 
+/// `CREATE TABLE` の列制約（`NOT NULL`／`DEFAULT <literal>`。TABLE-16・
+/// TASK-204、Issue #904）の構文木。列型ごとの適用可否（`DEFAULT` の型整合・
+/// `VECTOR` への `DEFAULT` 禁止等）は呼び出し元（`Parser::
+/// parse_create_table_column`）が判定する。
+struct ColumnConstraints {
+    not_null: bool,
+    default: Option<InsertLiteral>,
+}
+
 /// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
 /// （文字列リテラル／数値）のみを構造として保持し、列型との照合・意味論的解釈は
 /// `sql::parser::bind_insert` の責務とする。UPDATE の SET 句のリテラル値表現としても
@@ -1129,17 +1165,22 @@ pub enum InsertLiteral {
     Number(String),
     /// BOOLEAN 列向けの `true`/`false` リテラル（TABLE-13・TASK-196、Issue #883）。
     Bool(bool),
-    /// SQL `NULL`（nullable 列への明示的な NULL 設定。Issue #889 レビュー指摘・
-    /// PR #1014。SQL の `UPDATE ... SET` 構文には現状 `NULL` リテラルの字句・
-    /// 構文規則が無く（`sql::allowlist` の `SET` 句パーサーは `NULL` トークンを
-    /// 生成しない）、本 variant は NoSQL 表層 `update` op
-    /// （`wire-server::http::query::update::map_set_assignments`）が JSON
-    /// `null` かつ nullable 列の場合にのみ構築する。`bind_set_assignments`
-    /// （SQL-17・SQL-19 の UPDATE SET 束縛）はこの variant を
-    /// `column.nullable` に応じて `Value::Null`／エラーへ写像し、
-    /// `bind_insert`／`bind_upsert_assignments`／`bind_file_insert`
-    /// （INSERT・UPSERT。SQL テキストからもファイル形からも `Null` は
-    /// 構築されない到達不能パス）は fail-closed に一律拒否する。
+    /// SQL `NULL`（明示的な NULL 指定。Issue #889 レビュー指摘・PR #1014）。
+    /// SQL の `UPDATE ... SET` 構文には現状 `NULL` リテラルの字句・構文規則が
+    /// 無く（`sql::allowlist` の `SET` 句パーサーは `NULL` トークンを生成
+    /// しない）、SQL テキストの `INSERT ... VALUES` 構文からも構築されない
+    /// （VALUES 要素パーサーが `NULL` トークンを受理しない）。本 variant は
+    /// NoSQL 表層 `update`／`insert` op（`wire-server::http::query::update::
+    /// map_set_assignments`・`insert::bind_row`。TABLE-16・TASK-204、
+    /// Issue #904 D5）が JSON `null` から構築する。
+    ///
+    /// 明示的な `NULL` には `DEFAULT` を適用しない契約（TABLE-16）のため、
+    /// 「省略」（`DEFAULT` 適用対象。`sql::parser::fill_omitted_columns`）とは
+    /// 独立の経路として扱う。`bind_insert_row`・`bind_set_assignments`
+    /// （UPDATE）・`bind_upsert_assignments`（UPSERT `DO UPDATE SET`）・
+    /// `bind_file_insert` はいずれも `column.nullable` に応じて
+    /// `Value::Null`（nullable）／`SqlSurfaceError::NotNullViolation`
+    /// （非 nullable。`23502`）へ写像する（列型を問わない一律拒否ではない）。
     Null,
     /// `VECTOR` 列向けの、既に要素ごとに検証済みの `f32` 列（NoSQL 表層
     /// `insert`／`update` op が JSON 配列から直接構築する。Issue #896
@@ -2855,7 +2896,28 @@ impl<'a> Parser<'a> {
 
         let column = if self.peek_ident_matches("TEXT") {
             self.advance();
-            ColumnDef::new(name, ColumnType::Text, true)
+            let constraints = self.parse_column_constraints()?;
+            let default = match constraints.default {
+                None => None,
+                Some(InsertLiteral::String(s)) => {
+                    if s.len() > MAX_COLUMN_DEFAULT_LEN {
+                        return Err(SqlSurfaceError::payload_too_large(format!(
+                            "column {name:?} DEFAULT literal exceeds length limit"
+                        )));
+                    }
+                    Some(ColumnDefault::Text(s))
+                }
+                Some(_) => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "column {name:?} DEFAULT expects a text literal"
+                    )))
+                }
+            };
+            let mut column = ColumnDef::new(name, ColumnType::Text, !constraints.not_null);
+            if let Some(default) = default {
+                column = column.with_default(default);
+            }
+            column
         } else if self.peek_ident_matches("VECTOR") {
             self.advance();
             self.expect_punct('(')?;
@@ -2864,6 +2926,14 @@ impl<'a> Parser<'a> {
                 SqlSurfaceError::unsupported(format!("invalid VECTOR dimension: {raw_dim:?}"))
             })?;
             self.expect_punct(')')?;
+            let constraints = self.parse_column_constraints()?;
+            if constraints.default.is_some() {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "column {name:?}: VECTOR columns do not support DEFAULT"
+                )));
+            }
+            // VECTOR は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
+            // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
             ColumnDef::new(name, ColumnType::Vector(dim), false)
         } else {
             return Err(SqlSurfaceError::unsupported(
@@ -2872,8 +2942,12 @@ impl<'a> Parser<'a> {
         };
 
         // 列制約 `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`CONSTRAINT
-        // <name> PRIMARY KEY` 形・`UNIQUE`／`NOT NULL`／`DEFAULT`／`CHECK`／
-        // `REFERENCES` はいずれも許可リスト外のまま（受理しない）。
+        // <name> PRIMARY KEY` 形・`UNIQUE`／`REFERENCES`／`CHECK` はいずれも
+        // 許可リスト外のまま（受理しない）。`NOT NULL`／`DEFAULT`
+        // （TABLE-16・TASK-204、Issue #904）は列型キーワードの直後
+        // （`parse_column_constraints` 内）で先に受理済みで、`PRIMARY KEY` は
+        // その後段の独立した列制約として構文上共存できる（`finalize_primary_key`
+        // が主キー列の `nullable` を最終的に `false` へ強制する）。
         let is_pk = if self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY") {
             self.advance();
             self.advance();
@@ -2923,6 +2997,41 @@ impl<'a> Parser<'a> {
             ));
         }
         Ok(cols)
+    }
+
+    /// `CREATE TABLE` の列定義に続く列制約（`NOT NULL`／`DEFAULT <literal>`。
+    /// TABLE-16・TASK-204、Issue #904）を、順序自由・各々最大 1 回まで受理する。
+    /// それぞれの重複指定は `42601`。列型ごとの適用可否（`VECTOR` への
+    /// `DEFAULT` 禁止等）は呼び出し元（[`Parser::parse_create_table_column`]）が
+    /// 判定する。`DEFAULT NULL` は `expect_literal` が `NULL` トークンを
+    /// リテラルとして受理しないため、構造的に `42601` で拒否される
+    /// （TABLE-16: 明示 `NULL` は `DEFAULT` の対象外）。
+    fn parse_column_constraints(&mut self) -> Result<ColumnConstraints, SqlSurfaceError> {
+        let mut not_null = false;
+        let mut default: Option<InsertLiteral> = None;
+        loop {
+            if self.peek_ident_matches("NOT") {
+                self.advance();
+                self.expect_contextual_keyword("NULL")?;
+                if not_null {
+                    return Err(SqlSurfaceError::unsupported(
+                        "duplicate NOT NULL constraint",
+                    ));
+                }
+                not_null = true;
+                continue;
+            }
+            if self.peek_ident_matches("DEFAULT") {
+                self.advance();
+                if default.is_some() {
+                    return Err(SqlSurfaceError::unsupported("duplicate DEFAULT constraint"));
+                }
+                default = Some(self.expect_literal()?);
+                continue;
+            }
+            break;
+        }
+        Ok(ColumnConstraints { not_null, default })
     }
 
     /// `DROP TABLE <table> [;]` の単一テーブル形のみを受理する（SQL-23、

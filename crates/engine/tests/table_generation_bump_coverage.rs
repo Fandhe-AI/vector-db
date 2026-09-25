@@ -117,14 +117,22 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `validate_primary_key`・`ColumnType::is_primary_key_allowed`／
     // `primary_key_tag`・カタログ v4 encode/decode・`alter_table_drop_column`
     // の主キー列拒否）で `catalog.rs` 冒頭側にさらに行が追加され、以下 2 件の
-    // 行番号がさらに移動したための追随（旧: 2238／2317）。
-    ("catalog.rs", 2487),
+    // 行番号がさらに移動したための追随（旧: 2238／2317）。Issue #904
+    // （NOT NULL／DEFAULT 宣言構文。`ColumnDefault` 型・カタログ v5 形式への
+    // 分離）で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 2487）。同
+    // Issue のレビュー対応（`hex_decode` の添字直接アクセス撤去。fail-closed な
+    // `get()` ベースへの書き換え）でさらに 10 行増え、再度追随。base（main）
+    // 取り込みマージ（Issue #903・#904 の PRIMARY KEY／v4・v5 カタログ形式の
+    // 統合。`parse_create_table_column` の NOT NULL／DEFAULT・PRIMARY KEY
+    // 列制約併合を含む）で `catalog.rs` 冒頭側にさらに行が追加され、以下
+    // 2 件の行番号が移動したための追随（旧: 2565／2644）。
+    ("catalog.rs", 2842),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（`alter_enum_type_add_value` の commit 呼び出しは
     // 依存テーブルの世代を明示的に進行させるため ALLOWLIST 対象外のまま）。
-    ("catalog.rs", 2566),
+    ("catalog.rs", 2921),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_

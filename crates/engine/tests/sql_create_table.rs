@@ -79,14 +79,15 @@ fn create_table_succeeds_with_vector_and_text_columns() {
         "INSERT INTO docs (id, embedding) VALUES (1, '[0.1,0.2,0.3,0.4]') USING OPERATION_ID 'op-omit-body'",
     )
     .expect("omitting the nullable TEXT column must succeed");
-    // `embedding`（non-null）を省略した INSERT は `22000` で拒否される。
+    // `embedding`（non-null）を省略した INSERT は `23502`（`NotNullViolation`。
+    // TABLE-16・TASK-204、Issue #904。旧 `22000` から契約変更）で拒否される。
     let err = core
         .execute_insert_sql(
             &alice,
             "INSERT INTO docs (id, body) VALUES (2, 'hello') USING OPERATION_ID 'op-omit-embedding'",
         )
         .expect_err("omitting the non-null VECTOR column must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "23502");
     // 次元 4 の VECTOR 列として検索できる。
     let hits = core
         .execute_sql(
