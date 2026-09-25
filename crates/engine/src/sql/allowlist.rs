@@ -2713,8 +2713,20 @@ impl<'a> Parser<'a> {
                 columns.push(column);
                 if columns.len() >= MAX_CREATE_TABLE_COLUMNS {
                     // 直後がカンマでもここで打ち切る（元実装の判定位置を維持。
-                    // PR #1044 レビューの off-by-one 是正を踏襲）。
-                    if matches!(self.peek(), Some(Token::Punct(','))) {
+                    // PR #1044 レビューの off-by-one 是正を踏襲）。ただし
+                    // カンマの次が表制約 `UNIQUE (...)`（TABLE-16・Issue #905）
+                    // の場合は列を追加しないため、上限判定の対象外とする
+                    // （codex-review 指摘・Issue #905 PR レビュー: ちょうど上限数の
+                    // 列を宣言したテーブルに表制約 `UNIQUE (...)` を続けると
+                    // 誤って `54000` を返していた回帰を修正）。
+                    let next_is_table_unique_constraint =
+                        matches!(
+                            self.tokens.get(self.pos + 1),
+                            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UNIQUE")
+                        ) && matches!(self.tokens.get(self.pos + 2), Some(Token::Punct('(')));
+                    if matches!(self.peek(), Some(Token::Punct(',')))
+                        && !next_is_table_unique_constraint
+                    {
                         return Err(SqlSurfaceError::payload_too_large(
                             "too many columns in CREATE TABLE",
                         ));
@@ -7795,6 +7807,48 @@ mod tests {
             .map(|i| format!("c{i} TEXT"))
             .collect();
         let sql = format!("CREATE TABLE t ({})", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match result {
+            Err(SqlSurfaceError::PayloadTooLarge { .. }) => {}
+            other => panic!("expected PayloadTooLarge, got: {other:?}"),
+        }
+    }
+
+    /// ちょうど `MAX_CREATE_TABLE_COLUMNS` 列を宣言したテーブルに表制約
+    /// `UNIQUE (...)` を続けても列は追加されないため受理されるべき（TABLE-16・
+    /// TASK-204・Issue #905 レビュー指摘の回帰テスト）。表制約の直前に列数上限
+    /// 判定が誤って割り込み、`,` の直後を無条件に「次の列」とみなして
+    /// `54000` を返していた境界値バグを固定する。
+    #[test]
+    fn create_table_accepts_exactly_max_columns_followed_by_table_unique_constraint() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({}, UNIQUE (c0, c1))", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match &result {
+            Ok(v) => {
+                assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+                assert_eq!(v.unique_constraints.len(), 1);
+            }
+            Err(e) => panic!(
+                "expected ok for exactly {MAX_CREATE_TABLE_COLUMNS} columns + trailing table \
+                 UNIQUE constraint, got err: {e:?}"
+            ),
+        }
+    }
+
+    /// 上記の境界値受理が、実際に新しい列を宣言する上限超過ケースまで緩めて
+    /// いないことの対照テスト（表制約の直前ではなく、上限超過後にさらに列を
+    /// 続けるケースは引き続き `54000` で拒否される）。
+    #[test]
+    fn create_table_still_rejects_max_columns_plus_one_column_before_unique_constraint() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS + 1)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({}, UNIQUE (c0, c1))", cols.join(", "));
         let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
         let result = validate_create_table_tokens(&tokens);
         match result {
