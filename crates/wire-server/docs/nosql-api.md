@@ -658,7 +658,7 @@ Date: <IMF-fixdate>
 
 「1 つの `wire_code` → 常に 1 つの HTTP ステータス」の方向にのみ 1:1 の射影
 であり、逆方向（ステータス → `wire_code`）は 1:1 ではない（例えば `400` は
-12 分類が共有する）。
+16 分類が共有する）。
 
 | `wire_code` | `code` | HTTP ステータス | 理由句 | NoSQL 表層での主な発生源 |
 | --- | --- | --- | --- | --- |
@@ -674,23 +674,25 @@ Date: <IMF-fixdate>
 | `25001` | `ACTIVE_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `25P01` | `NO_ACTIVE_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
 | `25P02` | `IN_FAILED_SQL_TRANSACTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（同上） |
+| `2BP01` | `DEPENDENT_OBJECTS_STILL_EXIST` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW` は SQL 表層専用の DDL。後述） |
 | `42601` | `UNSUPPORTED_SQL_SYNTAX` | 400 | Bad Request | JSON 構文エラー、`op` 別スキーマ違反、`tenant_id` 相当値の自己申告 |
 | `42701` | `DUPLICATE_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE TABLE` は op 許可リスト外。後述） |
+| `42809` | `WRONG_OBJECT_TYPE` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`DROP TABLE`／`DROP VIEW`・ビューへの書き込みは SQL 表層専用の DDL。後述） |
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送） |
-| `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE` は op 許可リスト外。後述） |
+| `42P07` | `DUPLICATE_TABLE` | 409 | Conflict | NoSQL 表層の実要求からは到達不能（`CREATE TABLE`／`CREATE VIEW` は op 許可リスト外。後述） |
 | `54000` | `PAYLOAD_TOO_LARGE` | 413 | Content Too Large | 要求本文サイズ超過、`filter` 件数超過、INDEX-4 バッチ上限超過 |
 | `XX000` | `INTERNAL_ERROR` | 500 | Internal Server Error | 内部エラー（詳細は非開示。`message` は固定文言へ差し替え） |
 | `0A000` | `FEATURE_NOT_SUPPORTED` | 501 | Not Implemented | 語彙外の `op` 指定 |
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 8 分類（`42501`・`P0002`・`42701`・`42P07`・`25000`・`25001`・
-`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 10 分類（`42501`・`P0002`・`42701`・`42P07`・`2BP01`・`42809`・
+`25000`・`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
@@ -698,13 +700,17 @@ Date: <IMF-fixdate>
 `DuplicateColumn`（`42701`）・`DuplicateTable`（`42P07`）は `CREATE TABLE`
 （SQL-23・TASK-202・Issue #899）が誘発する分類だが、NoSQL 表層の `op` 許可
 リストに `create_table` 相当が無いため実要求からは到達しない（`docs/design/
-sql-create-table.md` 参照）。明示トランザクション（SQL-31・TASK-221）の
+sql-create-table.md` 参照）。`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・
+TASK-205、Issue #909）は SQL 表層専用の DDL で、NoSQL `op` 許可リストに
+`view` 相当の語彙が無いため `42P07`（名前衝突を `CREATE TABLE` と共有）・
+`2BP01`・`42809` も同様に到達不能。明示トランザクション（SQL-31・TASK-221）の
 `BEGIN`／`COMMIT`／`ROLLBACK` は SQL 表層専用の機構で、NoSQL 表層の `op`
 許可リストにトランザクション制御に対応する語彙が無いため、その状態エラー
 （`25xxx`）は到達しない（一方、ロック待ちの `55P03` は SQL 表層のトランザク
-ションがライタを保持している間の NoSQL 書き込みで発生しうる。上表参照）。テナント境界の検査を緩める・バイパスする production 経路をこれら
-の分類のために新設することはせず（`.claude/rules/security.md` P0）、射影表と
-しての一致のみを production の応答エンコーダ経由で固定する。
+ションがライタを保持している間の NoSQL 書き込みで発生しうる。上表参照）。
+テナント境界の検査を緩める・バイパスする production 経路をこれらの分類のために
+新設することはせず（`.claude/rules/security.md` P0）、射影表としての一致のみを
+production の応答エンコーダ経由で固定する。
 
 本節の各 op スキーマ節（[op 別スキーマ](#op-別スキーマ)・
 [`filter` 配列](#filter-配列)・[`explain`](#explain)）では引き続き

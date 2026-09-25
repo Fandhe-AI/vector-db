@@ -540,6 +540,16 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropTable(_) => OutcomeResponse::Command {
             tag: "DROP TABLE".to_string(),
         },
+        // TABLE-18・SQL-23・TASK-205（Issue #909）: `CREATE VIEW`／`DROP VIEW`
+        // （`sql::ddl::CreateViewOutcome`／`DropViewOutcome` はいずれも件数を
+        // 持たない）の応答を pg 互換の `CommandComplete` タグ（件数を持たない
+        // 固定タグ。`DROP TABLE`・`TRUNCATE TABLE` と同じ設計）へ整形する。
+        SqlOutcome::CreateView(_) => OutcomeResponse::Command {
+            tag: "CREATE VIEW".to_string(),
+        },
+        SqlOutcome::DropView(_) => OutcomeResponse::Command {
+            tag: "DROP VIEW".to_string(),
+        },
     }
 }
 

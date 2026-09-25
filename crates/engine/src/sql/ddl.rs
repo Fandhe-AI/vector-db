@@ -32,7 +32,10 @@
 //! 一切変更しない。
 
 use crate::catalog::{CatalogError, TableSchema};
-use crate::sql::allowlist::{SqlSurfaceError, ValidatedCreateTable, ValidatedDropTable};
+use crate::sql::allowlist::{
+    SqlSurfaceError, ValidatedCreateTable, ValidatedCreateView, ValidatedDropTable,
+    ValidatedDropView,
+};
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
 
@@ -102,7 +105,15 @@ pub(crate) fn execute_create_table(
         // 専用の変種で、`Storage::create_table` からは返らない（到達不能）。
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)
-        | CatalogError::IncompatibleTypeChange { .. } => SqlSurfaceError::Internal {
+        | CatalogError::IncompatibleTypeChange { .. }
+        // `ViewNotFound`／`WrongObjectKind`／`DependentViewsExist`／
+        // `ViewLimitExceeded` は `CREATE VIEW`／`DROP VIEW`
+        // （TABLE-18・SQL-23・TASK-205、Issue #909）専用の変種で、
+        // `Storage::create_table` からは返らない（到達不能）。
+        | CatalogError::ViewNotFound(_)
+        | CatalogError::WrongObjectKind(_)
+        | CatalogError::DependentViewsExist(_)
+        | CatalogError::ViewLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     })?;
@@ -155,6 +166,12 @@ fn map_drop_table_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::Invalid(_) => {
             SqlSurfaceError::unsupported("malformed table reference in DROP TABLE")
         }
+        // TABLE-18・SQL-23・TASK-205（Issue #909）: 対象名がビューだった場合
+        // （`42809`）、対象テーブルをビューが参照している場合（`2BP01`）。
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::DependentViewsExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で、書き込み
         // ゲートの待機上限を超えた。他の書き込み入口と同じく `55P03` を返す
         // （`catalog::table_lookup_error` 系の写像と同じ契約）。
@@ -169,6 +186,93 @@ fn map_drop_table_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+/// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、Issue #909）の
+/// 成功応答。[`DropTableOutcome`] と同じくフィールドを持たない（作成した
+/// ビューの内容・他テナントの存在情報を応答から推測できないようにする必要は
+/// ないが、`Insert`／`Truncate` と異なり返す値自体がないため設計を揃える）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateViewOutcome {}
+
+/// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropViewOutcome {}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体。
+/// `crate::catalog::Storage::create_view` へ委譲する（構文検証段〔
+/// `validate_create_view_tokens`〕はカタログを一切照会していないため、
+/// 参照先の存在確認・ネスト深さ判定・名前衝突判定はすべてこの呼び出しの
+/// 中で初めて行われる）。
+pub(crate) fn execute_create_view(
+    storage: &Storage,
+    validated: &ValidatedCreateView,
+) -> Result<CreateViewOutcome, SqlSurfaceError> {
+    storage
+        .create_view(
+            validated.name(),
+            validated.base_relation(),
+            validated.body_sql(),
+        )
+        .map_err(map_create_view_error)?;
+    Ok(CreateViewOutcome {})
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体。
+/// `crate::catalog::Storage::drop_view` へ委譲する。
+pub(crate) fn execute_drop_view(
+    storage: &Storage,
+    validated: &ValidatedDropView,
+) -> Result<DropViewOutcome, SqlSurfaceError> {
+    storage
+        .drop_view(validated.name())
+        .map_err(map_drop_view_error)?;
+    Ok(DropViewOutcome {})
+}
+
+/// `Storage::create_view` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （ERR-6 の管轄表: 名前衝突 `42P07`、参照先不存在 `42P01`、ネスト深さ・
+/// 登録件数上限超過 `54000`）。エラー文言にテナント・行内容・redb 内部詳細は
+/// 含めない（security.md P0）。
+fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("malformed view definition in CREATE VIEW")
+        }
+        // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
+        // ゲートの待機上限を超えた。他の書き込み入口（`CREATE TABLE`／
+        // `DROP TABLE`）と同じく `55P03` を返す（`XX000` へ丸めない）。
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "CREATE VIEW failed".to_string(),
+        },
+    }
+}
+
+/// `Storage::drop_view` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （ERR-6 の管轄表: 対象不存在 `42P01`、テーブル名を指定 `42809`、依存する
+/// ビューが残存 `2BP01`）。
+fn map_drop_view_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::ViewNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::DependentViewsExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("malformed view reference in DROP VIEW")
+        }
+        // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
+        // ゲートの待機上限を超えた。他の書き込み入口（`CREATE TABLE`／
+        // `DROP TABLE`）と同じく `55P03` を返す（`XX000` へ丸めない）。
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "DROP VIEW failed".to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +282,23 @@ mod tests {
     #[test]
     fn drop_table_write_lock_timeout_maps_to_lock_not_available() {
         let err = map_drop_table_error(CatalogError::WriteLockTimeout);
+        assert_eq!(err.wire_code(), "55P03");
+    }
+
+    /// `CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）も
+    /// `CREATE TABLE`／`DROP TABLE` と同じ書き込み入口の契約を守り、書き込み
+    /// ゲートの待機上限超過を `XX000`（内部エラー）へ丸めず `55P03` として
+    /// 返すことを固定する（SQL-31・TASK-221 との base 取り込みマージ統合で
+    /// 見落としやすい写像の一つ）。
+    #[test]
+    fn create_view_write_lock_timeout_maps_to_lock_not_available() {
+        let err = map_create_view_error(CatalogError::WriteLockTimeout);
+        assert_eq!(err.wire_code(), "55P03");
+    }
+
+    #[test]
+    fn drop_view_write_lock_timeout_maps_to_lock_not_available() {
+        let err = map_drop_view_error(CatalogError::WriteLockTimeout);
         assert_eq!(err.wire_code(), "55P03");
     }
 
