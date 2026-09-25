@@ -85,6 +85,13 @@ fn drain_to_ready_for_query(stream: &mut impl Read) {
 }
 
 fn spawn_tls_server(users_path: &std::path::Path) -> std::net::SocketAddr {
+    spawn_tls_server_with_read_timeout(users_path, Duration::from_secs(5))
+}
+
+fn spawn_tls_server_with_read_timeout(
+    users_path: &std::path::Path,
+    read_timeout: Duration,
+) -> std::net::SocketAddr {
     let store = Arc::new(UserStore::load_from_file(users_path).expect("valid user store"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
@@ -98,7 +105,7 @@ fn spawn_tls_server(users_path: &std::path::Path) -> std::net::SocketAddr {
             None,
             Some(tls),
             limiter,
-            Duration::from_secs(5),
+            read_timeout,
         );
     });
 
@@ -317,4 +324,57 @@ fn pipelined_plaintext_after_ssl_request_is_not_processed_as_startup() {
         ),
         Err(_) => {}
     }
+}
+
+/// 受入基準 4: TLS ハンドシェイク完了後、接続の読み取りタイムアウトが
+/// ハンドシェイク driver 側の定数（`HANDSHAKE_READ_TIMEOUT`）のまま
+/// 残らず、接続設定値（`accept_loop_with_tls` に渡した値）へ復元される
+/// こと。ハンドシェイク完了後にクライアントが何も送らない場合、接続
+/// 設定値（短い値を注入）で応答なしに切断されることを確認する。
+#[test]
+fn read_timeout_is_restored_to_connection_setting_after_tls_handshake() {
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_tls_server_with_read_timeout(&users_path, Duration::from_millis(300));
+
+    let mut socket = TcpStream::connect(addr).expect("connect");
+    write_ssl_request(&mut socket);
+    let resp = read_exact_n(&mut socket, 1);
+    assert_eq!(&resp, b"S");
+
+    let _client = tls_client::drive_client_handshake_over_socket(&mut socket);
+
+    // ハンドシェイク完了後、何も送らずに待つ。接続設定値（300ms）へ正しく
+    // 復元されていれば、`HANDSHAKE_READ_TIMEOUT`（数秒〜のオーダー）より
+    // 十分に短い時間で応答なしに切断される。
+    // WIRE-5 の「応答なしで切断」は pg wire 応答（ErrorResponse 等）を
+    // 送らないという契約であり、TLS 層の `close_notify`（`graceful_close`。
+    // ペイロードを持たない小さな alert レコード）自体は正常に送られうる。
+    // そのためここでは「有界な時間内に最終的な EOF へ到達すること」だけを
+    // 検証し、`close_notify` に相当する少量のバイト列が先に届くことは許容
+    // する（生ソケット読み取りのため復号はしない）。
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set client read timeout");
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 256];
+    let mut reached_eof = false;
+    for _ in 0..64 {
+        match socket.read(&mut buf) {
+            Ok(0) => {
+                reached_eof = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        reached_eof,
+        "server must eventually close without a pg-wire response on idle timeout"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "connection read timeout was not restored to the short connection setting: took {elapsed:?}"
+    );
 }
