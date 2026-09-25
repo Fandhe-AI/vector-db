@@ -953,6 +953,24 @@ fn push_dml_where_predicates(
                 b.push_bytes(column.as_bytes())
                     .map_err(|_| dml_hash_field_too_large())?;
             }
+            // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較
+            // （`< > <= >=`。TABLE-13・TASK-199、Issue #891）。演算子の判別子
+            // （`CompareOp` の宣言順）を末尾へ付け加えることで、列・リテラルが
+            // 同じでも演算子が異なれば別ハッシュになる。
+            WherePredicate::Compare { column, op, value } => {
+                b.push_u8(7);
+                b.push_bytes(column.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+                b.push_bytes(value.as_bytes())
+                    .map_err(|_| dml_hash_field_too_large())?;
+                let op_tag: u8 = match op {
+                    crate::sql::allowlist::CompareOp::Lt => 0,
+                    crate::sql::allowlist::CompareOp::Le => 1,
+                    crate::sql::allowlist::CompareOp::Gt => 2,
+                    crate::sql::allowlist::CompareOp::Ge => 3,
+                };
+                b.push_u8(op_tag);
+            }
         }
     }
 

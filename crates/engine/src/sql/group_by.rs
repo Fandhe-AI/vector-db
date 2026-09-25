@@ -1511,4 +1511,172 @@ mod tests {
         let b = Cell::Numeric(crate::numeric::Decimal::from_parts(200, 2).unwrap());
         assert_eq!(cmp_cell_values(&a, &b), Ordering::Less);
     }
+
+    // --- Issue #894: 新スカラー型（TABLE-13・TASK-199）の GROUP BY 経路 --------
+
+    fn schema_with_text_group_column_and_uuid() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+                ColumnDef::new("ext_id", ColumnType::Uuid, true),
+            ],
+        )
+    }
+
+    fn bound_count_uuid_grouped_by_lang() -> BoundAggregate {
+        BoundAggregate {
+            table: "docs".to_string(),
+            items: vec![BoundAggregateItem {
+                func: AggregateFunc::Count,
+                input: AggregateInput::UuidColumn(2),
+                name: "result".to_string(),
+            }],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            rls_predicate_present: false,
+            projection: vec![
+                crate::sql::parser::ProjectionColumn::GroupKey {
+                    name: "lang".to_string(),
+                },
+                crate::sql::parser::ProjectionColumn::Aggregate {
+                    item_index: 0,
+                    name: "result".to_string(),
+                },
+            ],
+            group_by: Some(BoundGroupBy {
+                column_index: 1,
+                having: Vec::new(),
+                order_by: None,
+                limit: None,
+            }),
+        }
+    }
+
+    /// `GROUP BY`（`TEXT` キー）＋新型（`UUID`）集計は `derive` を通じても
+    /// embedding を要求せず（`DimAndScalar` に収まる。受入条件 3）、TABLE-12
+    /// のキー／ヘッダ tenant 不一致は fail-closed で拒否される（受入条件 2。
+    /// `key_tenant_header_tenant_mismatch_is_rejected_fail_closed` の新型版）。
+    #[test]
+    fn key_tenant_header_tenant_mismatch_is_rejected_fail_closed_with_new_type_aggregate() {
+        let path = unique_db_path("group-by-table12-mismatch-new-type");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column_and_uuid();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_with_mismatched_key_tenant(
+            &storage,
+            "docs",
+            "tenant-a",
+            "tenant-b",
+            1,
+            &[1.0, 2.0, 3.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-b").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound = bound_count_uuid_grouped_by_lang();
+        let referenced = crate::sql::aggregate::ReferencedColumns::derive(
+            &schema,
+            &bound.items,
+            &bound.metadata_filters,
+            &bound.expr_filters,
+            bound.group_by.as_ref().map(|g| g.column_index),
+        );
+        assert!(
+            !referenced.needs_embedding(),
+            "COUNT(<UUID column>) grouped by TEXT must not require embedding decode"
+        );
+
+        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, None, None)
+            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    /// 新型（`UUID`）集計付き `GROUP BY` の結果が、可視行だけから算出した値と
+    /// 一致することを固定する（受入条件 1・3 の正しさの確認）。
+    #[test]
+    fn group_by_with_new_type_count_produces_expected_counts_per_group() {
+        let path = unique_db_path("group-by-new-type-count");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column_and_uuid();
+        storage.create_table(&schema).expect("create table");
+
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            let rows: [(u64, &str, crate::row_codec::Value); 3] = [
+                (
+                    1,
+                    "ja",
+                    crate::row_codec::Value::Uuid(crate::uuid::Uuid::from_bytes([1u8; 16])),
+                ),
+                (2, "ja", crate::row_codec::Value::Null),
+                (
+                    3,
+                    "en",
+                    crate::row_codec::Value::Uuid(crate::uuid::Uuid::from_bytes([2u8; 16])),
+                ),
+            ];
+            for (id, lang, ext_id) in rows {
+                // `encode_scalar_columns` の `values` は `schema.columns` と同じ
+                // 添字（`embedding` を含む）で揃える（`VECTOR` 列自体は内部で
+                // スキップされ値を消費しない）。
+                let metadata = crate::row_codec::encode_scalar_columns(
+                    &schema,
+                    &[
+                        crate::row_codec::Value::Null,
+                        crate::row_codec::Value::Text(lang.to_string()),
+                        ext_id,
+                    ],
+                )
+                .expect("encode scalar columns");
+                let buf = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0, 3.0],
+                    metadata: &metadata,
+                })
+                .expect("encode row");
+                table
+                    .insert(("tenant-a", id), buf.as_slice())
+                    .expect("insert row");
+            }
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound = bound_count_uuid_grouped_by_lang();
+        let result = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound, None, None)
+            .expect("grouped COUNT(<UUID column>) should succeed");
+
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for row in &result.rows {
+            let lang = match &row.cells[0] {
+                Cell::Text(s) => s.clone(),
+                other => panic!("unexpected group key cell: {other:?}"),
+            };
+            let count = match &row.cells[1] {
+                Cell::Integer(n) => *n,
+                other => panic!("unexpected count cell: {other:?}"),
+            };
+            counts.insert(lang, count);
+        }
+        // "ja" は 2 行あるが id=2 の ext_id が NULL のため COUNT(<UUID column>) は 1。
+        assert_eq!(counts.get("ja"), Some(&1));
+        assert_eq!(counts.get("en"), Some(&1));
+    }
 }

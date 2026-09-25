@@ -215,10 +215,14 @@ fn insert_rejects_number_or_boolean_literal_for_uuid_column() {
     assert_eq!(err.wire_code(), "22000");
 }
 
-// --- 受け入れ条件 5: WHERE 述語・SUM/AVG/MIN/MAX への露出は拒否・COUNT は受理 ---
+// --- 受け入れ条件 5: WHERE 等価・範囲比較述語（TABLE-13・TASK-199、Issue #891）は
+// 受理・SUM/AVG/MIN/MAX への露出は拒否・COUNT は受理 ------------------------------
 
 #[test]
-fn where_predicate_on_uuid_column_is_rejected() {
+fn where_equality_predicate_on_uuid_column_is_accepted() {
+    // UUID 列は算術を持たない宣言的経路（レーン B。Issue #891）で `=` を
+    // 受理する。式（算術・関数引数）中の参照は引き続き対象外のまま
+    // （`vec_norm(ext_id)` 等は下の SUM/AVG/MIN/MAX と同じ 22000 経路）。
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
@@ -228,11 +232,46 @@ fn where_predicate_on_uuid_column_is_rejected() {
         &insert_sql(1, "ja", &format!("'{NIL_UUID}'"), 1),
     )
     .expect("insert should succeed");
+    core.execute_sql_in_session(
+        &alice,
+        &mut SessionState::default(),
+        &insert_sql(2, "ja", &format!("'{ALL_ONES_UUID}'"), 2),
+    )
+    .expect("insert should succeed");
 
-    let err = core
+    let result = core
         .execute_sql(
             &alice,
             &format!("SELECT id FROM {TABLE} WHERE ext_id = '{NIL_UUID}' LIMIT 10"),
+        )
+        .expect("UUID equality predicate should be accepted");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
+
+    // 範囲比較（`< > <= >=`）。UUID の `Ord` はバイト列の辞書順。
+    let result = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE ext_id > '{NIL_UUID}' LIMIT 10"),
+        )
+        .expect("UUID range predicate should be accepted");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
+
+    // 形式不正のリテラルは `22P02`（既存の INSERT リテラルと同じ写像）。
+    let err = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE ext_id = 'not-a-uuid' LIMIT 10"),
+        )
+        .unwrap_err();
+    assert_eq!(err.wire_code(), "22P02");
+
+    // TEXT 列との比較（型不一致）は `22000`。
+    let err = core
+        .execute_sql(
+            &alice,
+            &format!("SELECT id FROM {TABLE} WHERE lang > '{NIL_UUID}' LIMIT 10"),
         )
         .unwrap_err();
     assert_eq!(err.wire_code(), "22000");

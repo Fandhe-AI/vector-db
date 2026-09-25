@@ -284,9 +284,11 @@ TABLE-13・TASK-197（Issue #886。関連: WIRE-13・NOSQL-17）で `ColumnType:
     `22P02` 導入時に再分類する）。長さ超過は表層を問わず `54000`。
 - 対象外（申し送り）: RowDescription の OID 拡張（既存の `WireType::Text`
   〔OID 25〕のまま。#895）、NoSQL の既存型統一・`columns[].type`（#896）、
-  `22P02` の新設（#897・TASK-227）、`WHERE` 述語・二次索引への `BYTEA` 対応
-  （#891・#893）、SQL `CREATE TABLE` 構文での `BYTEA` 宣言（SQL-23 は未実装。
-  宣言は Rust API の `TableSchema` 経由）。
+  `22P02` の新設（#897・TASK-227）、二次索引への `BYTEA` 対応（#893）、SQL
+  `CREATE TABLE` 構文での `BYTEA` 宣言（SQL-23 は未実装。宣言は Rust API の
+  `TableSchema` 経由）。`WHERE` 等価・範囲比較述語は #891・TASK-199 で
+  対応済み（`declarative_filter::FilterOp::TypedCompare`。詳細は
+  `docs/design/scalar-types-predicates.md` 参照）。
 
 ## #889 追記: JSON / JSONB 列型
 
@@ -640,9 +642,10 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
 - **順序規約**: derive した `Ord` はバイト列の辞書順（`memcmp` 相当）になり、
   これは符号なし 128bit big-endian の大小・正規テキストの辞書順のどちらとも
   一致することを単体テストで機械的に固定した（`uuid.rs::tests::
-  byte_order_matches_canonical_text_order`）。WHERE 比較・二次索引・
-  ORDER BY がこの順序を共有する唯一の定義とするが、本 Issue ではいずれへも
-  未結線（#891・#893 へ申し送り）。
+  byte_order_matches_canonical_text_order`）。WHERE 比較（#891・TASK-199 で
+  結線済み。`declarative_filter::MetadataFilter::matches` の `TypedCompare`
+  腕がこの `Ord` をそのまま使う）・二次索引・ORDER BY がこの順序を共有する
+  唯一の定義とするが、二次索引への結線は #893 へ引き続き申し送り。
 - **カタログ**: 型タグ `"uuid"`・`param` は常に `"-"`（他のパラメータなし
   スカラー型と同じ）。
 - **行バイト表現**: presence タグに続く 16 バイト生値固定
@@ -691,8 +694,10 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   `InsertLiteral::Null`）。`insert` op は既存のワイルドカードによる拒否の
   まま（#896 へ申し送り。insert/update の非対称は BOOLEAN／DATE と同じ
   既知の制約）。
-- 対象外（申し送り）: WHERE 述語・式評価での UUID 列参照の受理（#891）、
-  `SUM`/`AVG`/`MIN`/`MAX`（#892）、スカラー二次索引化（#893）、`DecodeTier`
-  の精査（#894）、UUID 列のバイナリ形式・OID 2950 対応（#895）、NoSQL
-  `insert` op での JSON 束縛（#896）、SQL `CREATE TABLE` 構文での `UUID`
-  列宣言（SQL-23 は未実装）。
+- 対象外（申し送り）: WHERE 等価・範囲比較述語は #891・TASK-199 で対応済み
+  （`declarative_filter::FilterOp::TypedCompare`。詳細は
+  `docs/design/scalar-types-predicates.md` 参照）。式（算術・関数引数）中の
+  UUID 列参照・`SUM`/`AVG`/`MIN`/`MAX`（#892）、スカラー二次索引化（#893）、
+  `DecodeTier` の精査（#894）、UUID 列のバイナリ形式・OID 2950 対応
+  （#895）、NoSQL `insert` op での JSON 束縛（#896）、SQL `CREATE TABLE`
+  構文での `UUID` 列宣言（SQL-23 は未実装）は引き続き対象外。

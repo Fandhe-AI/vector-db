@@ -129,10 +129,17 @@ Issue #891〜#896 の担当範囲は、本 Issue では振る舞いを追加せ�
 
 | 経路 | 拒否コード | 対応 Issue |
 | --- | --- | --- |
-| `WHERE`・フィルタ列の解決（`declarative_filter.rs`・`sql::udf_call`・`sql::using_plan`・`sql::scoring_boost`） | `22000`（既存の TEXT 列限定チェックへ合流） | #891 |
+| `WHERE`・フィルタ列の解決（`declarative_filter.rs`・`sql::udf_call`・`sql::using_plan`・`sql::scoring_boost`） | `22000`（既存の TEXT 列限定チェックへ合流） | #891（注記参照） |
 | 集計の束縛（`sql::parser::resolve_aggregate_input`） | `22000`（`COUNT` を含む全関数） | #892 |
 | `sql::scalar_index`（列単位索引構築） | 索引化しない（`per_column.push(None)`。VECTOR 列と同じ扱い） | #893 |
 | NoSQL `insert`（`http/query/insert.rs`） | `22000`（既存の型不一致腕 `_ =>` へ合流。表層固有の新設腕なし） | #896 |
+
+**#891 追記**: 算術を持たない非数値型（`DATE`／`TIMESTAMP`／`NUMERIC`／
+`UUID`／`BYTEA`）の WHERE 等価・範囲比較述語は #891・TASK-199 で対応済み
+（`declarative_filter::FilterOp::TypedCompare`。詳細は
+`docs/design/scalar-types-predicates.md` 参照）。`REAL`／`DOUBLE` は算術と
+組み合わせる式評価経路（レーン A）の対象のため、上表の拒否は本表の意味では
+継続し、対応は別 Issue へ申し送り。
 | NoSQL `update`（`http/query/update.rs`） | `22000`（`UpdateError::Set`。既存の TEXT/VECTOR 型不一致と同じ応答形） | #896 |
 
 ## 対象外（申し送り）
