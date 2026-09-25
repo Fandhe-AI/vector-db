@@ -82,12 +82,18 @@
 //!   [`certificate_verify`]・[`x509`] をつなぎ、alert の実送出・
 //!   ハンドシェイク中の読み取りタイムアウトを提供する
 //!
-//! 接続への結線（`SSLRequest` への `'S'` 応答・`server.rs`／
-//! `handshake.rs` の実接続、CLI からの証明書・鍵読み込み、HTTPS 表層、
-//! 3 クライアント接続テスト、channel binding）はいずれも #966 以降の
-//! 後続 sub-issue の担当であり、本モジュールは対象外のまま。並列開発時の
-//! コンフリクトを避けるため、後続 sub-issue は `pub mod` を 1 行ずつ
-//! 追加していく想定。
+//! - [`stream`]: `SSLRequest` への `'S'` 応答後の pg wire バイトストリーム
+//!   [`stream::TlsStream`]（Issue #966）。`crate::wire_stream::WireStream`
+//!   を実装し、`handshake.rs` の二段ネゴシエーション（`negotiate_startup`
+//!   → TLS 昇格 → `TlsStream` 上で認証・クエリループを継続）から使われる。
+//!   レコード層の読み取りは push 型（[`record::RecordBuffer::feed`]／
+//!   `next_record`）を使い、`handshake::read_next_frame_header` の
+//!   `WouldBlock`/`TimedOut` 読み直し契約（SQL-31・TASK-221）と両立する
+//!
+//! CLI からの証明書・鍵読み込み（#967）・HTTPS 表層（#968）・3 クライアント
+//! 接続テスト（#969）・channel binding（#970）はいずれも後続 sub-issue の
+//! 担当であり、本モジュールは対象外のまま。並列開発時のコンフリクトを
+//! 避けるため、後続 sub-issue は `pub mod` を 1 行ずつ追加していく想定。
 
 pub mod aes;
 pub mod aes_gcm;
@@ -107,6 +113,7 @@ pub mod record;
 pub mod record_protection;
 pub mod server_handshake;
 pub mod sha512;
+pub mod stream;
 pub mod transcript;
 pub mod x25519;
 pub mod x509;
