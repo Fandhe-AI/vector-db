@@ -38,6 +38,12 @@ const MAX_INSERT_COLUMNS: usize = 256;
 /// アロケーション前の上限検証（`.claude/rules/security.md`）を満たす）。
 const MAX_CREATE_TABLE_COLUMNS: usize = 256;
 
+/// `PRIMARY KEY (<col>[, <col>]*)` に宣言できる列数の上限（TABLE-16・
+/// TASK-204、Issue #903）。`catalog::validate_schema` が同じ上限
+/// （[`crate::catalog::MAX_PRIMARY_KEY_COLUMNS`]）で再検証するため、単一の
+/// 定数を共有しドリフトを防ぐ。
+use crate::catalog::MAX_PRIMARY_KEY_COLUMNS;
+
 /// 複数行 `VALUES (...), (...), ...`（SQL-16、TASK-190）が 1 文に持てる行数の上限。
 /// `sql/group_by.rs::MAX_GROUPS` と同じ「本リポ独自の実装既定値・無制限 `Vec`
 /// 確保を避ける」設計方針を踏襲する（security.md「不安全な設計｜無制限リソース
@@ -334,6 +340,11 @@ pub enum SqlSurfaceError {
     /// [`SqlSurfaceError::MissingOperationId`] と共有し `code` ラベルでのみ
     /// 区別する）。
     NotNullViolation { column: String },
+    /// `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約に
+    /// 違反した（[`crate::tenant::TenantWriteError::UniqueViolation`] の写像。
+    /// ERR-6: `23505`）。行キー衝突（[`SqlSurfaceError::IdConflict`]。物理キー
+    /// `(tenant_id, id)` の衝突）とは別の固定文言を返す。
+    UniqueViolation,
 }
 
 impl SqlSurfaceError {
@@ -458,6 +469,13 @@ impl SqlSurfaceError {
             column: truncate_for_error(&column.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::exec::map_write_error` が
+    /// [`crate::tenant::TenantWriteError::UniqueViolation`] を写像するために使う
+    /// （TABLE-16・TASK-204、Issue #903）。
+    pub(crate) fn unique_violation() -> Self {
+        SqlSurfaceError::UniqueViolation
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -494,6 +512,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
             SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
+            SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
         }
     }
 
@@ -587,6 +606,10 @@ impl std::fmt::Display for SqlSurfaceError {
                     "null value in column {column:?} violates not-null constraint"
                 )
             }
+            // 行キー衝突（`IdConflict`）とは別の固定文言（`TenantWriteError::
+            // UniqueViolation` の `Display` と同じ考え方）。キー値・行 id・
+            // テナント名は含めない（security.md P0）。
+            SqlSurfaceError::UniqueViolation => write!(f, "unique constraint violation"),
         }
     }
 }
@@ -1336,16 +1359,77 @@ pub enum DeleteStatement {
 /// 避けるため行わない。`sql::ddl` モジュールドキュメント参照）。
 ///
 /// 受理する形は `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]` の
-/// みで、`<type>` は `TEXT`／`VECTOR ( <N> )` のみ（`IF NOT EXISTS`・列制約・
-/// 表制約・`USING OPERATION_ID` の付与はいずれも許可リスト外。TABLE-13/14 の
-/// 追加型は別 Issue の管轄）。
+/// みで、`<type>` は `TEXT`／`VECTOR ( <N> )` のみ（`IF NOT EXISTS`・
+/// `CONSTRAINT <name>`・`UNIQUE`／`NOT NULL`／`DEFAULT`／`CHECK`／`REFERENCES`・
+/// `USING OPERATION_ID` の付与はいずれも許可リスト外）。列制約
+/// `<col> <type> PRIMARY KEY`・表制約 `PRIMARY KEY (<col>[, <col>]*)`（複合キー
+/// を含む）のみを許可形状として追加受理する（TABLE-16・TASK-204、Issue #903。
+/// 詳細・共存規約は `docs/design/sql-primary-key.md` 参照）。TABLE-13/14 の
+/// 追加型は別 Issue の管轄。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedCreateTable {
     /// カタログ存在確認前のテーブル名（識別子形式のみ検証済み）。
     pub table_name: String,
     /// 宣言順を保持した列定義（1 件以上）。`VECTOR` 列は `nullable = false`・
     /// `TEXT` 列は `nullable = true`（PostgreSQL の既定に倣う。TABLE-1）。
+    /// 主キー構成列（[`Self::primary_key`] が `Some` の場合）は列制約・表制約の
+    /// いずれで宣言されても `nullable = false` へ書き換え済み。
     pub columns: Vec<ColumnDef>,
+    /// `PRIMARY KEY` 宣言列名（宣言順。TABLE-16・TASK-204、Issue #903）。
+    /// 未宣言（`id` 暗黙主キーのまま）は `None`。`PRIMARY KEY (id)`（`id` 単独）
+    /// は暗黙主キーの明示宣言として受理したうえで `None` へ正規化する
+    /// （`docs/design/sql-primary-key.md`「id 暗黙主キーとの共存規約」参照）。
+    pub primary_key: Option<Vec<String>>,
+}
+
+/// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
+/// `PRIMARY KEY` 宣言の最終判定・正規化（TABLE-16・TASK-204、Issue #903）。
+///
+/// - `None`（未宣言）はそのまま `Ok(None)`。
+/// - `id` 単独宣言（`PRIMARY KEY (id)`）は暗黙主キーの明示宣言として `Ok(None)`
+///   （何も永続化しない。`docs/design/sql-primary-key.md` 参照）。
+/// - `id` と他列の混在は曖昧さを避けるため `42601` で拒否する。
+/// - それ以外の各列名は `columns`（生存列のみ。表制約は宣言順に関わらず任意
+///   位置の列を参照できる）に存在しなければならず、存在すれば
+///   `nullable = false` へ書き換える（列制約・表制約いずれの宣言経路でも
+///   同じ最終状態にする）。列型自体の許可判定
+///   （[`crate::catalog::ColumnType::is_primary_key_allowed`]）はここでは行わず
+///   `catalog::validate_schema`（`sql::ddl::execute_create_table` が書き込み
+///   トランザクション内で通す）に委ねる（同じ `42601` 分類のため二重実装
+///   しない）。
+fn finalize_primary_key(
+    primary_key: Option<Vec<String>>,
+    columns: &mut [ColumnDef],
+) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+    let Some(pk_cols) = primary_key else {
+        return Ok(None);
+    };
+    if pk_cols.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "PRIMARY KEY must declare at least one column",
+        ));
+    }
+    let contains_id = pk_cols.iter().any(|name| name.eq_ignore_ascii_case("id"));
+    if contains_id {
+        if pk_cols.len() > 1 {
+            return Err(SqlSurfaceError::unsupported(
+                "PRIMARY KEY must not combine the implicit id column with other columns",
+            ));
+        }
+        return Ok(None);
+    }
+    for name in &pk_cols {
+        let column = columns
+            .iter_mut()
+            .find(|c| &c.name == name)
+            .ok_or_else(|| {
+                SqlSurfaceError::unsupported(format!(
+                    "PRIMARY KEY references unknown column: {name}"
+                ))
+            })?;
+        column.nullable = false;
+    }
+    Ok(Some(pk_cols))
 }
 
 /// 許可形状の構造判定を通過した TRUNCATE 文（SQL-22、TASK-195）。テーブル定義
@@ -1528,6 +1612,18 @@ impl<'a> Parser<'a> {
     /// `using`・`set` を従来どおり通常の識別子として扱える。
     fn peek_ident_matches(&self, word: &str) -> bool {
         matches!(self.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word))
+    }
+
+    /// [`Self::peek_ident_matches`] の 2 トークン先読み版。`CREATE TABLE` の表
+    /// 制約 `PRIMARY KEY (...)`（TABLE-16・TASK-204、Issue #903）を、列名
+    /// `primary`（`Ident("PRIMARY")` を消費せず単独の列名として使うケース）と
+    /// 曖昧さなく判定するために使う——`offset` 個先のトークンが `KEY` である
+    /// 場合にのみ表制約として扱う。
+    fn peek_ident_matches_at(&self, offset: usize, word: &str) -> bool {
+        matches!(
+            self.tokens.get(self.pos.saturating_add(offset)),
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word)
+        )
     }
 
     /// 現在位置が `Token::Ident` かつ大文字小文字を区別せず `word` と一致する場合のみ
@@ -2703,12 +2799,48 @@ impl<'a> Parser<'a> {
 
         self.expect_punct('(')?;
         let mut columns: Vec<ColumnDef> = Vec::new();
+        // `PRIMARY KEY` 宣言（列制約・表制約のいずれか一方のみ。TABLE-16・
+        // TASK-204、Issue #903）。列名の存在検証・`id` 混在検査・nullable の
+        // 強制は列リスト全体の構文判定を終えた後（このループを抜けた後）に
+        // まとめて行う（表制約は宣言順に関わらず任意位置の列を参照できる
+        // ため）。
+        let mut primary_key: Option<Vec<String>> = None;
         loop {
-            let column = self.parse_create_table_column(&columns)?;
-            columns.push(column);
+            // 表制約 `PRIMARY KEY (<col>[, <col>]*)` は要素先頭が文脈的識別子
+            // `PRIMARY` かつ次のトークンが `KEY` の場合にのみ判定する
+            // （`KEY` は列型キーワードではないため、列名 `primary` との構文上の
+            // 曖昧さは生じない）。
+            if self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY") {
+                if primary_key.is_some() {
+                    return Err(SqlSurfaceError::unsupported(
+                        "CREATE TABLE must declare at most one PRIMARY KEY",
+                    ));
+                }
+                primary_key = Some(self.parse_primary_key_table_constraint()?);
+            } else {
+                let (column, is_pk) = self.parse_create_table_column(&columns)?;
+                if is_pk {
+                    if primary_key.is_some() {
+                        return Err(SqlSurfaceError::unsupported(
+                            "CREATE TABLE must declare at most one PRIMARY KEY",
+                        ));
+                    }
+                    primary_key = Some(vec![column.name.clone()]);
+                }
+                columns.push(column);
+            }
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
-                if columns.len() >= MAX_CREATE_TABLE_COLUMNS {
+                // カンマの次要素が表制約 `PRIMARY KEY (...)` の場合は `columns`
+                // へ追加されない（列を消費しない）ため、上限判定の対象から
+                // 除外する（Cursor Bugbot 指摘・PR #1050: ちょうど上限数の列を
+                // 宣言したテーブルへ末尾で表制約 `PRIMARY KEY` を付けると、
+                // 実際には列を 1 つも追加しないにもかかわらず「ペイロード
+                // 過大」として拒否され、同じ制約を先頭・中間に置いた場合と
+                // 非対称な挙動になっていた）。
+                let next_is_primary_key_constraint =
+                    self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY");
+                if !next_is_primary_key_constraint && columns.len() >= MAX_CREATE_TABLE_COLUMNS {
                     return Err(SqlSurfaceError::payload_too_large(
                         "too many columns in CREATE TABLE",
                     ));
@@ -2719,28 +2851,34 @@ impl<'a> Parser<'a> {
         }
         self.expect_punct(')')?;
 
+        let primary_key = finalize_primary_key(primary_key, &mut columns)?;
+
         Ok(ValidatedCreateTable {
             table_name,
             columns,
+            primary_key,
         })
     }
 
-    /// `CREATE TABLE` の列 1 個ぶんの許可形状: `<col> (TEXT | VECTOR '(' <N> ')')`
-    /// （Issue #899）。`TEXT`／`VECTOR` は `lexer::Keyword` へ含めない（`SET`・
-    /// `CREATE` と同方針。statement 中のこの位置でのみ文脈的キーワードとして
-    /// 照合する）。予約列名（`id`／`tenant_id`／`visibility`。ASCII の大文字小文字を
-    /// 無視して照合）・同一文内の列名重複はここで拒否する（`sql::parser` が
-    /// これら 3 語を疑似列・RLS 内部列として扱う契約と整合させ、SQL 表層の DDL で
-    /// これらを隠蔽する列を作らせない。fail-closed。`.claude/rules/security.md`
+    /// `CREATE TABLE` の列 1 個ぶんの許可形状: `<col> (TEXT | VECTOR '(' <N> ')')
+    /// [PRIMARY KEY]`（Issue #899・#903）。`TEXT`／`VECTOR`／`PRIMARY`／`KEY` は
+    /// `lexer::Keyword` へ含めない（`SET`・`CREATE` と同方針。statement 中の
+    /// この位置でのみ文脈的キーワードとして照合する）。予約列名（`id`／
+    /// `tenant_id`／`visibility`。ASCII の大文字小文字を無視して照合）・
+    /// 同一文内の列名重複はここで拒否する（`sql::parser` がこれら 3 語を
+    /// 疑似列・RLS 内部列として扱う契約と整合させ、SQL 表層の DDL でこれらを
+    /// 隠蔽する列を作らせない。fail-closed。`.claude/rules/security.md`
     /// 「アクセス制御の不備」対応）。`VECTOR` の次元は `Token::Number` を `u32` へ
     /// checked に parse する（先頭 `-`・小数点・オーバーフローはいずれも
     /// `UnsupportedSyntax` へ落ちる。範囲（`1..=MAX_VECTOR_DIM`）検証自体は
     /// `catalog::validate_schema`（`sql::ddl::execute_create_table` が書き込み
     /// トランザクション内で通す）に委ねる——同じ `42601` 分類のため二重実装しない）。
+    /// 戻り値の `bool` は列制約 `PRIMARY KEY` が付与されたかどうか
+    /// （`finalize_primary_key` 呼び出し前の nullable 書き換えは行わない）。
     fn parse_create_table_column(
         &mut self,
         existing: &[ColumnDef],
-    ) -> Result<ColumnDef, SqlSurfaceError> {
+    ) -> Result<(ColumnDef, bool), SqlSurfaceError> {
         let name = self.expect_ident()?;
         crate::catalog::validate_identifier(&name)
             .map_err(|e| SqlSurfaceError::unsupported(format!("invalid column name: {e}")))?;
@@ -2756,7 +2894,7 @@ impl<'a> Parser<'a> {
             return Err(SqlSurfaceError::duplicate_column(name));
         }
 
-        if self.peek_ident_matches("TEXT") {
+        let column = if self.peek_ident_matches("TEXT") {
             self.advance();
             let constraints = self.parse_column_constraints()?;
             let default = match constraints.default {
@@ -2779,9 +2917,8 @@ impl<'a> Parser<'a> {
             if let Some(default) = default {
                 column = column.with_default(default);
             }
-            return Ok(column);
-        }
-        if self.peek_ident_matches("VECTOR") {
+            column
+        } else if self.peek_ident_matches("VECTOR") {
             self.advance();
             self.expect_punct('(')?;
             let raw_dim = self.expect_number()?;
@@ -2797,11 +2934,69 @@ impl<'a> Parser<'a> {
             }
             // VECTOR は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
             // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
-            return Ok(ColumnDef::new(name, ColumnType::Vector(dim), false));
+            ColumnDef::new(name, ColumnType::Vector(dim), false)
+        } else {
+            return Err(SqlSurfaceError::unsupported(
+                "expected column type TEXT or VECTOR(<dim>)",
+            ));
+        };
+
+        // 列制約 `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`CONSTRAINT
+        // <name> PRIMARY KEY` 形・`UNIQUE`／`REFERENCES`／`CHECK` はいずれも
+        // 許可リスト外のまま（受理しない）。`NOT NULL`／`DEFAULT`
+        // （TABLE-16・TASK-204、Issue #904）は列型キーワードの直後
+        // （`parse_column_constraints` 内）で先に受理済みで、`PRIMARY KEY` は
+        // その後段の独立した列制約として構文上共存できる（`finalize_primary_key`
+        // が主キー列の `nullable` を最終的に `false` へ強制する）。
+        let is_pk = if self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY") {
+            self.advance();
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        Ok((column, is_pk))
+    }
+
+    /// 表制約 `PRIMARY KEY (<col>[, <col>]*)`（TABLE-16・TASK-204、Issue #903）の
+    /// 許可形状。`PRIMARY`・`KEY` の消費のみを行い、列名の存在検証は
+    /// `finalize_primary_key` へ委譲する（表制約は列リスト中の宣言順に
+    /// 関わらず任意位置の列を参照できるため）。同一主キー内の列名重複は
+    /// ここで拒否する（`42701`。列リスト全体の重複列名検査
+    /// `parse_create_table_column` と同じ分類）。
+    fn parse_primary_key_table_constraint(&mut self) -> Result<Vec<String>, SqlSurfaceError> {
+        self.expect_contextual_keyword("PRIMARY")?;
+        self.expect_contextual_keyword("KEY")?;
+        self.expect_punct('(')?;
+        let mut cols: Vec<String> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            crate::catalog::validate_identifier(&name).map_err(|e| {
+                SqlSurfaceError::unsupported(format!("invalid primary key column name: {e}"))
+            })?;
+            if cols.contains(&name) {
+                return Err(SqlSurfaceError::duplicate_column(name));
+            }
+            cols.push(name);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                if cols.len() >= MAX_PRIMARY_KEY_COLUMNS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many columns in PRIMARY KEY",
+                    ));
+                }
+                continue;
+            }
+            break;
         }
-        Err(SqlSurfaceError::unsupported(
-            "expected column type TEXT or VECTOR(<dim>)",
-        ))
+        self.expect_punct(')')?;
+        if cols.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "PRIMARY KEY must declare at least one column",
+            ));
+        }
+        Ok(cols)
     }
 
     /// `CREATE TABLE` の列定義に続く列制約（`NOT NULL`／`DEFAULT <literal>`。
@@ -7768,6 +7963,29 @@ mod tests {
         match result {
             Err(SqlSurfaceError::PayloadTooLarge { .. }) => {}
             other => panic!("expected PayloadTooLarge, got: {other:?}"),
+        }
+    }
+
+    /// Cursor Bugbot 指摘（PR #1050）に対する回帰テスト: ちょうど上限数の
+    /// 列を宣言したテーブルへ末尾で表制約 `PRIMARY KEY (...)` を付けても、
+    /// 表制約は `columns` を消費しないため受理される（先頭・中間に置いた
+    /// 場合と対称な挙動になることを固定する）。
+    #[test]
+    fn create_table_accepts_trailing_primary_key_constraint_at_max_columns() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({}, PRIMARY KEY (c0))", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match &result {
+            Ok(v) => {
+                assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+                assert_eq!(v.primary_key, Some(vec!["c0".to_string()]));
+            }
+            Err(e) => panic!(
+                "expected ok for exactly {MAX_CREATE_TABLE_COLUMNS} columns with trailing PRIMARY KEY, got err: {e:?}"
+            ),
         }
     }
 }

@@ -5,7 +5,7 @@
 //! Issue #904 レビュー指摘（Medium）: 変更・追加された既存テストは「非
 //! nullable 列省略」系の `wire_code` 期待値の書き換え・フィクスチャの
 //! `ColumnDef::new` 移行のみで、`DEFAULT` 補完そのもの（構文成功・実際の
-//! 適用値・カタログ v4 の永続化往復・型不一致／`VECTOR` 禁止／重複宣言／
+//! 適用値・カタログ v5 の永続化往復・型不一致／`VECTOR` 禁止／重複宣言／
 //! 長さ上限超過の各エラー経路・`ALTER TABLE ADD COLUMN` の拒否）を検証する
 //! 新規テストが存在しなかった。本ファイルはその欠落を埋める。
 //!
@@ -78,6 +78,54 @@ fn create_table_accepts_default_before_not_null() {
         "CREATE TABLE docs (embedding VECTOR(4), lang TEXT DEFAULT 'ja' NOT NULL)",
     )
     .expect("CREATE TABLE with DEFAULT before NOT NULL must succeed");
+}
+
+#[test]
+fn create_table_accepts_default_and_primary_key_on_the_same_column() {
+    // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）と `DEFAULT`（同 Issue
+    // #904）は独立した列制約として共存でき、カタログは両者を持つ v5 で
+    // 永続化される（`catalog.rs::encode_decode_roundtrip_preserves_primary_key_and_default_v5`
+    // の SQL 表層側の対応。base 取り込みマージで両フォーマットを統合した際の
+    // 回帰）。`PRIMARY KEY` 宣言により `code` は `DEFAULT` の有無に関わらず
+    // 非 nullable になる（`finalize_primary_key`）。
+    let (core, path) = new_core("not-null-default-with-primary-key");
+    let _guard = CleanupGuard(path.clone());
+    {
+        let alice = ctx("alice");
+        let mut session = granted_session();
+
+        core.execute_sql_in_session(
+            &alice,
+            &mut session,
+            "CREATE TABLE docs (embedding VECTOR(4), code TEXT DEFAULT 'draft' PRIMARY KEY)",
+        )
+        .expect("CREATE TABLE with DEFAULT and PRIMARY KEY on the same column must succeed");
+    }
+    // `core` が保持する `Storage`（延いては redb::Database）を再オープン前に
+    // 破棄する（`catalog_v5_roundtrips_default_value_across_reopen` と同じ
+    // 単一ライター制約の回避パターン）。
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    let schema = storage
+        .get_table_schema("docs")
+        .expect("get schema after reopen");
+    assert_eq!(
+        schema.primary_key(),
+        Some(&["code".to_string()][..]),
+        "PRIMARY KEY must survive a catalog v5 round trip through reopen"
+    );
+    let code = schema
+        .columns
+        .iter()
+        .find(|c| c.name == "code")
+        .expect("code column present");
+    assert!(!code.nullable, "PRIMARY KEY column must be non-nullable");
+    assert_eq!(
+        code.default,
+        Some(engine::catalog::ColumnDefault::Text("draft".to_string())),
+        "DEFAULT must survive alongside PRIMARY KEY in a catalog v5 round trip"
+    );
 }
 
 // --- DEFAULT 補完の実値検証 ---------------------------------------------
@@ -174,10 +222,10 @@ fn copy_with_explicit_null_marker_does_not_apply_default_and_is_rejected_for_non
     assert_eq!(err.wire_code(), "23502");
 }
 
-// --- カタログ v4 の永続化往復（再オープンを含む） ------------------------
+// --- カタログ v5 の永続化往復（再オープンを含む） ------------------------
 
 #[test]
-fn catalog_v4_roundtrips_default_value_across_reopen() {
+fn catalog_v5_roundtrips_default_value_across_reopen() {
     let path = unique_db_path("not-null-default-catalog-roundtrip");
     let _guard = CleanupGuard(path.clone());
     {
@@ -193,7 +241,7 @@ fn catalog_v4_roundtrips_default_value_across_reopen() {
             ))
             .expect("create table with DEFAULT");
     }
-    // 再オープン後もカタログ v4 の `default` フィールドが往復する。
+    // 再オープン後もカタログ v5 の `default` フィールドが往復する。
     {
         let storage = Storage::open(&path).expect("reopen storage");
         let schema = storage
@@ -208,14 +256,14 @@ fn catalog_v4_roundtrips_default_value_across_reopen() {
         assert_eq!(
             lang.default,
             Some(engine::catalog::ColumnDefault::Text("ja".to_string())),
-            "DEFAULT must survive a catalog v4 round trip through reopen"
+            "DEFAULT must survive a catalog v5 round trip through reopen"
         );
     }
 }
 
 #[test]
 fn catalog_v2_v3_bytes_are_unchanged_when_no_column_declares_default() {
-    // `DEFAULT` を 1 つも持たないスキーマは v4 を使わず、既存のバイト列表現
+    // `DEFAULT` を 1 つも持たないスキーマは v5 を使わず、既存のバイト列表現
     // （v2／v3）のまま不変（docs/design/not-null-default.md「カタログの
     // テキスト形式」節）。往復自体で `default` が常に `None` のまま保たれる
     // ことを確認する（バイト列そのものの厳密な形式検証は既存のゴールデン

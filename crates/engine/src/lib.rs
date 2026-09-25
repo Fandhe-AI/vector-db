@@ -226,6 +226,7 @@ pub mod buffer_pool;
 pub mod bytea;
 pub mod catalog;
 pub mod chunking;
+pub(crate) mod constraint;
 pub mod core;
 pub mod crypto;
 pub mod datetime;

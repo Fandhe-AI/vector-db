@@ -51,13 +51,16 @@ sql-create-table.md` 参照）のため、`DEFAULT` が実質的に使えるの�
   `ColumnDef::new(name, ty, nullable)`（引き続き `default: None` で構築。
   約 1,200 箇所の既存呼び出しは無変更のまま動く）と、新設の
   `ColumnDef::with_default(default)`。
-- カタログのテキスト形式に **v4** を追加する（`v2`・`v3`〔TABLE-19・
-  Issue #901〕は無変更）。`DEFAULT` を 1 つでも持つスキーマは（`DROP COLUMN`
-  の墓標の有無を問わず）v4 で書き、6 フィールド
-  `name:tag:param:nullable:state:default` を 1 列 1 行に持つ（`state` は
-  v3 と同じ `L`／`D`。墓標行の `default` は常に `-`）。`DEFAULT` を持たない
-  スキーマは従来どおり v2／v3 のままバイト列を変えない（既存ゴールデン
-  テストへの影響なし）。
+- カタログのテキスト形式に **v5** を追加する（`v2`・`v3`〔TABLE-19・
+  Issue #901〕・`v4`〔`PRIMARY KEY` 宣言専用フォーマット、TASK-204・
+  Issue #903〕は無変更）。`DEFAULT` を 1 つでも持つスキーマは（`PRIMARY KEY`・
+  `DROP COLUMN` の墓標の有無を問わず）v5 で書き、`cols:` 行の直後に `pk:`
+  行を必ず 1 行持つ（主キー宣言が無ければ空のまま書き、decode 側はこれを
+  「主キーなし」と解釈する。v4 の `pk:` 行は非空必須のまま変えない）うえで
+  6 フィールド `name:tag:param:nullable:state:default` を 1 列 1 行に持つ
+  （`state` は v3／v4 と同じ `L`／`D`。墓標行の `default` は常に `-`）。
+  `DEFAULT` を持たないスキーマは従来どおり v2／v3／v4 のままバイト列を
+  変えない（既存ゴールデンテストへの影響なし）。
 - `default` フィールドの符号化: `-`（なし）／`t`・`f`（真偽値）／`s<hex>`・
   `n<hex>`（文字列・数値リテラルの本体を 16 進化）。`TEXT` の既定値は `:`・
   改行を含み得るため、カタログの区切り文字（`:`・改行）と衝突しないよう
@@ -69,7 +72,7 @@ sql-create-table.md` 参照）のため、`DEFAULT` が実質的に使えるの�
   （最大 2 倍）× 列数上限（`MAX_COLUMN_COUNT` = 256）がカタログ値全体の上限
   （`MAX_CATALOG_VALUE_LEN` = 1 MiB）に十分収まることを `const _: () =
   assert!(...)` でコンパイル時に固定する。
-- decode 側は v4 の一意性契約（`DEFAULT` を 1 つも持たない v4 値は不正。
+- decode 側は v5 の一意性契約（`DEFAULT` を 1 つも持たない v5 値は不正。
   v3 の「墓標 0 件の v3 値は不正」〔TABLE-19 D2〕と同じ設計判断）・
   未知の符号化タグ・不正な 16 進・不正な UTF-8・墓標行への `DEFAULT` 混入を
   すべて fail-closed（`CatalogError::CorruptSchema`）に拒否する。
