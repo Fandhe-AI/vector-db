@@ -143,12 +143,19 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
   要求の種類（Sync・Flush 等の SQL を伴わない要求を含む）を問わず
   共有書き込みトランザクションを abort してライタを解放し、`Failed` へ遷移する。
   その後の最初の文／`COMMIT` には `54000` を 1 回だけ返し、以降は `25P02`。
-- 要求が 1 件も届かない無通信の間は、接続全体の読み取りタイムアウト
-  （`limits::READ_TIMEOUT`＝30 秒。WIRE-5）で接続が閉じられ、
-  `SessionTransaction` の drop によってライタが解放される。したがって、
-  無通信時にライタを保持し続ける時間の上限は `max_duration` ではなく
-  `READ_TIMEOUT` になる。`max_duration` ちょうどで解放するには WIRE-5 の
-  「接続全体に同一の期限を適用する」契約の変更が必要なため、本 PR の対象外とする。
+- 要求が 1 件も届かない無通信の間も `max_duration` で解放する（PR #1041
+  レビュー指摘）。`Active` の間だけ、wire 層（`handshake::read_next_frame_header`）
+  が次の要求の型バイトを待つ読み取りタイムアウトを「上限までの残り時間」と
+  接続の読み取りタイムアウト（`limits::READ_TIMEOUT`＝30 秒。WIRE-5）の小さい方へ
+  切り詰める。期限到達でタイムアウトしたら `release_if_expired` で abort して
+  ライタを解放し、応答は送らずに接続を維持したまま受信待ちを続ける（最初の文／
+  `COMMIT` に `54000` が返る点は受信時の検査と同じ）。
+  - 切り詰めるのは型バイトの受信待ちだけで、受信後は長さ・本文を読む前に接続の
+    読み取りタイムアウトへ戻す（フレームの途中で打ち切らない）。
+  - 無通信の上限（WIRE-5）は不変: 期限到達後の再待機は、受信待ちを始めた時点
+    からの経過を差し引いた読み取りタイムアウトの残りで待ち、尽きたら従来どおり
+    応答なしで切断する。
+  - `Failed`・`Idle` はライタを保持しないため切り詰めない。
 - `lock_wait`（他セッションが writer gate を待つ上限）: **30 秒**
   （`Storage::DEFAULT_WRITE_LOCK_WAIT`。既存 `READ_TIMEOUT` と同じ値）。
   超過時は `55P03`。
@@ -211,6 +218,7 @@ encode_ready_for_query`／`simple_query.rs`／`extended_query::handle_sync`）�
 | 簡易クエリ: `COMMIT` | 期限切れは abort して `Failed`・`54000`。commit 失敗はロールバック扱いで `Idle` | `25P02` |
 | 簡易クエリ: `COPY`（`handshake::post_auth_loop`） | `0A000` で `fail()` | `25P02`（`crate::copy::run` へ委譲しない） |
 | 簡易クエリ: 空文字列 | 対象外（エラーにならない） | EmptyQueryResponse（副作用なし） |
+| 簡易クエリ: 応答のエンコード失敗（`RowDescription`・`DataRow`・`CommandComplete`） | 文の実行後でも `txn.fail()` | — |
 | 拡張: Parse | エラー応答は `respond_error_and_await_sync` を通り、`post_auth_loop` が `ignore_till_sync` を見て `fail()` | `ROLLBACK`・空文字列以外は parse より前に `25P02` |
 | 拡張: Bind | 同上 | `ROLLBACK`・空文字列以外のステートメントは `25P02`（`Failed` 前に Parse 済みのものを含む） |
 | 拡張: Describe | 同上 | 受理（副作用なし。実行は Execute で拒否される） |
@@ -218,6 +226,7 @@ encode_ready_for_query`／`simple_query.rs`／`extended_query::handle_sync`）�
 | 拡張: Close・Sync・Flush | 対象外（エラー応答は `ignore_till_sync` 経由で `fail()`） | 受理（副作用なし） |
 | フレーミング・プロトコル違反 | 接続を切断し、`SessionTransaction` の drop で abort | 同左 |
 | 全メッセージ共通（受信直後） | 期限切れなら `release_if_expired` で `Failed` にしてライタを解放 | — |
+| 無通信（受信待ち） | 期限到達で受信待ちを打ち切り、`release_if_expired` で `Failed` にしてライタを解放 | — |
 
 ## 検証
 
