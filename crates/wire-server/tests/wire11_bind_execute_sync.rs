@@ -1174,6 +1174,60 @@ fn malformed_terminate_during_ignore_till_sync_is_rejected_not_silently_closed()
     }
 }
 
+/// codex P0 指摘（PR #1013）の回帰防止: `ignore_till_sync`
+/// （`extended_query` モジュールドキュメント「エラー後の同期回復」節）中に
+/// 読み捨て対象となるメッセージ（'H' 等）の本文が、宣言長より短いバイト数で
+/// 接続が切断された場合、その切り詰めを正常な読み捨てとして受理せず
+/// fail-closed に接続を閉じる（`framing::discard_body` が `io::copy` の
+/// 戻り値〔実コピー長〕を宣言長と照合するようになったことの確認）。
+#[test]
+fn truncated_body_during_ignore_till_sync_discard_closes_the_connection() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = tcp_connect(addr);
+
+    // 許可リスト外 SQL の Parse でエラー後の同期回復モードへ入る。
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("", "SELECT id FROM documents WHERE id = $1", 0),
+    );
+    assert_error_response(&mut stream, "42601");
+
+    // Flush（'H'）を、宣言長 20（body 16 バイト）だが実際には 5 バイトしか
+    // 送らないまま書き込み側を閉じることで、読み捨て中の途中切断を再現する。
+    let mut msg = Vec::new();
+    msg.push(b'H');
+    msg.extend_from_slice(&20i32.to_be_bytes());
+    msg.extend_from_slice(&[0u8; 5]);
+    stream
+        .write_all(&msg)
+        .expect("send truncated Flush header+partial body");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown write half to signal EOF mid-body");
+
+    // 修正前は `io::copy` の戻り値を確認せず、EOF による切り詰めコピーを
+    // そのまま `Ok(())` として受理していたため、この後もサーバーは
+    // 同期回復モードのまま次のメッセージ（Sync）を待ち続けていた。
+    // 修正後は `FrameError::Truncated` として fail-closed に接続を閉じる
+    // （エラー応答は送出しない。回復不能なフレーミング違反は他の
+    // `Truncated` 系と同じ扱い）。
+    let mut buf = [0u8; 1];
+    match stream.read(&mut buf) {
+        Ok(n) => assert_eq!(
+            n, 0,
+            "connection must close after the truncated discard body"
+        ),
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionReset,
+            "unexpected read error after truncated discard body: {e:?}"
+        ),
+    }
+}
+
 /// PR #1013 レビュー指摘（Cursor Bugbot Medium）の回帰防止: 実行を試みて
 /// 失敗した portal（`operation_id` 重複により `execute_parsed_in_session`
 /// 自体がエラーを返すケース）は Sync を越えても `Ready` へ戻らず、次の
