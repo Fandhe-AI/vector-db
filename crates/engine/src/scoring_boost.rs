@@ -296,14 +296,14 @@ mod tests {
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 
     fn schema() -> TableSchema {
-        TableSchema {
-            name: "docs".to_string(),
-            columns: vec![
+        TableSchema::new(
+            "docs",
+            vec![
                 ColumnDef::new("body", ColumnType::Vector(2), false),
                 ColumnDef::new("path", ColumnType::Text, false),
                 ColumnDef::new("kind", ColumnType::Text, true),
             ],
-        }
+        )
     }
 
     #[test]

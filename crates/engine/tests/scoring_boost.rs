@@ -67,13 +67,13 @@ fn build_corpus() -> Vec<Doc> {
 }
 
 fn schema() -> TableSchema {
-    TableSchema {
-        name: "docs".to_string(),
-        columns: vec![
+    TableSchema::new(
+        "docs",
+        vec![
             ColumnDef::new("path", ColumnType::Text, false),
             ColumnDef::new("kind", ColumnType::Text, true),
         ],
-    }
+    )
 }
 
 fn fuse(docs: &[Doc], cfg: &RrfConfig) -> Vec<HybridHit> {
