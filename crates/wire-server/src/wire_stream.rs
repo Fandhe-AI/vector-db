@@ -1,0 +1,83 @@
+//! 認証後の pg wire 接続ハンドラ（`handshake`・`simple_query`・
+//! `extended_query`・`copy`・`protocol_dispatch`）が読み書きするストリームの
+//! 抽象。平文 `TcpStream` と TLS 上のストリーム（[`crate::tls::stream::
+//! TlsStream`]。Issue #966）のどちらでも同じハンドラロジックを走らせるために
+//! 導入する（Issue #966）。
+//!
+//! ハンドラ側の関数は本 trait のオブジェクト（`&mut dyn WireStream`）を
+//! 受け取る形へ一般化し、分岐やメッセージ組み立てのロジック自体は変更しない
+//! （型を広げるだけ）。`Read + Write` はオブジェクトセーフなので、個々の
+//! 関数を generic 化せずに単一の trait object で受け渡しできる。
+
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+/// 認証後接続ハンドラが要求するストリーム操作の最小集合。
+///
+/// `TcpStream`（平文）と `TlsStream`（TLS。Issue #966）の双方に実装する。
+/// ハンドラ側のロジック（分岐・応答内容・順序）はこの trait を介しても
+/// 一切変えない契約とする。
+pub trait WireStream: Read + Write {
+    /// 現在設定されている読み取りタイムアウトを取得する
+    /// （`post_auth_loop` が接続全体の基準値として最初に読む）。
+    fn read_timeout(&self) -> io::Result<Option<Duration>>;
+
+    /// 読み取りタイムアウトを設定する。TLS 上でも同じ OS ソケットの
+    /// タイムアウトがそのまま効く（`TlsStream` は内部の `TcpStream` へ委譲）。
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// 書き込みタイムアウトを設定する。[`Self::set_read_timeout`] と対。
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+
+    /// 読み書き両方向を閉じる（`protocol_dispatch::drain_and_close` 等の
+    /// fail-closed な即時切断が使う）。
+    fn shutdown_both(&mut self) -> io::Result<()>;
+
+    /// 書き込み方向だけを閉じる（`protocol_dispatch::drain_and_close` の
+    /// lingering close が FIN を送ってから読み捨てるために使う）。
+    fn shutdown_write(&mut self) -> io::Result<()>;
+
+    /// 緊急応答（RECOVER-6・panic フック経由の応答送出）用の生ソケット複製。
+    /// `engine::recovery::panic_hook::EmergencyResponseRegistration` が
+    /// `TcpStream` 固定の API のため、平文接続でのみ `Some` を返す。TLS
+    /// 接続では平文バイト列が TLS レコードへ混入するのを防ぐため `None`
+    /// を返し、緊急応答の登録自体をスキップする（Issue #966 の既知の
+    /// 制約。詳細は `docs/design/tls-wire-connection.md` 参照）。
+    fn emergency_channel(&self) -> Option<TcpStream>;
+
+    /// 接続終了時の best-effort な後始末（TLS では `close_notify` の送出）。
+    /// 平文では no-op（既存挙動とビット同一）。
+    fn graceful_close(&mut self);
+}
+
+impl WireStream for TcpStream {
+    fn read_timeout(&self) -> io::Result<Option<Duration>> {
+        TcpStream::read_timeout(self)
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+
+    fn shutdown_both(&mut self) -> io::Result<()> {
+        TcpStream::shutdown(self, std::net::Shutdown::Both)
+    }
+
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        TcpStream::shutdown(self, std::net::Shutdown::Write)
+    }
+
+    fn emergency_channel(&self) -> Option<TcpStream> {
+        self.try_clone().ok()
+    }
+
+    fn graceful_close(&mut self) {
+        // 平文接続には送るべき終端メッセージが無い。既存挙動（drop のみ）と
+        // ビット同一に保つため何もしない。
+    }
+}

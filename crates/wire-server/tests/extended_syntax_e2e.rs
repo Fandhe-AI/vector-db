@@ -96,15 +96,22 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path, extra_args: &[String]) -
 
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, rx) = mpsc::channel::<String>();
+    // EOF（子プロセス終了）まで読み続ける（Issue #943）。listen 行の待ち受けが
+    // 終わって受信側が破棄された後に読み取りを止めるとパイプの読み口が閉じ、
+    // サーバーが接続エラー等を stderr へ書いた時点で `EPIPE` により
+    // `eprintln!` が panic し、panic フック（TASK-99・RECOVER-8）経由で
+    // SIGABRT 終了してしまう（`tests/three_client_e2e.rs::ServerGuard` 参照）。
     thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
         loop {
             line.clear();
             let n = reader.read_line(&mut line).unwrap_or(0);
-            if n == 0 || tx.send(std::mem::take(&mut line)).is_err() {
+            if n == 0 {
                 break;
             }
+            // 受信側破棄後の送信失敗は無視し、読み捨てを続ける。
+            let _ = tx.send(std::mem::take(&mut line));
         }
     });
 

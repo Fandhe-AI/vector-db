@@ -52,8 +52,7 @@
 //! が契約を固定する。永続化自体は engine API 側の `Private` 可視
 //! `PolicyContext` からも同じく確認できる）。
 
-use std::io::{self, Write};
-use std::net::TcpStream;
+use std::io;
 
 use engine::core::EngineCore;
 use engine::error_format::{ClassifiedError, ErrorClass};
@@ -63,8 +62,9 @@ use engine::sql::transaction::SessionTransaction;
 use engine::sql::SqlOutcome;
 
 use crate::result_encoder;
+use crate::wire_stream::WireStream;
 
-fn write_all(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
+fn write_all<S: WireStream>(stream: &mut S, msg: &[u8]) -> io::Result<()> {
     stream.write_all(msg)
 }
 
@@ -73,8 +73,8 @@ fn write_all(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
 /// 変更しない）。`class` は `crate::handshake::write_error_response_io`（実体は
 /// `crate::error_response::encode`）へそのまま渡り、severity・SQLSTATE の決定を
 /// 横断写像へ一元化する（TASK-153・ERR-1・codex-review P1 指摘対応・PR #258）。
-fn respond_error_and_ready(
-    stream: &mut TcpStream,
+fn respond_error_and_ready<S: WireStream>(
+    stream: &mut S,
     class: ErrorClass,
     message: &str,
     txn_status: engine::sql::transaction::TransactionStatus,
@@ -119,8 +119,8 @@ enum StatementStatus {
 /// 既存挙動（応答バイト列・エラーコード・メッセージ）は構造的に不変のまま保たれる。
 ///
 /// SQL 本文・テナント ID はログへ出さない（security.md P0）。
-pub(crate) fn execute_and_respond<'e>(
-    stream: &mut TcpStream,
+pub(crate) fn execute_and_respond<'e, S: WireStream>(
+    stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
@@ -273,8 +273,8 @@ impl MessageSnapshot {
 /// 未報告分があれば `54000`）を返す。`Active` なら `Failed` へ遷移させてから
 /// 元のエラーを返す（`Active` のまま残すと後続の `COMMIT` が先行する書き込みを
 /// 永続化してしまう。PR #1041 レビュー指摘）。
-fn respond_splitter_error(
-    stream: &mut TcpStream,
+fn respond_splitter_error<S: WireStream>(
+    stream: &mut S,
     txn: &mut SessionTransaction<'_>,
     e: &engine::sql::statement_splitter::MultiStatementError,
 ) -> io::Result<()> {
@@ -322,8 +322,8 @@ fn respond_splitter_error(
 /// `INSERT` 等の分岐先決定は engine 側（`EngineCore::execute_sql_in_session`。
 /// TASK-82・SQL-10）に一元化する。wire 層はここで構文種別ごとに分岐しない
 /// （モジュール冒頭コメント参照）。
-fn run_statement<'e>(
-    stream: &mut TcpStream,
+fn run_statement<'e, S: WireStream>(
+    stream: &mut S,
     engine: &'e EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
@@ -369,12 +369,12 @@ fn run_statement<'e>(
 /// 緊急応答チャネルへの登録が既に外れている（[`run_statement`] 旧実装の
 /// コメントが警告していた「書きかけの通常応答フレームへの緊急応答混入」を
 /// 防ぐ構造は不変のまま）。
-pub(crate) fn execute_with_emergency_registration(
-    stream: &mut TcpStream,
+pub(crate) fn execute_with_emergency_registration<S: WireStream>(
+    stream: &mut S,
     f: impl FnOnce() -> Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError>,
 ) -> Result<SqlOutcome, engine::sql::allowlist::SqlSurfaceError> {
     let _emergency_registration = cached_emergency_response_bytes().and_then(|response_bytes| {
-        let clone = stream.try_clone().ok()?;
+        let clone = stream.emergency_channel()?;
         Some(
             engine::recovery::panic_hook::EmergencyResponseRegistration::register(
                 response_bytes.clone(),
@@ -585,8 +585,8 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
 /// `INSERT`／`TRUNCATE TABLE`／`DELETE`／`UPDATE`）の共通本体。`finish` が
 /// [`Finish::Continue`] のときは `ReadyForQuery` を送らず、複数文の次の文へ
 /// 制御を返す。
-fn respond_command_complete(
-    stream: &mut TcpStream,
+fn respond_command_complete<S: WireStream>(
+    stream: &mut S,
     tag: &str,
     finish: Finish,
     txn: &mut SessionTransaction<'_>,
@@ -609,8 +609,8 @@ fn respond_command_complete(
 /// 経路であるため、`respond_rows_with_tag` と同じく明示トランザクション中なら
 /// `Failed` へ遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘: `Active` の
 /// まま残すと後続の `COMMIT` が書き込みを永続化してしまう）。
-fn respond_command_complete_with(
-    stream: &mut TcpStream,
+fn respond_command_complete_with<S: WireStream>(
+    stream: &mut S,
     tag: &str,
     finish: Finish,
     txn: &mut SessionTransaction<'_>,
@@ -759,8 +759,8 @@ pub fn emergency_response_bytes() -> Option<&'static [u8]> {
 /// ため）。バイト列契約の回帰テスト（`respond_query_result_matches_*`）専用の
 /// ヘルパーとして残す。
 #[cfg(test)]
-fn respond_query_result(
-    stream: &mut TcpStream,
+fn respond_query_result<S: WireStream>(
+    stream: &mut S,
     result: &engine::sql::exec::QueryResult,
     command_tag: &str,
     finish: Finish,
@@ -785,8 +785,8 @@ fn respond_query_result(
 /// `SqlOutcome::Returning` 分岐参照）。バイト列の組み立て自体（`ResponseBuffer`
 /// によるバッファリング・上限超過時のフレーム境界分割送出）は本切り出しの
 /// 前後で完全に同一。`finish`／戻り値の意味は [`respond_query_result`] 参照。
-fn respond_rows_with_tag(
-    stream: &mut TcpStream,
+fn respond_rows_with_tag<S: WireStream>(
+    stream: &mut S,
     result: &engine::sql::exec::QueryResult,
     tag: &str,
     finish: Finish,
@@ -897,7 +897,7 @@ mod tests {
     use super::*;
     use engine::catalog::ColumnType;
     use engine::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
 
     /// 実ソケットを介したループバック対（`protocol_dispatch.rs::tests::
     /// loopback_pair` と同じパターン）。大容量応答の送信ブロックを避けるため、

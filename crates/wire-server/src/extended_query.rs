@@ -104,8 +104,7 @@
 //! 'S'／'C'／'H' のいずれも従来どおり `protocol_dispatch::reject_and_close`
 //! （`0A000` + 切断）のまま（WIRE-8 の契約を維持）。
 
-use std::io::{self, Write};
-use std::net::TcpStream;
+use std::io;
 
 use engine::core::{EngineCore, ParsedSql};
 use engine::error_format::{ClassifiedError, ErrorClass};
@@ -121,6 +120,7 @@ use crate::limits::{
     MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION,
 };
 use crate::result_encoder;
+use crate::wire_stream::WireStream;
 
 /// Parse 本文の最小長（空文字列ステートメント名 cstr・空クエリ cstr・
 /// パラメータ件数 i16 の合計）。
@@ -941,7 +941,7 @@ fn build_error_response_body(err: &HandlerError) -> Result<Vec<u8>, result_encod
 /// ErrorResponse を送出し、フレーム自体が壊れており同期を回復できない
 /// （モジュールドキュメント「エラー後の同期回復」節）場合に、有界
 /// lingering close で接続を終える。
-fn respond_error_and_close(stream: &mut TcpStream, err: &HandlerError) -> io::Result<()> {
+fn respond_error_and_close<S: WireStream>(stream: &mut S, err: &HandlerError) -> io::Result<()> {
     eprintln!(
         "wire-server: extended query rejecting message ({})",
         err.error_class().wire_code()
@@ -970,8 +970,8 @@ fn respond_error_and_close(stream: &mut TcpStream, err: &HandlerError) -> io::Re
 /// 経路になる。エラー応答を本関数以外の方法で返す経路を追加してはならない
 /// （切断する経路は `respond_error_and_close`。切断で `SessionTransaction` が
 /// drop され、書き込みトランザクションは abort される）。
-fn respond_error_and_await_sync(
-    stream: &mut TcpStream,
+fn respond_error_and_await_sync<S: WireStream>(
+    stream: &mut S,
     err: &HandlerError,
     state: &mut ExtendedQueryState,
 ) -> io::Result<()> {
@@ -1002,8 +1002,8 @@ fn io_error_from_frame(e: FrameError) -> io::Error {
 /// Parse（'P'）を処理する（`engine` が接続済みの場合のみ呼ばれる。`handshake::
 /// post_auth_loop` 参照）。SQL は簡易クエリと同一の許可リスト
 /// （[`EngineCore::parse_sql`]）で検証してから保持する（検証失敗なら保持しない）。
-pub(crate) fn handle_parse(
-    stream: &mut TcpStream,
+pub(crate) fn handle_parse<S: WireStream>(
+    stream: &mut S,
     engine: &EngineCore,
     txn: &mut engine::sql::transaction::SessionTransaction<'_>,
     state: &mut ExtendedQueryState,
@@ -1087,8 +1087,8 @@ enum DescribeResult {
 /// 担当）と `RowDescription`（結果列なしは `NoData`）を返す。portal 対象は
 /// `ParameterDescription` を返さず `RowDescription`／`NoData` のみ返す
 /// （PostgreSQL の規約）。
-pub(crate) fn handle_describe(
-    stream: &mut TcpStream,
+pub(crate) fn handle_describe<S: WireStream>(
+    stream: &mut S,
     engine: &EngineCore,
     session: &SessionState,
     txn: &engine::sql::transaction::SessionTransaction<'_>,
@@ -1124,8 +1124,8 @@ pub(crate) fn handle_describe(
     }
 }
 
-fn write_describe_response(
-    stream: &mut TcpStream,
+fn write_describe_response<S: WireStream>(
+    stream: &mut S,
     include_parameter_description: bool,
     columns: Option<Vec<ColumnMeta>>,
 ) -> io::Result<()> {
@@ -1161,8 +1161,8 @@ fn write_describe_response(
 /// 返さず（[`write_describe_response`] と異なり常に `false` 相当）、
 /// `RowDescription` の format code は Bind 時点で確定した `formats`
 /// （[`Portal::result_formats`]）をそのまま反映する。
-fn write_describe_response_portal(
-    stream: &mut TcpStream,
+fn write_describe_response_portal<S: WireStream>(
+    stream: &mut S,
     columns: Option<Vec<ColumnMeta>>,
     formats: &[result_encoder::FormatCode],
 ) -> io::Result<()> {
@@ -1251,8 +1251,8 @@ fn validate_format_codes(codes: &[i16], target_count: usize) -> Result<(), Handl
 /// ステートメントを Describe 相当（`describe_parsed_in_session`）して結果列を
 /// 確定し、portal として保持する（Bind 時点のスナップショット。モジュール
 /// ドキュメント「portal のライフサイクル」節参照）。
-pub(crate) fn handle_bind(
-    stream: &mut TcpStream,
+pub(crate) fn handle_bind<S: WireStream>(
+    stream: &mut S,
     engine: &EngineCore,
     session: &SessionState,
     txn: &mut engine::sql::transaction::SessionTransaction<'_>,
@@ -1389,8 +1389,8 @@ fn handle_bind_body(
 /// クエリプロトコル経由の `BEGIN` は `Idle` から進めず常に `0A000`
 /// （`transaction_feature_not_supported`）で拒否されていた。`execute_parsed_
 /// in_txn` へ切り替え、簡易クエリと同じ状態機械を共有する）。
-pub(crate) fn handle_execute<'e>(
-    stream: &mut TcpStream,
+pub(crate) fn handle_execute<'e, S: WireStream>(
+    stream: &mut S,
     engine: &'e EngineCore,
     ctx: &engine::policy::PolicyContext,
     session: &mut SessionState,
@@ -1447,7 +1447,7 @@ pub(crate) fn handle_execute<'e>(
     }
 }
 
-fn write_command_complete(stream: &mut TcpStream, tag: &str) -> Result<(), HandlerError> {
+fn write_command_complete<S: WireStream>(stream: &mut S, tag: &str) -> Result<(), HandlerError> {
     let msg = result_encoder::encode_command_complete(tag)
         .map_err(|_| internal_error("failed to encode command complete"))?;
     stream.write_all(&msg).map_err(io_to_handler)?;
@@ -1480,8 +1480,8 @@ fn portal_is_exempt_while_failed(state: &ExtendedQueryState, portal_name: &str) 
 /// `txn` 追加で `clippy::too_many_arguments`（閾値 7）を超える
 /// （`sql/exec.rs`・`tenant.rs` 等、既存の同種箇所と同じ対応）。
 #[allow(clippy::too_many_arguments)]
-fn execute_portal<'e>(
-    stream: &mut TcpStream,
+fn execute_portal<'e, S: WireStream>(
+    stream: &mut S,
     engine: &'e EngineCore,
     ctx: &engine::policy::PolicyContext,
     session: &mut SessionState,
@@ -1938,8 +1938,8 @@ fn execute_portal<'e>(
 /// （`SessionTransaction`）自体は本関数の対象外で、`handshake::
 /// post_auth_loop` が接続単位で保持したまま Sync を越えて生き続ける
 /// （SQL-31・TASK-221・Issue #942）。
-pub(crate) fn handle_sync(
-    stream: &mut TcpStream,
+pub(crate) fn handle_sync<S: WireStream>(
+    stream: &mut S,
     state: &mut ExtendedQueryState,
     txn_status: engine::sql::transaction::TransactionStatus,
 ) -> io::Result<LoopSignal> {
@@ -1972,8 +1972,8 @@ pub(crate) fn handle_sync(
 /// Close（'C'）を処理する。statement 対象はその statement から作られた
 /// portal もまとめて閉じる。存在しない名前を渡しても失敗させない
 /// （PostgreSQL と同じ挙動）。
-pub(crate) fn handle_close(
-    stream: &mut TcpStream,
+pub(crate) fn handle_close<S: WireStream>(
+    stream: &mut S,
     state: &mut ExtendedQueryState,
 ) -> io::Result<LoopSignal> {
     let body = match framing::read_length_prefixed_body(
@@ -2019,7 +2019,7 @@ pub(crate) fn handle_close(
 /// Flush（'H'）を処理する。body は厳密に空（length=4）以外を fail-closed で
 /// 拒否する（`'S'`/`'X'` と同じ扱い）。出力を flush するのみで `ReadyForQuery`
 /// は送らない（PostgreSQL の規約）。
-pub(crate) fn handle_flush(stream: &mut TcpStream) -> io::Result<LoopSignal> {
+pub(crate) fn handle_flush<S: WireStream>(stream: &mut S) -> io::Result<LoopSignal> {
     let _body = match framing::read_length_prefixed_body(stream, 4, 4) {
         Ok(b) => b,
         Err(FrameError::Truncated) => return Ok(LoopSignal::Closed),

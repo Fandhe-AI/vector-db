@@ -189,6 +189,15 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 への対応として本 PR へ吸収し実装済み（`wire-server::result_encoder::
 encode_ready_for_query`／`simple_query.rs`／`extended_query::handle_sync`）。
 
+`#943`（WIRE-19）は上記の中核実装を前提に、残差の検証（単一文の異常遷移・
+複数文（WIRE-16）・空クエリ・COPY・拡張クエリの Execute 段エラーの状態
+バイト、および無改造の実クライアント 3 種による観測）を層 A
+（`crates/wire-server/tests/wire19_ready_for_query_status.rs`・
+`wire942_extended_transaction.rs` の失効テストへの状態アサーション追加）・
+層 B（`crates/wire-server/tests/three_client_e2e.rs::
+three_clients_observe_transaction_status_transitions`）として実施した。
+production コード（`crates/wire-server/src/`）は無変更・テスト専任。
+
 ## wire-server への結線
 
 - `handshake.rs::post_auth_loop` が接続単位の `Option<SessionTransaction<'e>>`

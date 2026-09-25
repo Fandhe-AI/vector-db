@@ -13,10 +13,12 @@
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（正式なフレーミング上限体系。対象ビヘイビア WIRE-4, WIRE-10）。
 
-use std::io::{self, Write};
+use std::io;
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::wire_stream::WireStream;
 use engine::error_format::{ClassifiedError, ErrorClass};
 
 use crate::auth::{self, base64_std, scram, AuthMethod, UserStore};
@@ -91,7 +93,7 @@ type Result<T> = std::result::Result<T, HandshakeError>;
 // 低レベル読み書きプリミティブ
 // ---------------------------------------------------------------------------
 
-fn write_all(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+fn write_all<S: WireStream>(stream: &mut S, data: &[u8]) -> Result<()> {
     stream.write_all(data)?;
     Ok(())
 }
@@ -121,7 +123,7 @@ fn write_ssl_no_response(stream: &mut TcpStream) -> Result<()> {
     write_all(stream, b"N")
 }
 
-fn write_authentication_cleartext_password(stream: &mut TcpStream) -> Result<()> {
+fn write_authentication_cleartext_password<S: WireStream>(stream: &mut S) -> Result<()> {
     // 'R' + length(4) + AuthenticationCleartextPassword コード(4) = 3
     let mut msg = Vec::with_capacity(9);
     msg.push(b'R');
@@ -130,7 +132,7 @@ fn write_authentication_cleartext_password(stream: &mut TcpStream) -> Result<()>
     write_all(stream, &msg)
 }
 
-fn write_authentication_ok(stream: &mut TcpStream) -> Result<()> {
+fn write_authentication_ok<S: WireStream>(stream: &mut S) -> Result<()> {
     let mut msg = Vec::with_capacity(9);
     msg.push(b'R');
     msg.extend_from_slice(&8i32.to_be_bytes());
@@ -147,7 +149,7 @@ const MAX_SASL_MESSAGE_LEN: usize = 2048;
 /// `AuthenticationSASL`（'R'/10）: 提示する機構は [`scram::MECHANISM_NAME`]
 /// の 1 つのみ（`-PLUS` は TLS 未実装のため提示しない。Issue #941・TASK-228 へ
 /// 引き継ぐ）。
-fn write_authentication_sasl(stream: &mut TcpStream) -> Result<()> {
+fn write_authentication_sasl<S: WireStream>(stream: &mut S) -> Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(scram::MECHANISM_NAME.as_bytes());
     body.push(0);
@@ -162,7 +164,7 @@ fn write_authentication_sasl(stream: &mut TcpStream) -> Result<()> {
 }
 
 /// `AuthenticationSASLContinue`（'R'/11）: server-first-message を運ぶ。
-fn write_authentication_sasl_continue(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+fn write_authentication_sasl_continue<S: WireStream>(stream: &mut S, data: &[u8]) -> Result<()> {
     let total_len = (8 + data.len()) as i32;
     let mut msg = Vec::with_capacity(5 + data.len());
     msg.push(b'R');
@@ -176,7 +178,7 @@ fn write_authentication_sasl_continue(stream: &mut TcpStream, data: &[u8]) -> Re
 /// proof の検証に成功した場合にのみ送出し、これを送った直後は必ず
 /// `AuthenticationOk` 以降の既存シーケンスへ進む（`v=` を送ってからエラーに
 /// する経路は作らない）。
-fn write_authentication_sasl_final(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+fn write_authentication_sasl_final<S: WireStream>(stream: &mut S, data: &[u8]) -> Result<()> {
     let total_len = (8 + data.len()) as i32;
     let mut msg = Vec::with_capacity(5 + data.len());
     msg.push(b'R');
@@ -190,7 +192,7 @@ fn write_authentication_sasl_final(stream: &mut TcpStream, data: &[u8]) -> Resul
 /// 「int32 の長さ（`-1` は不可）」「client-first-message 本体」の順。
 /// PasswordMessage と型バイトは同じだが本文形状が異なるため
 /// `read_password_message` は流用しない。
-fn read_sasl_initial_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_sasl_initial_response<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> {
     let type_byte = match framing::read_typed_frame_header(stream)? {
         Some(b) => b,
         None => return Err(HandshakeError::Protocol("expected SASLInitialResponse")),
@@ -231,7 +233,7 @@ fn read_sasl_initial_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
 /// `SASLResponse`（型 'p'）を読む。本文は raw bytes（PasswordMessage と異なり
 /// NUL 終端ではない）。
-fn read_sasl_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_sasl_response<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> {
     let type_byte = match framing::read_typed_frame_header(stream)? {
         Some(b) => b,
         None => return Err(HandshakeError::Protocol("expected SASLResponse")),
@@ -246,7 +248,7 @@ fn read_sasl_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// BackendKeyData（'K'）: pid・secret key を通知する。CancelRequest 経路は本タスクの
 /// スコープ外だが、クライアント実装（psql 等）が本メッセージの到達を前提に
 /// StartupMessage 後続シーケンスを進めるため送出する。
-fn write_backend_key_data(stream: &mut TcpStream, pid: i32, secret: i32) -> Result<()> {
+fn write_backend_key_data<S: WireStream>(stream: &mut S, pid: i32, secret: i32) -> Result<()> {
     let mut msg = Vec::with_capacity(13);
     msg.push(b'K');
     msg.extend_from_slice(&12i32.to_be_bytes());
@@ -255,7 +257,7 @@ fn write_backend_key_data(stream: &mut TcpStream, pid: i32, secret: i32) -> Resu
     write_all(stream, &msg)
 }
 
-fn write_parameter_status(stream: &mut TcpStream, name: &str, value: &str) -> Result<()> {
+fn write_parameter_status<S: WireStream>(stream: &mut S, name: &str, value: &str) -> Result<()> {
     let mut body = Vec::with_capacity(name.len() + value.len() + 2);
     body.extend_from_slice(name.as_bytes());
     body.push(0);
@@ -277,8 +279,8 @@ fn write_parameter_status(stream: &mut TcpStream, name: &str, value: &str) -> Re
 /// 明示トランザクション（SQL-31・TASK-221・WIRE-19）の状態バイトへそのまま
 /// 写像する。呼び出し元に `SessionTransaction` が無い箇所（ハンドシェイク
 /// 直後）は `TransactionStatus::Idle` を渡す。
-fn write_ready_for_query(
-    stream: &mut TcpStream,
+fn write_ready_for_query<S: WireStream>(
+    stream: &mut S,
     status: engine::sql::transaction::TransactionStatus,
 ) -> Result<()> {
     write_all(
@@ -293,8 +295,8 @@ fn write_ready_for_query(
 /// `HandshakeError`／`handshake::Result` は本モジュール限定の型のため、モジュール
 /// 境界をまたいで直接公開せず、戻り値を `io::Result` へ写像したこの関数のみを
 /// `pub(crate)` にする（`HandshakeError` 自体は private のまま維持する）。
-pub(crate) fn write_error_response_io(
-    stream: &mut TcpStream,
+pub(crate) fn write_error_response_io<S: WireStream>(
+    stream: &mut S,
     class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
@@ -304,8 +306,8 @@ pub(crate) fn write_error_response_io(
 /// `write_ready_for_query` の `io::Result` 版ラッパー。[`crate::simple_query`] は
 /// 本モジュール限定の `handshake::Result` を扱えないため、`ReadyForQuery` を
 /// 送出する唯一の経路としてこの関数を `pub(crate)` にする。
-pub(crate) fn write_ready_for_query_io(
-    stream: &mut TcpStream,
+pub(crate) fn write_ready_for_query_io<S: WireStream>(
+    stream: &mut S,
     status: engine::sql::transaction::TransactionStatus,
 ) -> io::Result<()> {
     write_ready_for_query(stream, status).map_err(io::Error::from)
@@ -318,7 +320,11 @@ pub(crate) fn write_ready_for_query_io(
 /// そのまま受け取り severity は `ERROR` 固定〕を経由しており、`ErrorClass::
 /// ConnectionLimitExceeded` のような `FATAL` 契約の分類でも `ERROR` に丸められる
 /// 不整合があった）。
-fn write_error_response(stream: &mut TcpStream, class: ErrorClass, message: &str) -> Result<()> {
+fn write_error_response<S: WireStream>(
+    stream: &mut S,
+    class: ErrorClass,
+    message: &str,
+) -> Result<()> {
     let msg = crate::error_response::encode(class, message)?;
     write_all(stream, &msg)
 }
@@ -413,7 +419,7 @@ fn parse_startup_params(params_body: &[u8]) -> Result<String> {
 /// 拒否する。review 指摘: `password\0suffix\0` のような多重 NUL フレームを
 /// Argon2id 照合へそのまま渡すと、フレーミングの曖昧さがパスワード照合の意味論に
 /// 混入するため fail-closed で拒否する）。
-fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_password_message<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> {
     let type_byte = match framing::read_typed_frame_header(stream)? {
         Some(b) => b,
         None => return Err(HandshakeError::Protocol("expected PasswordMessage")),
@@ -468,8 +474,8 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// `engine::sql::mode::SessionState`（取得モード・宣言的 UDF レジストリ）で、
 /// いずれも本ループの全クエリを通じて 1 個の値を使い回す（`EngineCore` 自体は
 /// セッション状態を保持しない設計。`sql::mode` モジュールドキュメント参照）。
-fn post_auth_loop<'e>(
-    stream: &mut TcpStream,
+fn post_auth_loop<'e, S: WireStream>(
+    stream: &mut S,
     ctx: &engine::policy::PolicyContext,
     engine: Option<&'e engine::core::EngineCore>,
     session: &mut engine::sql::mode::SessionState,
@@ -947,8 +953,8 @@ const FRAME_DEADLINE_POLL: Duration = Duration::from_millis(100);
 ///   `framing::FrameDeadlineGuard` でフレーム全体の期限を課す（期限超過は接続を
 ///   閉じてライタを解放する）。`applied` は現在ソケットに設定中の値で、変更が
 ///   必要なときだけ `set_read_timeout` を呼ぶ。
-fn read_next_frame_header(
-    stream: &mut TcpStream,
+fn read_next_frame_header<S: WireStream>(
+    stream: &mut S,
     txn: &mut Option<engine::sql::transaction::SessionTransaction<'_>>,
     base_timeout: Option<Duration>,
     applied: &mut Option<Duration>,
@@ -1020,8 +1026,8 @@ fn read_next_frame_header(
 /// - `Frame(Truncated)`: 相手が既に切断しているため応答を送らずに `Ok(())`。
 /// - `Io`: サーバー側の異常として `Err` をそのまま返す（呼び出し元の
 ///   `server::accept_loop` がログに残す）。
-fn respond_and_close(
-    stream: &mut TcpStream,
+fn respond_and_close<S: WireStream>(
+    stream: &mut S,
     err: HandshakeError,
     fallback_message: &str,
 ) -> io::Result<()> {
@@ -1080,6 +1086,23 @@ pub fn handle_connection_with_engine(
     handle_connection_inner(stream, store, Some(engine))
 }
 
+/// TLS opt-in を含む新しい公開入口（Issue #966）。`tls` が `Some` の場合に
+/// 限り `SSLRequest` へ `'S'` を返し、`crate::tls::server_handshake::
+/// perform_server_handshake` を実行してから以後の pg wire メッセージを
+/// `crate::tls::stream::TlsStream` 上で処理する。`None` の場合は
+/// [`handle_connection_bounded`]／[`handle_connection_with_engine`] と
+/// ビット単位で同一の平文経路になる（受入基準 2）。CLI からの証明書・鍵
+/// 読み込みと `tls` の構築自体は対象外（#967。`server::accept_loop_with_tls`
+/// から呼ばれる想定）。
+pub fn handle_connection_with_options(
+    stream: TcpStream,
+    store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
+    tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+) -> io::Result<()> {
+    handle_connection_inner_with_tls(stream, store, engine, tls)
+}
+
 /// 認証の結果（成功時の `PolicyContext`、または失敗〔`ErrorResponse` は
 /// [`authenticate`] 内で既に送出済みで、呼び出し元は接続を閉じるだけでよい〕）。
 enum AuthOutcome {
@@ -1091,7 +1114,11 @@ enum AuthOutcome {
 /// フローを実行する（Issue #940・WIRE-18・TASK-222。サーバー全体で 1 方式に
 /// 固定し、ユーザーごとには切り替えない設計）。`AuthenticationOk` 以降の
 /// 共通シーケンスは呼び出し元（[`handle_connection_inner`]）が担う。
-fn authenticate(stream: &mut TcpStream, store: &UserStore, username: &str) -> Result<AuthOutcome> {
+fn authenticate<S: WireStream>(
+    stream: &mut S,
+    store: &UserStore,
+    username: &str,
+) -> Result<AuthOutcome> {
     match store.auth_method() {
         AuthMethod::Cleartext => authenticate_cleartext(stream, store, username),
         AuthMethod::ScramSha256 => authenticate_scram(stream, store, username),
@@ -1099,8 +1126,8 @@ fn authenticate(stream: &mut TcpStream, store: &UserStore, username: &str) -> Re
 }
 
 /// ポインタ: TASK-67・WIRE-3。既存の cleartext password フロー。
-fn authenticate_cleartext(
-    stream: &mut TcpStream,
+fn authenticate_cleartext<S: WireStream>(
+    stream: &mut S,
     store: &UserStore,
     username: &str,
 ) -> Result<AuthOutcome> {
@@ -1121,8 +1148,8 @@ fn authenticate_cleartext(
 /// [`auth::AUTH_FAILURE_DELAY`]）・同一のエラー応答で列挙攻撃を防ぐ。
 /// TLS 未実装のためチャネルバインディング（`-PLUS`／`p=<cb-name>`）は
 /// 提示・受理しない（`08P01`。Issue #941・TASK-228 へ引き継ぐ）。
-fn authenticate_scram(
-    stream: &mut TcpStream,
+fn authenticate_scram<S: WireStream>(
+    stream: &mut S,
     store: &UserStore,
     username: &str,
 ) -> Result<AuthOutcome> {
@@ -1235,16 +1262,105 @@ fn authenticate_scram(
 }
 
 fn handle_connection_inner(
-    mut stream: TcpStream,
+    stream: TcpStream,
     store: &UserStore,
     engine: Option<&engine::core::EngineCore>,
 ) -> io::Result<()> {
-    let username = match negotiate_startup(&mut stream) {
-        Ok(u) => u,
-        Err(e) => return respond_and_close(&mut stream, e, "invalid startup packet"),
-    };
+    handle_connection_inner_with_tls(stream, store, engine, None)
+}
 
-    let outcome = match authenticate(&mut stream, store, &username) {
+/// [`negotiate_startup_or_upgrade`] の戻り値。
+enum PreTlsOutcome {
+    /// StartupMessage を受理した（TLS へ昇格しない。`SSLRequest` を送らない
+    /// クライアント、または `tls` 未設定時の従来経路）。
+    Ready(String),
+    /// `SSLRequest` を受理し、TLS へ昇格すべき（Issue #966）。
+    UpgradeTls,
+}
+
+/// `tls` opt-in 時の `SSLRequest`/`GSSENCRequest`/StartupMessage 受理
+/// （Issue #966）。既存の [`negotiate_startup`]（TLS 未設定時に使う。
+/// ビット単位で不変）と受理判定は同じだが、`SSLRequest` を受けた時点で
+/// `'N'` を返さず [`PreTlsOutcome::UpgradeTls`] を返す点だけが異なる
+/// （応答は呼び出し元が `'S'` を書いてから TLS ハンドシェイクへ進む）。
+/// GSSENC は本 Issue の対象外のまま `'N'`（既存契約を維持）。
+fn negotiate_startup_or_upgrade(stream: &mut TcpStream) -> Result<PreTlsOutcome> {
+    // `SSLRequest` を受けた時点で即座に `UpgradeTls` を返す（呼び出し元が
+    // 制御を引き継ぐ）ため、平文経路の `negotiate_startup` と異なり
+    // `ssl_seen` フラグは不要 ―― この関数の同一呼び出し内で `SSLRequest` を
+    // 2 回受け取ることは構造的に起こらない。
+    let mut gssenc_seen = false;
+    loop {
+        let body = framing::read_startup_frame(stream)?;
+        let code_bytes: [u8; 4] = body
+            .get(0..4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(HandshakeError::Protocol("truncated startup code"))?;
+        let code = i32::from_be_bytes(code_bytes);
+
+        match code {
+            SSL_REQUEST_CODE => {
+                return Ok(PreTlsOutcome::UpgradeTls);
+            }
+            GSSENC_REQUEST_CODE if !gssenc_seen => {
+                gssenc_seen = true;
+                write_ssl_no_response(stream)?;
+                continue;
+            }
+            GSSENC_REQUEST_CODE => {
+                return Err(HandshakeError::Protocol("repeated SSL/GSSENC negotiation"));
+            }
+            CANCEL_REQUEST_CODE => {
+                return Err(HandshakeError::Protocol(
+                    "cancel request (not supported on this path)",
+                ));
+            }
+            PROTOCOL_VERSION_3_0 => {
+                return parse_startup_params(&body[4..]).map(PreTlsOutcome::Ready);
+            }
+            _ => {
+                return Err(HandshakeError::Protocol("unsupported protocol version"));
+            }
+        }
+    }
+}
+
+/// TLS 確立後（`TlsStream` 上）の StartupMessage 受理（Issue #966・受入
+/// 基準 3）。`SSLRequest`／`GSSENCRequest` はいずれも（初回であっても）
+/// `Protocol` エラーとし、平文経路の「2 回目の SSLRequest」と同じ応答契約
+/// （[`respond_and_close`] 経由の ErrorResponse・切断）へ倒す。PostgreSQL
+/// 本体も TLS 確立後の再ネゴシエーション要求は拒否する。
+fn negotiate_after_tls<S: WireStream>(stream: &mut S) -> Result<String> {
+    let body = framing::read_startup_frame(stream)?;
+    let code_bytes: [u8; 4] = body
+        .get(0..4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(HandshakeError::Protocol("truncated startup code"))?;
+    let code = i32::from_be_bytes(code_bytes);
+    match code {
+        SSL_REQUEST_CODE | GSSENC_REQUEST_CODE => Err(HandshakeError::Protocol(
+            "SSL/GSSENC negotiation is not allowed once TLS is established",
+        )),
+        CANCEL_REQUEST_CODE => Err(HandshakeError::Protocol(
+            "cancel request (not supported on this path)",
+        )),
+        PROTOCOL_VERSION_3_0 => parse_startup_params(&body[4..]),
+        _ => Err(HandshakeError::Protocol("unsupported protocol version")),
+    }
+}
+
+/// 認証成功後の共通シーケンス（`AuthenticationOk` 以降・[`post_auth_loop`]）。
+/// 平文接続（`tls` 未設定分岐）・TLS 確立後の接続
+/// （[`handle_tls_upgrade`]）の双方が共有する（Issue #966）。ロジック
+/// （分岐・応答内容・順序）は従来の `handle_connection_inner` から一切
+/// 変更せず、ストリーム型を `WireStream` へ一般化しただけ。
+fn run_authenticated_session<S: WireStream>(
+    stream: &mut S,
+    store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
+    username: String,
+) -> io::Result<()> {
+    let outcome = match authenticate(stream, store, &username) {
         Ok(o) => o,
         Err(e) => {
             // Cursor Bugbot 指摘（Issue #940 PR #1006）: `authenticate` の
@@ -1264,7 +1380,7 @@ fn handle_connection_inner(
                 AuthMethod::Cleartext => "invalid password message",
                 AuthMethod::ScramSha256 => "invalid message frame",
             };
-            return respond_and_close(&mut stream, e, fallback);
+            return respond_and_close(stream, e, fallback);
         }
     };
     let ctx = match outcome {
@@ -1273,19 +1389,17 @@ fn handle_connection_inner(
     };
 
     // 読み取りタイムアウトは `server::accept_loop_with_limiter` が接続全体に
-    // 一度だけ設定済み（WIRE-5）であり、ここで切り替えない。
-    write_authentication_ok(&mut stream)?;
+    // 一度だけ設定済み（WIRE-5）であり、ここで切り替えない（TLS 昇格時は
+    // `handle_tls_upgrade` がハンドシェイク前後で退避・復元する）。
+    write_authentication_ok(stream)?;
     // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、
     // 暗号学的な強さは要求しない。プロセス ID とプロセス内カウンタで十分。
     let pid = std::process::id() as i32;
     let secret = connection_counter();
-    write_backend_key_data(&mut stream, pid, secret)?;
-    write_parameter_status(&mut stream, "server_version", "14.0")?;
-    write_parameter_status(&mut stream, "client_encoding", "UTF8")?;
-    write_ready_for_query(
-        &mut stream,
-        engine::sql::transaction::TransactionStatus::Idle,
-    )?;
+    write_backend_key_data(stream, pid, secret)?;
+    write_parameter_status(stream, "server_version", "14.0")?;
+    write_parameter_status(stream, "client_encoding", "UTF8")?;
+    write_ready_for_query(stream, engine::sql::transaction::TransactionStatus::Idle)?;
 
     // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
     // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
@@ -1309,17 +1423,96 @@ fn handle_connection_inner(
     // テナント間で共有しない（`extended_query` モジュールドキュメント参照）。
     let mut extended = crate::extended_query::ExtendedQueryState::new();
 
-    match post_auth_loop(
-        &mut stream,
-        &ctx,
-        engine,
-        &mut session,
-        &mut txn,
-        &mut extended,
-    ) {
+    match post_auth_loop(stream, &ctx, engine, &mut session, &mut txn, &mut extended) {
         Ok(()) => Ok(()),
-        Err(e) => respond_and_close(&mut stream, e, "invalid message frame"),
+        Err(e) => respond_and_close(stream, e, "invalid message frame"),
     }
+}
+
+/// TLS opt-in を含む接続処理本体（Issue #966）。`tls` が `None` の場合は
+/// [`negotiate_startup`]（`'N'` 応答。ビット単位で不変）へそのまま委譲し
+/// （受入基準 2）、`Some` の場合のみ [`negotiate_startup_or_upgrade`] で
+/// `SSLRequest` を検出して `'S'` を返し TLS ハンドシェイクへ進む。
+fn handle_connection_inner_with_tls(
+    mut stream: TcpStream,
+    store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
+    tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+) -> io::Result<()> {
+    let Some(tls_config) = tls else {
+        let username = match negotiate_startup(&mut stream) {
+            Ok(u) => u,
+            Err(e) => return respond_and_close(&mut stream, e, "invalid startup packet"),
+        };
+        return run_authenticated_session(&mut stream, store, engine, username);
+    };
+
+    match negotiate_startup_or_upgrade(&mut stream) {
+        Ok(PreTlsOutcome::Ready(username)) => {
+            run_authenticated_session(&mut stream, store, engine, username)
+        }
+        Ok(PreTlsOutcome::UpgradeTls) => handle_tls_upgrade(stream, store, engine, tls_config),
+        Err(e) => respond_and_close(&mut stream, e, "invalid startup packet"),
+    }
+}
+
+/// `SSLRequest` へ `'S'` を返した直後の TLS ハンドシェイク実行と、以後の
+/// pg wire メッセージを [`crate::tls::stream::TlsStream`] 上で処理する
+/// 経路（Issue #966）。
+fn handle_tls_upgrade(
+    mut stream: TcpStream,
+    store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
+    tls_config: Arc<crate::tls::server_handshake::TlsServerConfig>,
+) -> io::Result<()> {
+    // `'S'`（受理）を返す。以後のバイト列は TLS レコードとして扱われる。
+    write_all(&mut stream, b"S")?;
+
+    // ハンドシェイク driver（`perform_server_handshake_with`）は
+    // `DeadlineReader`/`DeadlineWriter` でソケットの読み書きタイムアウトを
+    // 都度上書きし、成功時も `HANDSHAKE_READ_TIMEOUT` 定数のまま残す
+    // （#965 の既存設計。呼び出し元での補正が前提）。ここで接続設定値
+    // （`server::accept_loop_*` が受理直後に設定した値。WIRE-5）を退避し、
+    // ハンドシェイク完了後に再適用することで、受入基準 4（TLS 上でも同じ
+    // タイムアウト値が働く）を満たす。
+    let saved_read_timeout = stream.read_timeout()?;
+    let saved_write_timeout = stream.write_timeout()?;
+
+    let session =
+        match crate::tls::server_handshake::perform_server_handshake(&mut stream, tls_config) {
+            Ok(session) => session,
+            Err(_e) => {
+                // alert の送出・切断は driver 側が既に行っている
+                // （`perform_server_handshake_with` のドキュメント参照）。
+                // ErrorResponse は送らない（TLS ハンドシェイクの失敗は
+                // ERR-1/2/4 の wire_code 写像の対象外。
+                // `docs/design/tls-wire-connection.md` 参照）。
+                return Err(io::Error::other("TLS handshake failed"));
+            }
+        };
+
+    if stream.set_read_timeout(saved_read_timeout).is_err()
+        || stream.set_write_timeout(saved_write_timeout).is_err()
+    {
+        return Err(io::Error::other(
+            "failed to restore connection timeouts after TLS handshake",
+        ));
+    }
+
+    let mut tls_stream = crate::tls::stream::TlsStream::new(stream, session);
+
+    let username = match negotiate_after_tls(&mut tls_stream) {
+        Ok(u) => u,
+        Err(e) => {
+            let result = respond_and_close(&mut tls_stream, e, "invalid startup packet");
+            tls_stream.graceful_close();
+            return result;
+        }
+    };
+
+    let result = run_authenticated_session(&mut tls_stream, store, engine, username);
+    tls_stream.graceful_close();
+    result
 }
 
 /// 旧 `(stream, store, post_auth_idle_timeout)` 3 引数シグネチャとの後方互換
@@ -1361,7 +1554,7 @@ fn connection_counter() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// フィクスチャ一時ディレクトリ名の一意性を pid・時刻だけに委ねないための

@@ -116,7 +116,7 @@ pub fn accept_loop_with_limiter(
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
-    accept_loop_inner(listener, store, None, limiter, read_timeout)
+    accept_loop_inner(listener, store, None, None, limiter, read_timeout)
 }
 
 /// engine（SQL 表層）を接続した接続受け付けループ（TASK-73・WIRE-1）。
@@ -131,13 +131,30 @@ pub fn accept_loop_with_engine(
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
-    accept_loop_inner(listener, store, Some(engine), limiter, read_timeout)
+    accept_loop_inner(listener, store, Some(engine), None, limiter, read_timeout)
+}
+
+/// TLS opt-in を含む接続受け付けループ（Issue #966）。`tls` が `Some` の
+/// 場合に限り、各接続で `SSLRequest` へ `'S'` を返し TLS ハンドシェイクへ
+/// 進む（[`crate::handshake::handle_connection_with_options`]）。`None` の
+/// 場合は [`accept_loop_with_engine`] とビット単位で同一の平文経路になる。
+/// CLI からの証明書・鍵読み込みと `tls` の構築自体は対象外（#967）。
+pub fn accept_loop_with_tls(
+    listener: TcpListener,
+    store: Arc<UserStore>,
+    engine: Option<Arc<EngineCore>>,
+    tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+) {
+    accept_loop_inner(listener, store, engine, tls, limiter, read_timeout)
 }
 
 fn accept_loop_inner(
     listener: TcpListener,
     store: Arc<UserStore>,
     engine: Option<Arc<EngineCore>>,
+    tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
@@ -225,15 +242,24 @@ fn accept_loop_inner(
 
         let store = Arc::clone(&store);
         let engine = engine.clone();
+        let tls = tls.clone();
         std::thread::spawn(move || {
             // 接続処理中は `permit` を保持し続け、スレッド終了時（正常終了・panic
             // いずれも）に Drop で確実に枠を解放する。
             let _permit = permit;
-            let result = match &engine {
-                Some(engine) => {
+            // `tls` が `None` の間は既存の 2 エントリポイントをそのまま呼び、
+            // ビット単位で従来と同一の平文経路を維持する（受入基準 2）。
+            let result = match (&engine, &tls) {
+                (_, Some(_)) => crate::handshake::handle_connection_with_options(
+                    stream,
+                    &store,
+                    engine.as_deref(),
+                    tls,
+                ),
+                (Some(engine), None) => {
                     crate::handshake::handle_connection_with_engine(stream, &store, engine)
                 }
-                None => crate::handshake::handle_connection_bounded(stream, &store),
+                (None, None) => crate::handshake::handle_connection_bounded(stream, &store),
             };
             if let Err(e) = result {
                 eprintln!("wire-server: connection error: {e}");
