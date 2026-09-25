@@ -1086,4 +1086,91 @@ mod tests {
                     .expect("cell_struct_bytes alone must not exceed the cap at this row count");
         }
     }
+
+    // --- Issue #894: 新スカラー型（TABLE-13・TASK-199）の DecodeTier 選択 ------
+
+    /// 新スカラー型を多数含むスキーマ（`sql::aggregate` モジュール内テストの
+    /// `many_new_scalar_types_schema` と同型の列構成）。
+    fn many_new_scalar_types_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true), // 0
+                ColumnDef::new("u", ColumnType::Uuid, true),              // 1
+                ColumnDef::new("bo", ColumnType::Boolean, true),          // 2
+                ColumnDef::new(
+                    "n",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ), // 3
+                ColumnDef::new("dt", ColumnType::Date, true),             // 4
+            ],
+        )
+    }
+
+    #[test]
+    fn decode_tier_for_new_type_projection_is_dim_and_scalar() {
+        let schema = many_new_scalar_types_schema();
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Column {
+                    index: 1,
+                    name: "u".to_string(),
+                },
+                ProjectedColumn::Column {
+                    index: 4,
+                    name: "dt".to_string(),
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            limit: 10,
+        };
+        let (tier, mask) = decode_tier_for(&schema, &bound);
+        assert_eq!(tier, DecodeTier::DimAndScalar);
+        assert_eq!(mask, vec![false, true, false, false, true]);
+    }
+
+    #[test]
+    fn decode_tier_for_id_only_projection_on_new_type_schema_is_fast() {
+        let schema = many_new_scalar_types_schema();
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![ProjectedColumn::Id],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            limit: 10,
+        };
+        let (tier, mask) = decode_tier_for(&schema, &bound);
+        assert_eq!(tier, DecodeTier::Fast);
+        assert!(mask.iter().all(|&wanted| !wanted));
+    }
+
+    #[test]
+    fn decode_tier_for_vector_projection_is_embedding() {
+        let schema = many_new_scalar_types_schema();
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Column {
+                    index: 0,
+                    name: "embedding".to_string(),
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            limit: 10,
+        };
+        let (tier, _mask) = decode_tier_for(&schema, &bound);
+        assert_eq!(tier, DecodeTier::Embedding);
+    }
 }
