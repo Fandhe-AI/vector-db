@@ -15,11 +15,14 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 ```
 
 - `<type>` は `TEXT` または `VECTOR ( <N> )` のみ（TABLE-13／14 の追加型は別 Issue の
-  管轄。`IF NOT EXISTS`・`CONSTRAINT <name>`・`UNIQUE`／`NOT NULL`／`DEFAULT`／
-  `CHECK`／`REFERENCES`・`USING OPERATION_ID` の付与はいずれも許可リスト外
-  （構造的に受理しない・`42601`）。列制約 `PRIMARY KEY`・表制約
-  `PRIMARY KEY (<col>[, ...])`（複合キーを含む）のみを制約構文として追加受理する
-  （TABLE-16・TASK-204、Issue #903。詳細は `docs/design/sql-primary-key.md` 参照）。
+  管轄。`IF NOT EXISTS`・`CONSTRAINT <name>`・`CHECK`／`REFERENCES`・
+  `USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・
+  `42601`）。列制約 `PRIMARY KEY`・表制約 `PRIMARY KEY (<col>[, ...])`（複合キーを
+  含む。TABLE-16・TASK-204、Issue #903。`docs/design/sql-primary-key.md`）と、
+  列制約 `UNIQUE`・表制約 `UNIQUE (<col>[, ...])`（Issue #905。
+  `docs/design/unique-constraint.md`）を制約構文として追加受理する。
+  列数の上限（256）は列定義 1 個をパースする直前に確定済みの列数だけで判定し、
+  表制約の位置（先頭・中間・末尾）に依存しない。
 - `TEXT`／`VECTOR` は `lexer::Keyword` へ追加しない（`SET`・`CREATE`・`TRUNCATE`・
   `TABLE` と同方針。statement 中の所定位置でのみ文脈的キーワードとして照合し、
   同名の列名・テーブル名として使う既存 SQL を壊さない）。
@@ -171,7 +174,7 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
 ## スコープ外・後続 Issue
 
 - `ALTER TABLE ADD COLUMN`／DROP／MODIFY COLUMN・各種制約
-  （`PRIMARY KEY`／`UNIQUE`／`CHECK`／`REFERENCES`）・
+  （`CHECK`／`REFERENCES`。`PRIMARY KEY`・`UNIQUE` は Issue #903・#905 で実装済み）・
   `CREATE INDEX`・`VIEW`・NoSQL 表層の DDL op はいずれも別 Issue の担当（本 Issue の
   権限ゲート（`require_ddl_permission`・`--ddl-allowed-users`）・
   `DuplicateColumn` 分類の再利用を前提とする）。`DROP TABLE` は Issue #902 で

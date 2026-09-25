@@ -100,6 +100,9 @@ NoSQL 表層の `op` 許可リストには索引 DDL が無く、両分類とも
 - `Storage::alter_table_drop_column`（Rust API）は、削除する列を含む索引宣言を同一 txn で
   削除する（PostgreSQL の `DROP COLUMN` と同じ扱い。消えた列名を指す宣言が残り、
   後の同名列の再追加で意図せず復活する事故を防ぐ）。
+  ただし UNIQUE 制約（TABLE-16、Issue #905）・`PRIMARY KEY` の構成列は `DROP COLUMN`
+  自体が拒否されるため、その場合は索引宣言も含め何も変更しない。
+- UNIQUE 制約は名前を持たないため、relation 名前空間の衝突対象にはならない。
 
 ## 既存キャッシュ・RLS との関係
 

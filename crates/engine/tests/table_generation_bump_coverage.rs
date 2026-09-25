@@ -123,8 +123,12 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // さらに行が追加され、再度追随。Issue #900（`CatalogError::TooManyColumns`
     // 追加）の base 取り込みマージで以下 4 件がさらに 12 行移動し再度追随
     // （旧: 3147／3226／3303／3331）。
-    // TASK-206・INDEX-7（Issue #908。索引宣言の追加）で再度追随（旧: 3159）。
-    ("catalog.rs", 3489),
+    // Issue #905（UNIQUE 制約。`UniqueConstraint`・カタログ v6・
+    // `Storage::alter_table_add_unique_constraint` 等）の base 取り込みマージで
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 3159）。
+    // TASK-206・INDEX-7（Issue #908。索引宣言の追加）の取り込みで再度追随
+    // （旧: 3506）。
+    ("catalog.rs", 3836),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -140,8 +144,12 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 対応（同上）で再度追随（旧: 2609）。Issue #942（SQL-31・TASK-221）系
     // 変更との base（main）取り込みマージ統合で再度追随（旧: 2622）。
     // Issue #903・#904 の base（main）取り込みマージで再度追随。
-    // TASK-206・INDEX-7（Issue #908。索引宣言の追加）で再度追随（旧: 3238）。
-    ("catalog.rs", 3568),
+    // Issue #905（UNIQUE 制約。`UniqueConstraint`・カタログ v6・
+    // `Storage::alter_table_add_unique_constraint` 等）の base 取り込みマージで
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 3238）。
+    // TASK-206・INDEX-7（Issue #908。索引宣言の追加）の取り込みで再度追随
+    // （旧: 3585）。
+    ("catalog.rs", 3915),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -149,16 +157,24 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 再度追随（旧: 2627）。Issue #942 系変更との base（main）取り込みマージ
     // 統合で再度追随（旧: 2686）。Issue #903・#904 の base（main）取り込み
     // マージで再度追随（旧: 2699）。
-    // TASK-206・INDEX-7（Issue #908。索引宣言の追加）で再度追随（旧: 3315）。
-    ("catalog.rs", 3649),
+    // Issue #905（UNIQUE 制約。`UniqueConstraint`・カタログ v6・
+    // `Storage::alter_table_add_unique_constraint` 等）の base 取り込みマージで
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 3315）。
+    // TASK-206・INDEX-7（Issue #908。索引宣言の追加）の取り込みで再度追随
+    // （旧: 3662）。
+    ("catalog.rs", 3996),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
     // 再度追随（旧: 2655）。Issue #942 系変更との base（main）取り込みマージ
     // 統合で再度追随（旧: 2714）。Issue #903・#904 の base（main）取り込み
     // マージで再度追随（旧: 2727）。
-    // TASK-206・INDEX-7（Issue #908。索引宣言の追加）で再度追随（旧: 3343）。
-    ("catalog.rs", 3682),
+    // Issue #905（UNIQUE 制約。`UniqueConstraint`・カタログ v6・
+    // `Storage::alter_table_add_unique_constraint` 等）の base 取り込みマージで
+    // `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 3343）。
+    // TASK-206・INDEX-7（Issue #908。索引宣言の追加）の取り込みで再度追随
+    // （旧: 3690）。
+    ("catalog.rs", 4029),
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
     // 変更が含まれる場合、その変更を書いた文自身（`tenant::insert_typed_row_
@@ -176,8 +192,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 直接触れない。近傍走査（テキスト上の近さ）では検出できないが、`f` を渡す
     // 4 呼び出し元はいずれも自分のクロージャの最後で
     // `bump_table_generation_in_txn` を呼んでから `Ok(())` を返すことを目視で
-    // 確認済み（各関数のドキュメントコメント参照）。
-    ("tenant.rs", 405),
+    // 確認済み（各関数のドキュメントコメント参照）。Issue #905（UNIQUE 制約。
+    // `TenantWriteError::UniqueViolation` のドキュメント拡充）で 1 行移動した
+    // ための追随（旧: 405）。
+    ("tenant.rs", 406),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
