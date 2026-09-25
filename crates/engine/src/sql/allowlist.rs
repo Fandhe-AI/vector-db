@@ -1451,6 +1451,28 @@ pub struct ValidatedTruncate {
     pub operation_id: Option<OperationId>,
 }
 
+/// 許可形状の構造判定を通過した `ALTER TABLE ... ADD COLUMN ...` 文
+/// （TASK-202・SQL-23。Issue #900）。DDL（テーブル定義の変更）であり、
+/// `USING OPERATION_ID` 句は取らない（`ValidatedTruncate`／`ValidatedInsert`
+/// とは異なり `operation_id` を保持しない。SQL-23 の DDL は台帳〔TASK-93〕の
+/// 対象外）。
+///
+/// 受理する形は `ALTER TABLE <table> ADD COLUMN <column> <type> [;]` のみ
+/// （`IF NOT EXISTS`・複数 `ADD`・列制約〔`NOT NULL`／`DEFAULT`／`PRIMARY KEY`
+/// 等〕・`DROP COLUMN`／`ALTER COLUMN`・`RETURNING`・`USING OPERATION_ID` の
+/// 併用はいずれも許可リスト外。構造検証段階ではカタログ照会を一切行わない
+/// （テーブル・列の存在確認は `sql::ddl::execute_alter_table_add_column` が
+/// DDL 権限ゲート通過後に行う——権限の無い主体への存在オラクル化を防ぐ
+/// ため）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAddColumn {
+    pub table_name: String,
+    pub column_name: String,
+    /// 型名の構文木。意味づけ（ENUM 型名の存在確認・`ColumnType` への変換）は
+    /// `sql::ddl::execute_alter_table_add_column` の責務。
+    pub column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
+}
+
 /// 許可形状の構造判定を通過した UPDATE 文（SQL-17、TASK-191）。`ValidatedInsert` と
 /// 同様、本モジュールが保証するのはここまでの構造情報のみで、列名・値の意味論的
 /// 妥当性は検証しない（`sql::parser::bind_update` の責務）。
@@ -2779,6 +2801,50 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `ALTER TABLE <table> ADD COLUMN <column> <type> [;]` の単一列追加形の
+    /// みを受理する（TASK-202・SQL-23。Issue #900）。`ALTER`／`TABLE`／`ADD`／
+    /// `COLUMN` は `lexer::Keyword` へ含めない設計方針（`lexer.rs` の
+    /// モジュールドキュメント参照）のため、いずれも `expect_contextual_keyword`
+    /// で文脈的に照合する。`IF NOT EXISTS`・複数 `ADD`・列制約・`DROP COLUMN`／
+    /// `ALTER COLUMN`・`USING OPERATION_ID` はいずれも構造的に受理しない
+    /// （`expect_end_of_statement` が余剰トークンとして `42601` で拒否するか、
+    /// `ADD` の直後に `COLUMN` 以外が続いた時点で `expect_contextual_keyword`
+    /// が拒否する）。
+    fn parse_alter_table_add_column(
+        &mut self,
+    ) -> Result<ParsedAlterTableAddColumnShape, SqlSurfaceError> {
+        self.expect_contextual_keyword("ALTER")?;
+        self.expect_contextual_keyword("TABLE")?;
+        let table_name = self.expect_ident()?;
+        self.expect_contextual_keyword("ADD")?;
+        self.expect_contextual_keyword("COLUMN")?;
+        let column_name = self.expect_ident()?;
+        // 予約列名（`id`／`tenant_id`／`visibility`。ASCII の大文字小文字を無視）は
+        // `parse_create_table_column` と同じく構造検証段階で拒否する（`sql::parser`
+        // がこれら 3 語を疑似列・RLS 内部列として扱う契約と整合させ、DDL で
+        // これらを隠蔽する列を作らせない。fail-closed。security.md「アクセス
+        // 制御の不備」対応）。カタログを参照しない判定のため権限ゲートより
+        // 前に置いても存在オラクルにならない。
+        if column_name.eq_ignore_ascii_case("id")
+            || column_name.eq_ignore_ascii_case("tenant_id")
+            || column_name.eq_ignore_ascii_case("visibility")
+        {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "column name {column_name:?} is reserved"
+            )));
+        }
+        // `sql::allowlist::Parser` の内部状態（`tokens`／`pos`）を共有する
+        // 独立実装（`sql::ddl_column_type` モジュールドキュメント参照）。
+        let column_type =
+            crate::sql::ddl_column_type::parse_column_type_name(self.tokens, &mut self.pos)?;
+
+        Ok(ParsedAlterTableAddColumnShape {
+            table_name,
+            column_name,
+            column_type,
+        })
+    }
+
     /// `CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]`（SQL-23・
     /// TASK-85、Issue #899）の許可形状。カタログ照会は行わない（`sql::ddl`
     /// モジュールドキュメント・[`ValidatedCreateTable`] 参照）。列数の上限判定
@@ -3050,6 +3116,14 @@ impl<'a> Parser<'a> {
 struct ParsedTruncateShape {
     table_name: String,
     operation_id: Option<OperationId>,
+}
+
+/// 構文木（[`ValidatedAlterTableAddColumn`] の元）。カタログ存在確認前の
+/// 中間結果（TASK-202・SQL-23。Issue #900）。
+struct ParsedAlterTableAddColumnShape {
+    table_name: String,
+    column_name: String,
+    column_type: crate::sql::ddl_column_type::SqlColumnTypeName,
 }
 
 /// 構文木（[`ValidatedStatement`] の元）。カタログ存在確認前の中間結果。
@@ -3880,6 +3954,37 @@ pub(crate) fn validate_truncate_tokens(
     Ok(ValidatedTruncate {
         table_name: shape.table_name,
         operation_id: shape.operation_id,
+    })
+}
+
+/// `ALTER TABLE ADD COLUMN` 文をトークン化し、許可リスト形式で構造検証する
+/// （TASK-202・SQL-23。Issue #900 の公開 API）。`validate_truncate` とは異なり
+/// **カタログ照会（`TableLookup::table_exists`）を一切行わない**——DDL 権限
+/// ゲート（`sql::ddl::require_ddl_permission`）より先にテーブルの存在有無を
+/// 返すと、権限の無い主体に対する存在オラクルになるため（`ValidatedAlterTableAddColumn`
+/// のドキュメント参照）。テーブル・列の存在確認、型名解決（ENUM 型名の存在確認・
+/// `VECTOR` 列の `0A000` 拒否を含む）は権限ゲート通過後の実行段
+/// （`sql::ddl::execute_alter_table_add_column`）が担う。
+pub fn validate_alter_table(sql: &str) -> Result<ValidatedAlterTableAddColumn, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_alter_table_tokens(&tokens)
+}
+
+/// [`validate_alter_table`] の本体。トークン列を受け取ることで、呼び出し元
+/// （`core.rs::EngineCore::parse_tokens`）が既に先頭トークン判定のために
+/// `tokenize` 済みの場合、同一 SQL 文字列の再トークナイズを避けられる
+/// （`validate_truncate_tokens` と同じ設計）。
+pub(crate) fn validate_alter_table_tokens(
+    tokens: &[lexer::Token],
+) -> Result<ValidatedAlterTableAddColumn, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let shape = p.parse_alter_table_add_column()?;
+    p.expect_end_of_statement()?;
+
+    Ok(ValidatedAlterTableAddColumn {
+        table_name: shape.table_name,
+        column_name: shape.column_name,
+        column_type: shape.column_type,
     })
 }
 
