@@ -277,11 +277,6 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
         .map_err(|_| X509Error::Malformed)?;
     cert_reader.expect_end().map_err(|_| X509Error::Malformed)?;
 
-    let (unused_bits, _) = signature_value.split_first().ok_or(X509Error::Malformed)?;
-    if *unused_bits > 7 {
-        return Err(X509Error::Malformed);
-    }
-
     let mut tbs = DerReader::new(tbs_tlv.value);
 
     // version [0] EXPLICIT INTEGER 2（v3）のみ受理。欠落（v1）・
@@ -309,13 +304,12 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     }
 
     // signature AlgorithmIdentifier（tbsCertificate 側）。外側の
-    // signatureAlgorithm と DER バイト列が一致するかは後で検査する。
+    // signatureAlgorithm との DER バイト列一致検査は、モジュール doc の
+    // 「パース手順」どおり tbsCertificate の残りのフィールドをすべて
+    // 読み終えたあと（手順 5）にまとめて行う。
     let tbs_sig_alg_tlv = tbs.read_any().map_err(|_| X509Error::Malformed)?;
     if tbs_sig_alg_tlv.tag != TAG_SEQUENCE {
         return Err(X509Error::Malformed);
-    }
-    if tbs_sig_alg_tlv.raw != sig_alg_tlv.raw {
-        return Err(X509Error::SignatureAlgorithmMismatch);
     }
 
     // issuer Name（中身は解釈しない）。
@@ -365,6 +359,18 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     let _ = tbs.read_optional(TAG_SUBJECT_UNIQUE_ID_IMPLICIT);
     let _ = tbs.read_optional(TAG_EXTENSIONS_EXPLICIT);
     tbs.expect_end().map_err(|_| X509Error::Malformed)?;
+
+    // tbsCertificate.signature と外側 signatureAlgorithm の DER バイト列
+    // 一致（手順 5。RFC 5280 §4.1.1.2）。
+    if tbs_sig_alg_tlv.raw != sig_alg_tlv.raw {
+        return Err(X509Error::SignatureAlgorithmMismatch);
+    }
+
+    // signatureValue BIT STRING の形状検査（手順 6）。
+    let (unused_bits, _) = signature_value.split_first().ok_or(X509Error::Malformed)?;
+    if *unused_bits > 7 {
+        return Err(X509Error::Malformed);
+    }
 
     Ok(ParsedCertificate {
         not_before,
