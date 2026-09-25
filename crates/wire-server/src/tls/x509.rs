@@ -24,8 +24,10 @@
 //!   本サーバーが自己整合性チェックとして検証するのは #961 の
 //!   `CertificateVerify` 用の鍵一致のみ）
 //! - SAN・ホスト名・keyUsage・basicConstraints 等 extensions の意味解釈
-//!   （[`super::der::validate_structure`] による構造検証のみ行い、中身は
-//!   スキップする）
+//!   （各 `Extension` の `extnID`／`critical`／`extnValue` の構文までは
+//!   検査するが、`extnValue` の中身は解釈しない）
+//! - issuer/subject `Name` の属性値の意味解釈（`RDNSequence`・`SET OF`
+//!   の DER 順序・`AttributeTypeAndValue` の構文までは検査する）
 //! - 中間証明書どうしの issuer/subject 連結検査・パス構築（RFC 8446
 //!   §4.4.2 は後続証明書の順序を SHOULD とするに留まるため、本モジュールは
 //!   チェーン先頭が葉であることのみを前提にする）
@@ -40,11 +42,16 @@
 //!    signatureValue BIT STRING }`（後続バイトは拒否）
 //! 4. `tbsCertificate` の各フィールドを順に読む（version → serialNumber →
 //!    signature → issuer → validity → subject → subjectPublicKeyInfo →
-//!    任意の unique ID／extensions）
-//! 5. `tbsCertificate.signature` と外側 `signatureAlgorithm` の DER
-//!    バイト列一致（RFC 5280 §4.1.1.2）
-//! 6. `signatureValue` BIT STRING の形状検査（空でない・未使用ビット数
-//!    0〜7）
+//!    任意の unique ID／extensions）。version は v3 のみ、serialNumber は
+//!    正の整数・20 オクテット以下・最小符号化、issuer/subject は
+//!    `RDNSequence` の構文と `SET OF` の DER 順序、SPKI は
+//!    AlgorithmIdentifier の構造（OID の整形式性・parameters 高々 1 個）、
+//!    unique ID は BIT STRING の形状、extensions は wrapper と各
+//!    `Extension` の構文を検査する
+//! 5. `tbsCertificate.signature` の AlgorithmIdentifier 構造検査と、外側
+//!    `signatureAlgorithm` との DER バイト列一致（RFC 5280 §4.1.1.2）
+//! 6. `signatureValue` BIT STRING の形状検査（未使用ビット数 0〜7・
+//!    署名データが 1 バイト以上・未使用ビットの 0 埋め）
 //!
 //! validity（notBefore／notAfter）はチェーン内の**全証明書**に対して
 //! 現在時刻（呼び出し元が注入する `now_unix_secs`）で検査する。葉の SPKI
@@ -71,6 +78,8 @@ use super::pkcs8::KeyAlgorithm;
 /// パース対象 1 個ごとの上限として、値を確保する前に判定する。
 pub const MAX_CERTIFICATE_DER_LEN: usize = 64 * 1024;
 
+const TAG_BOOLEAN: u8 = 0x01;
+const TAG_OCTET_STRING: u8 = 0x04;
 const TAG_SEQUENCE: u8 = 0x30;
 const TAG_SET: u8 = 0x31;
 const TAG_INTEGER: u8 = 0x02;
@@ -349,6 +358,12 @@ fn validate_oid_content(oid: &[u8]) -> Result<(), X509Error> {
 /// 「スコープ外」参照）。RDNSequence が 0 個の RelativeDistinguishedName
 /// を持つこと（空の Name。本モジュールのテストフィクスチャが使う形）は
 /// RFC 5280 上も許容されるため受理する。
+///
+/// あわせて、`RelativeDistinguishedName` は `SET OF` であるため、DER
+/// （X.690 §11.6）が要求する「各要素の符号化バイト列の昇順」も検査し、
+/// 隣接する `AttributeTypeAndValue` の符号化が降順になっている非正規
+/// （BER）表現を拒否する（PR #1036 codex-review P1 指摘）。比較の詳細は
+/// [`set_of_elements_in_der_order`] を参照。
 fn validate_name_structure(name_value: &[u8]) -> Result<(), X509Error> {
     let mut rdn_sequence = DerReader::new(name_value);
     while !rdn_sequence.is_empty() {
@@ -356,12 +371,19 @@ fn validate_name_structure(name_value: &[u8]) -> Result<(), X509Error> {
             .read_expected(TAG_SET)
             .map_err(|_| X509Error::Malformed)?;
         let mut rdn_reader = DerReader::new(rdn_value);
-        let mut has_attribute = false;
+        let mut previous_atv_raw: Option<&[u8]> = None;
         while !rdn_reader.is_empty() {
-            let atv_value = rdn_reader
-                .read_expected(TAG_SEQUENCE)
-                .map_err(|_| X509Error::Malformed)?;
-            let mut atv_reader = DerReader::new(atv_value);
+            let atv_tlv = rdn_reader.read_any().map_err(|_| X509Error::Malformed)?;
+            if atv_tlv.tag != TAG_SEQUENCE {
+                return Err(X509Error::Malformed);
+            }
+            if let Some(previous) = previous_atv_raw {
+                if !set_of_elements_in_der_order(previous, atv_tlv.raw) {
+                    return Err(X509Error::Malformed);
+                }
+            }
+            previous_atv_raw = Some(atv_tlv.raw);
+            let mut atv_reader = DerReader::new(atv_tlv.value);
             let attribute_oid = atv_reader
                 .read_expected(TAG_OID)
                 .map_err(|_| X509Error::Malformed)?;
@@ -370,15 +392,27 @@ fn validate_name_structure(name_value: &[u8]) -> Result<(), X509Error> {
             // 整形式であり、それ以外の余剰要素が無いことだけを要求する。
             atv_reader.read_any().map_err(|_| X509Error::Malformed)?;
             atv_reader.expect_end().map_err(|_| X509Error::Malformed)?;
-            has_attribute = true;
         }
         // RelativeDistinguishedName は SET SIZE (1..MAX)。0 個の
         // AttributeTypeAndValue は構文上不正。
-        if !has_attribute {
+        if previous_atv_raw.is_none() {
             return Err(X509Error::Malformed);
         }
     }
     Ok(())
+}
+
+/// DER の `SET OF` で隣接する 2 要素 `previous`・`current`（いずれも
+/// タグ・長さ込みの符号化バイト列）が正規順序（`previous <= current`）で
+/// 並んでいるかを判定する。X.690 §11.6 は「短い方の末尾を 0x00 で
+/// 埋めたオクテット列として比較した昇順」を要求するが、ここで比較する
+/// のはいずれも整形式の単一 TLV であり、長さ・値の範囲はタグ直後の
+/// 長さオクテットで一意に決まるため、一方が他方の真の接頭辞になることは
+/// 無い（接頭辞関係になるのは両者が同一の場合のみ）。したがって 0x00
+/// 埋め比較とスライスの辞書順比較は同じ結果になり、後者で判定する。
+/// 等しい要素の並び（重複）は昇順の定義上許容する。
+fn set_of_elements_in_der_order(previous: &[u8], current: &[u8]) -> bool {
+    previous <= current
 }
 
 /// `BIT STRING` の値部分（先頭 1 バイトが未使用ビット数、残りが内容）が
@@ -404,14 +438,17 @@ fn validate_bit_string_shape(value: &[u8]) -> Result<(), X509Error> {
 }
 
 /// `extensions [3] EXPLICIT Extensions`・`Extensions ::= SEQUENCE SIZE
-/// (1..MAX) OF Extension` の外形（意味は解釈しない）を検査する。
+/// (1..MAX) OF Extension` の構文（意味は解釈しない）を検査する。
 /// `[3] EXPLICIT` は元の型（`SEQUENCE`）のタグをそのまま内側に持つため、
 /// wrapper の値部分は「ちょうど 1 個の `SEQUENCE` で後続データが無い」
 /// ことを要求し、さらにその `SEQUENCE`（`Extensions`）が 1 個以上の
-/// `Extension`（各要素も `SEQUENCE`）から成ることを検査する。各
-/// `Extension` の中身（`extnID`／`critical`／`extnValue` の意味解釈）は
-/// 本モジュールの対象外のまま変えない（モジュール doc「スコープ外」
-/// 参照。PR #1036 codex-review P1 指摘）。
+/// `Extension` から成り、各 `Extension` が
+/// `SEQUENCE { extnID OBJECT IDENTIFIER, critical BOOLEAN DEFAULT FALSE,
+/// extnValue OCTET STRING }`（RFC 5280 §4.1）の構文を満たすことを
+/// [`validate_extension_syntax`] で検査する。`extnID` の既知 OID 判定・
+/// `extnValue` の中身（SAN・keyUsage 等）の意味解釈は本モジュールの
+/// 対象外のまま変えない（モジュール doc「スコープ外」参照。PR #1036
+/// codex-review P1 指摘）。
 fn validate_extensions_wrapper(wrapper_value: &[u8]) -> Result<(), X509Error> {
     let mut wrapper_reader = DerReader::new(wrapper_value);
     let extensions_value = wrapper_reader
@@ -428,11 +465,45 @@ fn validate_extensions_wrapper(wrapper_value: &[u8]) -> Result<(), X509Error> {
         return Err(X509Error::Malformed);
     }
     while !extensions_reader.is_empty() {
-        extensions_reader
+        let extension_value = extensions_reader
             .read_expected(TAG_SEQUENCE)
             .map_err(|_| X509Error::Malformed)?;
+        validate_extension_syntax(extension_value)?;
     }
     Ok(())
+}
+
+/// 1 個の `Extension ::= SEQUENCE { extnID OBJECT IDENTIFIER, critical
+/// BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }`（RFC 5280 §4.1）の
+/// 値部分を、この順序どおりに読む。`extnID` は OID として整形式
+/// （[`validate_oid_content`]）、`critical` は存在すれば `BOOLEAN`
+/// （値の正規形 `0x00`／`0xFF` は [`super::der::validate_structure`] が
+/// 検査済みだが、ここでも防御的に再確認する）、`extnValue` は必須の
+/// `OCTET STRING` で、その後に余剰要素が無いことを要求する。空の
+/// Extension・`extnID` 欠落・`critical` と `extnValue` の順序逆転・
+/// `extnValue` の型違い・余剰要素はいずれも `Malformed` で拒否する。
+///
+/// `critical` が明示的な `FALSE`（`01 01 00`）で符号化されている場合は
+/// 受理する。DER（X.690 §11.5）は DEFAULT 値の省略を要求するが、
+/// 公開テストベクタである RFC 8410 §10.2 の証明書自身が `critical`
+/// FALSE を明示符号化しており、主要な TLS 実装もこの形を受理するため、
+/// ここで拒否すると正当な中間証明書を起動時に弾いてしまう。`extnValue`
+/// の中身（各拡張固有の構造）は解釈しない。
+fn validate_extension_syntax(extension_value: &[u8]) -> Result<(), X509Error> {
+    let mut reader = DerReader::new(extension_value);
+    let extn_id = reader
+        .read_expected(TAG_OID)
+        .map_err(|_| X509Error::Malformed)?;
+    validate_oid_content(extn_id)?;
+    if let Some(critical) = reader.read_optional(TAG_BOOLEAN) {
+        if !matches!(critical, [0x00] | [0xff]) {
+            return Err(X509Error::Malformed);
+        }
+    }
+    reader
+        .read_expected(TAG_OCTET_STRING)
+        .map_err(|_| X509Error::Malformed)?;
+    reader.expect_end().map_err(|_| X509Error::Malformed)
 }
 
 /// パース手順（モジュール doc 参照）に従い 1 個の証明書 DER を検査する。
@@ -499,7 +570,7 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     }
 
     // issuer Name（中身は解釈しないが RDNSequence/AttributeTypeAndValue の
-    // 外形は検査する）。
+    // 外形と RDN の SET OF の DER 順序は検査する）。
     let issuer_value = tbs
         .read_expected(TAG_SEQUENCE)
         .map_err(|_| X509Error::Malformed)?;
@@ -520,7 +591,7 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     }
 
     // subject Name（中身は解釈しないが RDNSequence/AttributeTypeAndValue の
-    // 外形は検査する）。
+    // 外形と RDN の SET OF の DER 順序は検査する）。
     let subject_value = tbs
         .read_expected(TAG_SEQUENCE)
         .map_err(|_| X509Error::Malformed)?;
@@ -555,8 +626,9 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
 
     // 任意の issuerUniqueID [1]／subjectUniqueID [2]／extensions [3]。
     // 意味は解釈しないが、存在すれば BIT STRING の形状（unique ID）・
-    // 単一 SEQUENCE で後続データが無いこと（extensions wrapper）という
-    // ASN.1 の外形は検査する（PR #1036 codex-review P1 指摘）。
+    // 単一 SEQUENCE で後続データが無いこと（extensions wrapper）・各
+    // Extension の extnID／critical／extnValue の構文という ASN.1 の
+    // 外形は検査する（PR #1036 codex-review P1 指摘）。
     if let Some(issuer_unique_id) = tbs.read_optional(TAG_ISSUER_UNIQUE_ID_IMPLICIT) {
         validate_bit_string_shape(issuer_unique_id)?;
     }
@@ -909,6 +981,49 @@ mod tests {
             parse_utc_time(b"500101000000Z").expect("valid UTCTime"),
             -631_152_000
         );
+    }
+
+    // SET OF の DER 順序判定: 昇順・等値は受理し、降順は拒否する
+    // （PR #1036 codex-review P1 指摘の回帰）。
+    #[test]
+    fn set_of_elements_in_der_order_accepts_ascending_and_equal_rejects_descending() {
+        let cn = [0x30, 0x07, 0x06, 0x03, 0x55, 0x04, 0x03, 0x05, 0x00];
+        let org = [0x30, 0x07, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x05, 0x00];
+        assert!(set_of_elements_in_der_order(&cn, &org));
+        assert!(set_of_elements_in_der_order(&cn, &cn));
+        assert!(!set_of_elements_in_der_order(&org, &cn));
+    }
+
+    // 各 Extension の構文検査（extnID・任意の critical・必須の extnValue・
+    // 余剰要素なし）を単体で固定する（PR #1036 codex-review P1 指摘の回帰）。
+    #[test]
+    fn validate_extension_syntax_accepts_rfc5280_shapes_and_rejects_others() {
+        let oid = [0x06, 0x03, 0x55, 0x1d, 0x0f];
+        let critical_true = [0x01, 0x01, 0xff];
+        let critical_false = [0x01, 0x01, 0x00];
+        let extn_value = [0x04, 0x01, 0x00];
+        let concat = |parts: &[&[u8]]| parts.concat();
+
+        assert!(validate_extension_syntax(&concat(&[&oid, &extn_value])).is_ok());
+        assert!(validate_extension_syntax(&concat(&[&oid, &critical_true, &extn_value])).is_ok());
+        assert!(validate_extension_syntax(&concat(&[&oid, &critical_false, &extn_value])).is_ok());
+
+        let rejected: [Vec<u8>; 7] = [
+            Vec::new(),
+            concat(&[&extn_value]),
+            concat(&[&oid]),
+            concat(&[&oid, &extn_value, &critical_true]),
+            concat(&[&oid, &[0x03, 0x01, 0x00], &[]]),
+            concat(&[&oid, &extn_value, &[0x05, 0x00]]),
+            concat(&[&[0x06, 0x01, 0x80], &extn_value]),
+        ];
+        for body in rejected {
+            assert_eq!(
+                validate_extension_syntax(&body),
+                Err(X509Error::Malformed),
+                "extension body {body:02x?} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -1334,6 +1334,259 @@ fn extensions_wrapper_with_trailing_data_is_rejected() {
     }
 }
 
+/// テスト専用: issuer／subject Name と任意の extensions `[3]` フィールドを
+/// 差し替えた Ed25519 葉証明書の DER を手組みする（RDN の SET OF 順序・
+/// Extension 構文の回帰テスト用。PR #1036 codex-review P1 指摘）。
+fn build_ed25519_leaf_with_names_and_extensions(
+    issuer: &[u8],
+    subject: &[u8],
+    extensions_field: Option<&[u8]>,
+) -> Vec<u8> {
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let serial = tlv(0x02, &[0x01]);
+    let version = version_v3();
+    let mut tbs_parts: Vec<&[u8]> = vec![
+        &version,
+        &serial,
+        &signature_algorithm,
+        issuer,
+        &validity,
+        subject,
+        &spki,
+    ];
+    if let Some(field) = extensions_field {
+        tbs_parts.push(field);
+    }
+    let tbs_certificate = sequence(&tbs_parts);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ])
+}
+
+/// テスト専用: 1 個以上の Extension 本体（各 `Extension` の SEQUENCE の
+/// 値部分）から `extensions [3] EXPLICIT` フィールドを組み立てる。
+fn extensions_field_from_bodies(extension_bodies: &[&[u8]]) -> Vec<u8> {
+    let extensions: Vec<Vec<u8>> = extension_bodies
+        .iter()
+        .map(|body| tlv(0x30, body))
+        .collect();
+    let parts: Vec<&[u8]> = extensions.iter().map(Vec::as_slice).collect();
+    tlv(0xa3, &sequence(&parts))
+}
+
+fn assert_leaf_rejected_as_malformed(der: Vec<u8>) {
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 0, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+fn assert_leaf_accepted(der: Vec<u8>) {
+    let chain = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .expect("well-formed leaf certificate must be accepted");
+    assert_eq!(chain.leaf_public_key(), &RFC8410_10_1_ED25519_PUBLIC_KEY);
+}
+
+// id-ce-keyUsage（2.5.29.15）・id-ce-basicConstraints（2.5.29.19）。
+const OID_KEY_USAGE_TLV: [u8; 5] = [0x06, 0x03, 0x55, 0x1d, 0x0f];
+const OID_BASIC_CONSTRAINTS_TLV: [u8; 5] = [0x06, 0x03, 0x55, 0x1d, 0x13];
+const CRITICAL_TRUE_TLV: [u8; 3] = [0x01, 0x01, 0xff];
+const CRITICAL_FALSE_TLV: [u8; 3] = [0x01, 0x01, 0x00];
+
+fn octet_string_extn_value() -> Vec<u8> {
+    // extnValue OCTET STRING（中身は keyUsage 相当の BIT STRING。意味は
+    // パーサが解釈しない）。
+    tlv(0x04, &tlv(0x03, &[0x07, 0x80]))
+}
+
+#[test]
+fn extensions_with_valid_extension_syntax_are_accepted() {
+    // critical 省略・critical TRUE・critical FALSE 明示（RFC 8410 §10.2 の
+    // 公開ベクタと同じ形）の 3 形状がいずれも受理されること。
+    let extn_value = octet_string_extn_value();
+    let omitted = [OID_KEY_USAGE_TLV.as_slice(), &extn_value].concat();
+    let critical_true = [
+        OID_BASIC_CONSTRAINTS_TLV.as_slice(),
+        &CRITICAL_TRUE_TLV,
+        &tlv(0x04, &sequence(&[])),
+    ]
+    .concat();
+    assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
+        &empty_name(),
+        &empty_name(),
+        Some(&extensions_field_from_bodies(&[&omitted, &critical_true])),
+    ));
+
+    let critical_false = [
+        OID_KEY_USAGE_TLV.as_slice(),
+        &CRITICAL_FALSE_TLV,
+        &extn_value,
+    ]
+    .concat();
+    assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
+        &empty_name(),
+        &empty_name(),
+        Some(&extensions_field_from_bodies(&[&critical_false])),
+    ));
+}
+
+#[test]
+fn extension_with_invalid_internal_syntax_is_rejected() {
+    // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE,
+    // extnValue OCTET STRING } に反する各形状（PR #1036 codex-review P1
+    // 指摘: 従来は各要素が SEQUENCE であることしか見ていなかった）。
+    let extn_value = octet_string_extn_value();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty extension", Vec::new()),
+        (
+            "missing extnID",
+            [CRITICAL_TRUE_TLV.as_slice(), &extn_value].concat(),
+        ),
+        ("missing extnValue", OID_KEY_USAGE_TLV.to_vec()),
+        (
+            "critical after extnValue",
+            [
+                OID_KEY_USAGE_TLV.as_slice(),
+                &extn_value,
+                &CRITICAL_TRUE_TLV,
+            ]
+            .concat(),
+        ),
+        (
+            "extnValue is BIT STRING instead of OCTET STRING",
+            [OID_KEY_USAGE_TLV.as_slice(), &tlv(0x03, &[0x07, 0x80])].concat(),
+        ),
+        (
+            "trailing element after extnValue",
+            [OID_KEY_USAGE_TLV.as_slice(), &extn_value, &tlv(0x05, &[])].concat(),
+        ),
+        (
+            "critical encoded as INTEGER",
+            [
+                OID_KEY_USAGE_TLV.as_slice(),
+                &tlv(0x02, &[0x01]),
+                &extn_value,
+            ]
+            .concat(),
+        ),
+        (
+            "truncated extnID",
+            [tlv(0x06, &[0x55, 0x1d, 0x8f]).as_slice(), &extn_value].concat(),
+        ),
+    ];
+    let valid_first = [OID_BASIC_CONSTRAINTS_TLV.as_slice(), &extn_value].concat();
+    for (label, body) in cases {
+        // 不正な Extension が単独でも、正当な Extension の後ろに続いても拒否される。
+        for bodies in [vec![body.as_slice()], vec![valid_first.as_slice(), &body]] {
+            let der = build_ed25519_leaf_with_names_and_extensions(
+                &empty_name(),
+                &empty_name(),
+                Some(&extensions_field_from_bodies(&bodies)),
+            );
+            let err = ServerCertificateChain::from_der_chain(
+                vec![der],
+                &RFC8410_10_1_ED25519_PUBLIC_KEY,
+                NOW_WITHIN_RFC8410_10_2_VALIDITY,
+            )
+            .expect_err(label);
+            assert_eq!(
+                err,
+                CertificateChainError::Certificate {
+                    index: 0,
+                    error: X509Error::Malformed
+                },
+                "{label}"
+            );
+        }
+    }
+}
+
+/// テスト専用: `AttributeTypeAndValue ::= SEQUENCE { type OID, value }`
+/// を組み立てる（値は UTF8String）。
+fn attribute_type_and_value(oid_last: u8, value: &str) -> Vec<u8> {
+    sequence(&[
+        &tlv(0x06, &[0x55, 0x04, oid_last]),
+        &tlv(0x0c, value.as_bytes()),
+    ])
+}
+
+#[test]
+fn multi_valued_rdn_in_der_ascending_order_is_accepted() {
+    // commonName（2.5.4.3）と organizationName（2.5.4.10）を 1 個の RDN
+    // （SET OF）にまとめ、符号化バイト列の昇順（0x03 < 0x0a）で並べた
+    // 正規 DER。issuer・subject の双方で受理されること。
+    let cn = attribute_type_and_value(0x03, "a");
+    let org = attribute_type_and_value(0x0a, "a");
+    let name = sequence(&[&tlv(0x31, &[cn.as_slice(), &org].concat())]);
+    assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
+        &name, &name, None,
+    ));
+
+    // 同一符号化の重複要素も昇順（非減少）の定義上は許容する。
+    let duplicated = sequence(&[&tlv(0x31, &[cn.as_slice(), &cn].concat())]);
+    assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
+        &duplicated,
+        &empty_name(),
+        None,
+    ));
+}
+
+#[test]
+fn multi_valued_rdn_in_descending_order_is_rejected() {
+    // 上と同じ 2 要素を逆順（降順）に並べた非正規 BER（PR #1036
+    // codex-review P1 指摘: SET OF の DER 順序を検査していなかった）。
+    let cn = attribute_type_and_value(0x03, "a");
+    let org = attribute_type_and_value(0x0a, "a");
+    let reversed = sequence(&[&tlv(0x31, &[org.as_slice(), &cn].concat())]);
+    assert_leaf_rejected_as_malformed(build_ed25519_leaf_with_names_and_extensions(
+        &reversed,
+        &empty_name(),
+        None,
+    ));
+    assert_leaf_rejected_as_malformed(build_ed25519_leaf_with_names_and_extensions(
+        &empty_name(),
+        &reversed,
+        None,
+    ));
+
+    // 値の長さが異なる場合も符号化バイト列（長さオクテットを含む）で比較する:
+    // 長さ 0x0d の要素は長さ 0x08 の要素より後ろでなければならない。
+    let short = attribute_type_and_value(0x0a, "a");
+    let long = attribute_type_and_value(0x03, "abcdef");
+    let ascending = sequence(&[&tlv(0x31, &[short.as_slice(), &long].concat())]);
+    assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
+        &ascending,
+        &empty_name(),
+        None,
+    ));
+    let descending = sequence(&[&tlv(0x31, &[long.as_slice(), &short].concat())]);
+    assert_leaf_rejected_as_malformed(build_ed25519_leaf_with_names_and_extensions(
+        &descending,
+        &empty_name(),
+        None,
+    ));
+}
+
 #[test]
 fn current_unix_secs_returns_a_plausible_recent_value() {
     // このリポジトリが書かれた時点（2020 年以降）より新しい値であることの
