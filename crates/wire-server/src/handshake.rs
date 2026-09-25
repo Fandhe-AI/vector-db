@@ -461,13 +461,64 @@ fn post_auth_loop(
     ctx: &engine::policy::PolicyContext,
     engine: Option<&engine::core::EngineCore>,
     session: &mut engine::sql::mode::SessionState,
-    prepared_statements: &mut crate::extended_query::PreparedStatementStore,
+    extended: &mut crate::extended_query::ExtendedQueryState,
 ) -> Result<()> {
     loop {
         let type_byte = match framing::read_typed_frame_header(stream)? {
             Some(b) => b,
             None => return Ok(()),
         };
+
+        // WIRE-11 確定化（Issue #934）: 拡張クエリプロトコルのエラー後は
+        // Sync（'S'）まで後続メッセージを破棄する「同期回復」モードに入る
+        // （`extended_query` モジュールドキュメント「エラー後の同期回復」節）。
+        // 'S' はここでは処理せず下の通常分岐へフォールスルーさせてフラグを
+        // 解除する。'X' は通常の分岐（559 行目付近）と同じく length=4・body
+        // 厳密に空であることを検証してから終了する（PR #1013 レビュー指摘・
+        // codex P1: 検証を素通りする経路があると、長さフィールド欠落・不正長・
+        // 余剰 body を持つ malformed Terminate が「エラー後」という条件だけで
+        // 正規の Terminate として受理されてしまい、フレーミング検証契約が
+        // ignore_till_sync モードでだけ回避可能になる）。長さ検証自体が失敗
+        // した場合は通常の `X` 分岐と同じく `?` で fail-closed に伝播する。
+        // COPY・FunctionCall・未知の型バイトは破棄対象にせず fail-closed に
+        // `reject_and_close`（既存の WIRE-8 契約のまま）。それ以外
+        // （'Q'/'P'/'D'/'B'/'E'/'C'/'H'）は長さフィールドのみ検証して本文を
+        // 読み捨て、応答を一切送らない。
+        if extended.ignore_till_sync && type_byte != b'S' {
+            if type_byte == b'X' {
+                let _body = framing::read_length_prefixed_body(stream, 4, 4)?;
+                return Ok(());
+            }
+            let kind = crate::protocol_dispatch::classify(type_byte);
+            match kind {
+                crate::protocol_dispatch::FrontendMessageKind::UnsupportedFeature(_)
+                | crate::protocol_dispatch::FrontendMessageKind::Unknown(_) => {
+                    framing::validate_typed_message_length_prefix(
+                        stream,
+                        framing::MIN_TYPED_MESSAGE_LEN,
+                        framing::MAX_MESSAGE_LEN,
+                    )?;
+                    crate::protocol_dispatch::reject_and_close(
+                        stream,
+                        kind,
+                        write_error_response_io,
+                    )?;
+                    return Ok(());
+                }
+                _ => {
+                    let total_len = framing::validate_typed_message_length_prefix(
+                        stream,
+                        framing::MIN_TYPED_MESSAGE_LEN,
+                        framing::MAX_MESSAGE_LEN,
+                    )?;
+                    let body_len = total_len
+                        .checked_sub(4)
+                        .ok_or(FrameError::Malformed("message length below header size"))?;
+                    framing::discard_body(stream, body_len)?;
+                    continue;
+                }
+            }
+        }
 
         match type_byte {
             b'Q' => {
@@ -492,6 +543,15 @@ fn post_auth_loop(
                 }
                 let text = std::str::from_utf8(text)
                     .map_err(|_| HandshakeError::Protocol("query text is not valid UTF-8"))?;
+
+                // PostgreSQL は simple Query の処理を無名 statement／無名 portal
+                // への暗黙の Parse／Bind／Execute と同一視し、その処理時に両方を
+                // 破棄する。拡張クエリプロトコルで確立した無名 portal を残した
+                // まま simple Query を発行すると、後続の `Execute("")` が
+                // simple Query 実行前の古い portal を誤って再開してしまう
+                // （Cursor Bugbot Medium 指摘・PR #1013）。名前付き
+                // statement／portal は維持する（PostgreSQL と同じ挙動）。
+                extended.discard_unnamed_for_simple_query();
 
                 match engine {
                     Some(engine) => {
@@ -523,11 +583,7 @@ fn post_auth_loop(
                 // 適用していた契約をそのまま維持）。
                 match engine {
                     Some(engine) => {
-                        match crate::extended_query::handle_parse(
-                            stream,
-                            engine,
-                            prepared_statements,
-                        )? {
+                        match crate::extended_query::handle_parse(stream, engine, extended)? {
                             crate::extended_query::LoopSignal::Continue => {}
                             crate::extended_query::LoopSignal::Closed => return Ok(()),
                         }
@@ -556,10 +612,7 @@ fn post_auth_loop(
                 match engine {
                     Some(engine) => {
                         match crate::extended_query::handle_describe(
-                            stream,
-                            engine,
-                            session,
-                            prepared_statements,
+                            stream, engine, session, extended,
                         )? {
                             crate::extended_query::LoopSignal::Continue => {}
                             crate::extended_query::LoopSignal::Closed => return Ok(()),
@@ -581,6 +634,112 @@ fn post_auth_loop(
                     }
                 }
             }
+            b'B' => match engine {
+                Some(engine) => {
+                    match crate::extended_query::handle_bind(stream, engine, session, extended)? {
+                        crate::extended_query::LoopSignal::Continue => {}
+                        crate::extended_query::LoopSignal::Closed => return Ok(()),
+                    }
+                }
+                None => {
+                    framing::validate_typed_message_length_prefix(
+                        stream,
+                        framing::MIN_TYPED_MESSAGE_LEN,
+                        framing::MAX_MESSAGE_LEN,
+                    )?;
+                    let kind = crate::protocol_dispatch::classify(type_byte);
+                    crate::protocol_dispatch::reject_and_close(
+                        stream,
+                        kind,
+                        write_error_response_io,
+                    )?;
+                    return Ok(());
+                }
+            },
+            b'E' => match engine {
+                Some(engine) => {
+                    match crate::extended_query::handle_execute(
+                        stream, engine, ctx, session, extended,
+                    )? {
+                        crate::extended_query::LoopSignal::Continue => {}
+                        crate::extended_query::LoopSignal::Closed => return Ok(()),
+                    }
+                }
+                None => {
+                    framing::validate_typed_message_length_prefix(
+                        stream,
+                        framing::MIN_TYPED_MESSAGE_LEN,
+                        framing::MAX_MESSAGE_LEN,
+                    )?;
+                    let kind = crate::protocol_dispatch::classify(type_byte);
+                    crate::protocol_dispatch::reject_and_close(
+                        stream,
+                        kind,
+                        write_error_response_io,
+                    )?;
+                    return Ok(());
+                }
+            },
+            b'S' => match engine {
+                Some(_engine) => match crate::extended_query::handle_sync(stream, extended)? {
+                    crate::extended_query::LoopSignal::Continue => {}
+                    crate::extended_query::LoopSignal::Closed => return Ok(()),
+                },
+                None => {
+                    framing::validate_typed_message_length_prefix(
+                        stream,
+                        framing::MIN_TYPED_MESSAGE_LEN,
+                        framing::MAX_MESSAGE_LEN,
+                    )?;
+                    let kind = crate::protocol_dispatch::classify(type_byte);
+                    crate::protocol_dispatch::reject_and_close(
+                        stream,
+                        kind,
+                        write_error_response_io,
+                    )?;
+                    return Ok(());
+                }
+            },
+            b'C' => match engine {
+                Some(_engine) => match crate::extended_query::handle_close(stream, extended)? {
+                    crate::extended_query::LoopSignal::Continue => {}
+                    crate::extended_query::LoopSignal::Closed => return Ok(()),
+                },
+                None => {
+                    framing::validate_typed_message_length_prefix(
+                        stream,
+                        framing::MIN_TYPED_MESSAGE_LEN,
+                        framing::MAX_MESSAGE_LEN,
+                    )?;
+                    let kind = crate::protocol_dispatch::classify(type_byte);
+                    crate::protocol_dispatch::reject_and_close(
+                        stream,
+                        kind,
+                        write_error_response_io,
+                    )?;
+                    return Ok(());
+                }
+            },
+            b'H' => match engine {
+                Some(_engine) => match crate::extended_query::handle_flush(stream)? {
+                    crate::extended_query::LoopSignal::Continue => {}
+                    crate::extended_query::LoopSignal::Closed => return Ok(()),
+                },
+                None => {
+                    framing::validate_typed_message_length_prefix(
+                        stream,
+                        framing::MIN_TYPED_MESSAGE_LEN,
+                        framing::MAX_MESSAGE_LEN,
+                    )?;
+                    let kind = crate::protocol_dispatch::classify(type_byte);
+                    crate::protocol_dispatch::reject_and_close(
+                        stream,
+                        kind,
+                        write_error_response_io,
+                    )?;
+                    return Ok(());
+                }
+            },
             other => {
                 // 拡張クエリプロトコル等の未対応メッセージ。長さフィールド
                 // （最低 4 バイト、MIN_TYPED_MESSAGE_LEN..=MAX_MESSAGE_LEN）だけは
@@ -883,18 +1042,12 @@ fn handle_connection_inner(
     // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
     // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
     let mut session = engine::sql::mode::SessionState::default();
-    // 接続単位の Parse 済みステートメント保持（Issue #933・TASK-71・
-    // WIRE-11）。`session` と同じく接続終了で破棄し、接続間・テナント間で
-    // 共有しない（`extended_query` モジュールドキュメント参照）。
-    let mut prepared_statements = crate::extended_query::PreparedStatementStore::new();
+    // 接続単位の Parse 済みステートメント・portal 保持（Issue #933・#934・
+    // TASK-71・WIRE-11）。`session` と同じく接続終了で破棄し、接続間・
+    // テナント間で共有しない（`extended_query` モジュールドキュメント参照）。
+    let mut extended = crate::extended_query::ExtendedQueryState::new();
 
-    match post_auth_loop(
-        &mut stream,
-        &ctx,
-        engine,
-        &mut session,
-        &mut prepared_statements,
-    ) {
+    match post_auth_loop(&mut stream, &ctx, engine, &mut session, &mut extended) {
         Ok(()) => Ok(()),
         Err(e) => respond_and_close(&mut stream, e, "invalid message frame"),
     }
@@ -1107,7 +1260,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
-                &mut crate::extended_query::PreparedStatementStore::new(),
+                &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_err(), "empty query body must be rejected");
         });
@@ -1133,7 +1286,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
-                &mut crate::extended_query::PreparedStatementStore::new(),
+                &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_err(), "embedded NUL in query must be rejected");
         });
@@ -1159,7 +1312,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
-                &mut crate::extended_query::PreparedStatementStore::new(),
+                &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(
                 result.is_err(),
@@ -1187,7 +1340,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
-                &mut crate::extended_query::PreparedStatementStore::new(),
+                &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(result.is_ok(), "well-formed Terminate must succeed");
         });
@@ -1216,7 +1369,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
-                &mut crate::extended_query::PreparedStatementStore::new(),
+                &mut crate::extended_query::ExtendedQueryState::new(),
             );
             match result {
                 Err(HandshakeError::Frame(_)) => {}
@@ -1253,7 +1406,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
-                &mut crate::extended_query::PreparedStatementStore::new(),
+                &mut crate::extended_query::ExtendedQueryState::new(),
             );
             match result {
                 Err(HandshakeError::Frame(FrameError::TooLarge { .. })) => {}
@@ -1289,7 +1442,7 @@ mod tests {
                 &ctx,
                 None,
                 &mut engine::sql::mode::SessionState::default(),
-                &mut crate::extended_query::PreparedStatementStore::new(),
+                &mut crate::extended_query::ExtendedQueryState::new(),
             );
             assert!(
                 result.is_ok(),

@@ -1,6 +1,7 @@
 # バイナリ形式の結果エンコーディング（WIRE-14）の設計判断
 
-- ステータス: **Accepted（Phase A: エンコーダ層のみ。wire 経由の結線は Phase B）**
+- ステータス: **Accepted（Phase A: エンコーダ層。Phase B の wire 経由結線は
+  Issue #934 で実施済み——「Phase B 追記」節参照）**
 - 対応: Issue #936（TASK-218・WIRE-14。ポインタ: `docs/spec/05-tasks.md`
   TASK-218・`docs/spec/04-behavior/wire-protocol.md` WIRE-14）
 - 実装: `crates/wire-server/src/result_encoder.rs`
@@ -34,6 +35,19 @@ Bind／Execute（Issue #934）・Parse／Describe（Issue #933）・型 OID の�
 組み立てる部分）に限定し、wire 経由で実際にバイナリ形式を要求して値を
 受け取るところまでは対象外とする（詳細は spec のビヘイビア定義 WIRE-14
 参照）。
+
+## Phase B 追記（Issue #934）
+
+Bind（`handle_bind`）が `ResultFormats::resolve`／`validate_binary_formats`
+を呼んで結果 format code を列ごとに解決・事前検査し、Describe(Portal) の
+`RowDescription`（`encode_row_description_with_formats`）と Execute の
+`DataRow`（`encode_data_row_into_with_formats`）が Bind 時点で確定した同じ
+値を参照するよう結線した（`crates/wire-server/src/extended_query.rs`・
+`docs/design/wire-extended-query-bind-execute-sync.md` 参照）。`0A000` 後の
+同期回復（WIRE-11）は既存の `respond_error_and_await_sync` 経路をそのまま
+使う。3 クライアントでのバイナリ受信 e2e（psycopg 3 `binary=True`・
+node pg `binary: true`・生バイト Rust クライアント）は本 Issue の対象外の
+まま別 Issue へ申し送る。
 
 ## 形式コードの列ごとの解決（`ResultFormats::resolve`）
 
@@ -131,9 +145,13 @@ matches_legacy_encoder`）で固定している。シグネチャは
 ## 申し送り（Phase B 以降）
 
 - Bind の結果形式コードを本 API へ渡す結線・Describe(portal) の
-  `RowDescription` への反映 → #934
-- `0A000` のあと当該文だけを拒否して接続を維持する同期回復 → #934（WIRE-11）
-- パラメータのバイナリ復号（長さ上限検証と `08P01`）→ #935／#934
+  `RowDescription` への反映 → **#934 で実施済み**（「Phase B 追記」節参照）
+- `0A000` のあと当該文だけを拒否して接続を維持する同期回復 →
+  **#934 で実施済み**（既存の `respond_error_and_await_sync` 経路をそのまま
+  使う）
+- パラメータのバイナリ復号（長さ上限検証と `08P01`）→ #935（`$n` 束縛自体が
+  未実装のため引き続き対象外）
 - `id`・集計列の型 OID 拡張とバイナリ対応の拡大 → #895
-- 3 クライアントのバイナリ受信モードでの値一致（層 B）→ #934 完了後
+- 3 クライアントのバイナリ受信モードでの値一致（層 B）→ #934 完了後の
+  別 Issue（本 doc の対象外のまま）
 - カーソル（WIRE-15）→ #937

@@ -35,11 +35,13 @@
 //! `WireType` 側の対応拡大（#895・NOSQL-13 ポインタ）に備えた部品として先行
 //! 提供するが、本モジュールが実際に結線するのは `Text` のみ。
 //!
-//! **本モジュール単独では wire 経由でバイナリ形式を要求する経路が無い**
-//! （拡張クエリプロトコルの Bind／Describe は #933・#934 が未実装。
-//! `protocol_dispatch::classify` が `'B'` を `0A000` で拒否する）。本 Issue の
-//! 範囲は結果側エンコーダの提供までで、Bind の結果形式コードから本 API への
-//! 結線・同期回復（`0A000` 後の接続維持）は #934 の担当。
+//! Bind の結果形式コードから本 API への結線は
+//! [`crate::extended_query::handle_bind`]（[`ResultFormats::resolve`]／
+//! [`validate_binary_formats`] を呼ぶ）・Describe(Portal) の
+//! `RowDescription`（[`encode_row_description_with_formats`]）・Execute の
+//! `DataRow`（[`encode_data_row_into_with_formats`]）が担う（#934・WIRE-11・
+//! WIRE-14）。パラメータ側（Bind が受け取る `$n` の binary 入力）は
+//! `$n` 束縛そのものが WIRE-12・#935 未実装のため対象外のまま。
 //!
 //! サイズ安全: フレーム長は `i32::try_from`/`checked_add` で算出し、超過は
 //! `Err(EncodeError::FrameTooLarge)` とする（`.claude/rules/coding-rust.md`
@@ -817,6 +819,35 @@ pub fn encode_no_data() -> [u8; 5] {
     msg[0] = b'n';
     let len_bytes = 4i32.to_be_bytes();
     msg[1..5].copy_from_slice(&len_bytes);
+    msg
+}
+
+/// `BindComplete`（'2'）。拡張クエリプロトコルの Bind（Issue #934・TASK-71・
+/// WIRE-11）が成功したことを示す固定応答。body なし・長さ固定（4）。
+pub fn encode_bind_complete() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'2';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// `CloseComplete`（'3'）。拡張クエリプロトコルの Close（Issue #934）が
+/// statement／portal いずれかを解放したことを示す固定応答（対象が未存在でも
+/// 同じ応答を返す。PostgreSQL と同じ挙動）。body なし・長さ固定（4）。
+pub fn encode_close_complete() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b'3';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
+    msg
+}
+
+/// `PortalSuspended`（'s'）。拡張クエリプロトコルの Execute（Issue #934）が
+/// `max_rows` 制限により行の送出を打ち切り、続きを次の Execute へ持ち越す
+/// ことを示す固定応答。body なし・長さ固定（4）。
+pub fn encode_portal_suspended() -> [u8; 5] {
+    let mut msg = [0u8; 5];
+    msg[0] = b's';
+    msg[1..5].copy_from_slice(&4i32.to_be_bytes());
     msg
 }
 
