@@ -308,10 +308,13 @@ fn nosql_update_set_json_null_on_nullable_column_clears_to_sql_null() {
     common::read_ready_for_query(&mut sql);
 }
 
-/// 非 nullable な `JSON`／`JSONB` 列への `null` は従来どおり `42601` で拒否する
-/// （fail-closed。nullable 列向けの緩和が非 nullable 列まで広げないことを固定）。
+/// 非 nullable な `JSON`／`JSONB` 列への `null` は fail-closed に拒否される
+/// （Issue #896 で判定順序が変わり、wire 層の型不一致検査（`42601`）ではなく
+/// `bind_update`（engine 側の単一情報源）の nullable 判定（`22000`）で拒否
+/// されるようになった。`docs/design/nosql-typed-json-binding.md`「null の
+/// 扱い」節参照。拒否されること自体・fail-closed であることは不変）。
 #[test]
-fn nosql_update_set_json_null_on_non_nullable_column_is_rejected_with_42601() {
+fn nosql_update_set_json_null_on_non_nullable_column_is_rejected() {
     let path = temp_db::unique_db_path("wire-json-column-non-nullable");
     let guard = temp_db::CleanupGuard(path.clone());
     let non_nullable_schema = TableSchema::new(
@@ -338,7 +341,7 @@ fn nosql_update_set_json_null_on_non_nullable_column_is_rejected_with_42601() {
 
     let update_body = br#"{"op":"update","table":"docs","where":{"id":1},"set":{"doc":null},"operation_id":"op-nosql-update-reject-null"}"#;
     let resp = query(&both, update_body);
-    assert_eq!(http_common::wire_code_of(&resp), "42601", "resp: {resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "22000", "resp: {resp:?}");
 }
 
 #[test]

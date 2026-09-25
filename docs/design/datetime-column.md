@@ -139,3 +139,7 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
 - `DATE '...'`／`TIMESTAMP '...'` の型付きリテラル接頭辞。
 - `TIMESTAMPTZ`。
 - PG バイナリ結果形式のエポック変換（#998）。
+
+## Issue #896 追記
+
+NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。

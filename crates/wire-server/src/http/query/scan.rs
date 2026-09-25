@@ -34,7 +34,6 @@
 use std::time::SystemTime;
 
 use engine::core::EngineCore;
-use engine::declarative_filter::{self, DeclarativeFilter};
 use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::json::JsonValue;
 use engine::policy::PolicyContext;
@@ -44,7 +43,7 @@ use engine::sql::mode::SessionState;
 use engine::sql::parser::{bind_projection, validate_search_limit, BoundScan};
 use engine::sql::udf_call::MAX_EXPR_NODES;
 
-use super::filter::{map_filter_items, FilterError};
+use super::filter::{bind_filter, FilterError};
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{SchemaError, Validated};
 use crate::http::response as http_response;
@@ -174,28 +173,21 @@ fn build_projection(validated: &Validated<'_>) -> Result<Projection, ScanError> 
     Ok(Projection::Columns(names))
 }
 
-/// `filter`（[`Validated::optional_array`]`("filter")` の結果）を未束縛の
-/// [`DeclarativeFilter`] 列へ写像する。未指定は空 `Vec`（AND 結合の単位元）。
-fn build_declared_filters(validated: &Validated<'_>) -> Result<Vec<DeclarativeFilter>, ScanError> {
-    match validated.optional_array("filter")? {
-        Some(items) => Ok(map_filter_items(items)?),
-        None => Ok(Vec::new()),
-    }
-}
-
 /// [`execute`] の本体。`table` のスキーマ取得・束縛・実行を単一スナップショット
 /// 上で行う（[`EngineCore::execute_bound_scan_in_session`] の契約）。
 ///
-/// 手順: (1) `explain: true` の拒否、(2) `table`／`limit`／`columns`／`filter`
-/// をスキーマに依存しない範囲で検証・写像（[`limit_to_u32`]・
-/// [`validate_search_limit`]・[`build_projection`]・[`build_declared_filters`]。
-/// いずれも `TableSchema` を必要としないため、テーブル解決より前に完結させる
-/// ——未知テーブルへの要求でも `limit`／`columns`／`filter` の構文エラーを
-/// 先に確定させて構わない。SQL 表層の許可リスト検証段と同じ判定順序の思想）、
-/// (3) [`EngineCore::execute_bound_scan_in_session`] の bind closure 内で
-/// [`bind_projection`]・`declarative_filter::bind_all`（いずれもスキーマ依存の
-/// 検証。未知列・`VECTOR` 列は `22000`）を適用して [`BoundScan::new`] を組み立て、
-/// (4) 実行する。
+/// 手順: (1) `explain: true` の拒否、(2) `table`／`limit`／`columns` をスキーマ
+/// に依存しない範囲で検証・写像（[`limit_to_u32`]・[`validate_search_limit`]・
+/// [`build_projection`]。いずれも `TableSchema` を必要としないため、テーブル
+/// 解決より前に完結させる——未知テーブルへの要求でも `limit`／`columns` の
+/// 構文エラーを先に確定させて構わない。SQL 表層の許可リスト検証段と同じ
+/// 判定順序の思想）、(3) [`EngineCore::execute_bound_scan_in_session`] の bind
+/// closure 内で [`bind_projection`]・[`super::filter::bind_filter`]（いずれも
+/// スキーマ依存の検証。`filter` は列型ごとに値レーンを振り分けるため
+/// `schema` が届くまで束縛できない——Issue #896・NOSQL-17 で `search`／
+/// `aggregate` と同じ「schema 到達後に単一段で束縛する」構成へ揃えた。未知列・
+/// `VECTOR` 列は `22000`）を適用して [`BoundScan::new`] を組み立て、(4) 実行
+/// する。
 pub fn execute(
     core: &EngineCore,
     ctx: &PolicyContext,
@@ -214,13 +206,14 @@ pub fn execute(
     let raw_limit = validated.required_number("limit")?;
     let limit = validate_search_limit(limit_to_u32(raw_limit)?)?;
     let projection = build_projection(validated)?;
-    let declared_filters = build_declared_filters(validated)?;
+    let filter_items = validated.optional_array("filter")?.unwrap_or(&[]);
 
     let session = SessionState::default();
     let result = core.execute_bound_scan_in_session(ctx, &session, table, |schema, udfs| {
         let mut node_budget = MAX_EXPR_NODES;
         let bound_projection = bind_projection(&projection, schema, udfs, &mut node_budget)?;
-        let bound_filters = declarative_filter::bind_all(&declared_filters, schema)?;
+        let bound_filters =
+            bind_filter(filter_items, schema).map_err(FilterError::into_sql_surface_error)?;
         Ok(BoundScan::new(
             table.to_string(),
             bound_projection,

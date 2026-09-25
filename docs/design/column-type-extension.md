@@ -701,3 +701,7 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   `DecodeTier` の精査（#894）、UUID 列のバイナリ形式・OID 2950 対応
   （#895）、NoSQL `insert` op での JSON 束縛（#896）、SQL `CREATE TABLE`
   構文での `UUID` 列宣言（SQL-23 は未実装）は引き続き対象外。
+
+## Issue #896 追記
+
+NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。

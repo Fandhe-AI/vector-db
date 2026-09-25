@@ -128,3 +128,7 @@
 - NoSQL の JSON 束縛（JSON 数値 → 整数列）→ #896
 - `22P02`（形式不正）の新設 → TASK-227／#897（本 Issue では `22000` で暫定拒否）
 - SQL の DDL（`CREATE TABLE` 文）→ Phase 3（SQL-23）
+
+## Issue #896 追記
+
+NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応・`columns[].type` の型名整備は Issue #896（NOSQL-17）で実施済み。詳細は `docs/design/nosql-typed-json-binding.md` 参照。
