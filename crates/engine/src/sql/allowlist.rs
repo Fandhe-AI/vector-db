@@ -350,6 +350,11 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
+    /// 存在しない（WIRE-15・TASK-218）。他セッション所有のカーソル名・単に
+    /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
+    /// 自体を含めない（security.md「存在情報を漏らさない」対応。ERR-6: `34000`）。
+    InvalidCursorName,
     /// `DROP TABLE`／`DROP VIEW` の対象を、それを参照するビューが 1 つ以上
     /// 残っているため削除できない（TABLE-18・SQL-23・TASK-205、Issue #909。
     /// ERR-6: `2BP01`）。依存元の名前一覧はエラー文言に含めない
@@ -477,6 +482,18 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `sql::cursor::CursorRegistry::fetch`／`close`（WIRE-15・TASK-218）が、
+    /// 現在のトランザクション内に存在しないカーソル名を報告するために使う。
+    /// 固定 variant（データを持たない）のため引数はない。`pub`（`pub(crate)`
+    /// から昇格。PR #1049 レビュー指摘対応）——`wire-server::extended_query`
+    /// が、カーソル `FETCH` 由来 portal の中断保持分を再送出する前に
+    /// `CLOSE`／`COMMIT`／`ROLLBACK`／再 `DECLARE` を挟んでいないか検証する
+    /// 経路で、同じ `34000` を直接構築するために使う（第 2 の実行器・第 2 の
+    /// エラー分類を作らない設計）。
+    pub fn invalid_cursor_name() -> Self {
+        SqlSurfaceError::InvalidCursorName
+    }
+
     /// `pub(crate)`: `sql::aggregate`（TASK-166・SQL-13）が集計の数値演算オーバー
     /// フロー（`u64` の `checked_add` 失敗・`f64` の非有限値化）を報告するために使う。
     pub(crate) fn numeric_out_of_range(detail: impl Into<String>) -> Self {
@@ -564,6 +581,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
+            SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
             }
@@ -662,6 +680,12 @@ impl std::fmt::Display for SqlSurfaceError {
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied for DDL statement")
+            }
+            // カーソル名・他セッション所有かどうかを一切含めない固定文言
+            // （security.md P0。`SqlSurfaceError::InvalidCursorName` ドキュメント
+            // 参照）。
+            SqlSurfaceError::InvalidCursorName => {
+                write!(f, "cursor does not exist")
             }
             // 依存元の名前一覧は含めない固定文言（security.md P0）。
             SqlSurfaceError::DependentObjectsStillExist { name } => {

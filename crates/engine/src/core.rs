@@ -1268,6 +1268,17 @@ pub enum ParsedSql {
     /// 更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードがあれば
     /// 追随が必要。
     CreateTable(crate::sql::allowlist::ValidatedCreateTable),
+    /// `DECLARE`/`FETCH`/`CLOSE`（カーソル。WIRE-15・TASK-218）。トランザクション
+    /// 文脈を持たない [`EngineCore::execute_parsed_in_session`] はこの variant を
+    /// `DECLARE` なら `25P01`（`NoActiveSqlTransaction`）、`FETCH`／`CLOSE` なら
+    /// `34000`（`InvalidCursorName`）で拒否する（カーソルは明示トランザクション
+    /// 内でのみ有効。`sql::cursor` モジュールドキュメント参照）。
+    ///
+    /// **BREAKING CHANGE**（WIRE-15・TASK-218）: 本 variant の追加により
+    /// `ParsedSql` を網羅的にマッチする既存コード（`crate::core::EngineCore`）は
+    /// すべて更新済み。クレート外で `ParsedSql` を網羅的にマッチするコードが
+    /// あれば追随が必要。
+    Cursor(crate::sql::cursor::CursorStatement),
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（SQL-23・TASK-202、
     /// Issue #900）。DDL 実行権限ゲート（`sql::ddl::require_ddl_permission`）の
     /// 判定は [`DropTable`](Self::DropTable)／[`CreateTable`](Self::CreateTable)
@@ -2215,7 +2226,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
-                    | crate::sql::SqlOutcome::Rollback => {
+                    | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::DeclareCursor
+                    | crate::sql::SqlOutcome::Fetch(_)
+                    | crate::sql::SqlOutcome::CloseCursor => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -2252,7 +2266,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
-                    | crate::sql::SqlOutcome::Rollback => {
+                    | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::DeclareCursor
+                    | crate::sql::SqlOutcome::Fetch(_)
+                    | crate::sql::SqlOutcome::CloseCursor => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -2286,7 +2303,10 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
-                    | crate::sql::SqlOutcome::Rollback => {
+                    | crate::sql::SqlOutcome::Rollback
+                    | crate::sql::SqlOutcome::DeclareCursor
+                    | crate::sql::SqlOutcome::Fetch(_)
+                    | crate::sql::SqlOutcome::CloseCursor => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -2501,6 +2521,36 @@ impl EngineCore {
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Update(stmt));
+        }
+
+        let is_declare_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DECLARE")
+        );
+        if is_declare_statement {
+            // カタログ照会（テーブル存在確認）は意図的にここでは行わない
+            // （`sql::cursor::validate_declare_tokens_structure_only` 参照。
+            // PR #1049 レビュー指摘 P1 対応）。
+            let stmt = crate::sql::cursor::validate_declare_tokens_structure_only(&tokens)?;
+            return Ok(ParsedSql::Cursor(stmt));
+        }
+
+        let is_fetch_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("FETCH")
+        );
+        if is_fetch_statement {
+            let stmt = crate::sql::cursor::validate_fetch_tokens(&tokens)?;
+            return Ok(ParsedSql::Cursor(stmt));
+        }
+
+        let is_close_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("CLOSE")
+        );
+        if is_close_statement {
+            let stmt = crate::sql::cursor::validate_close_tokens(&tokens)?;
+            return Ok(ParsedSql::Cursor(stmt));
         }
 
         // TASK-206・INDEX-7・SQL-23（Issue #908）: `DROP INDEX` は汎用の
@@ -2863,6 +2913,21 @@ impl EngineCore {
             ParsedSql::Transaction(_) => Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                 "transaction control statements are not supported by this entry point",
             )),
+            // WIRE-15・TASK-218: カーソルは明示トランザクション内でのみ有効
+            // （`sql::cursor` モジュールドキュメント参照）。トランザクション
+            // 文脈を持たない本エントリポイントでは、`DECLARE` は「トランザク
+            // ション外」（`25P01`。`COMMIT`/`ROLLBACK` を `Idle` で送った場合と
+            // 同じ分類）、`FETCH`／`CLOSE` は対象カーソルが存在し得ないため
+            // `34000` で拒否する。
+            ParsedSql::Cursor(stmt) => match stmt {
+                crate::sql::cursor::CursorStatement::Declare { .. } => {
+                    Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction)
+                }
+                crate::sql::cursor::CursorStatement::Fetch { .. }
+                | crate::sql::cursor::CursorStatement::Close { .. } => {
+                    Err(crate::sql::allowlist::SqlSurfaceError::invalid_cursor_name())
+                }
+            },
         }
     }
 
@@ -3071,12 +3136,170 @@ impl EngineCore {
             ParsedSql::Statement(stmt @ Statement::Explain(v)) => {
                 self.read_only_in_active_txn(ctx, session, txn, &v.table_name, stmt.clone())
             }
+            // WIRE-15・TASK-218: カーソルは `Active` なトランザクション内でのみ
+            // 意味を持つ（`sql::cursor` モジュールドキュメント参照）。
+            ParsedSql::Cursor(stmt) => self.execute_cursor_in_active_txn(ctx, session, txn, stmt),
             // 複数行 INSERT・ファイル形 INSERT・UPSERT・`UPDATE`・`DELETE`・
             // COPY 等、明示トランザクション内での対応外の文（対象外。
             // `docs/design/explicit-transaction.md` 参照）。
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
             )),
+        }
+    }
+
+    /// `DECLARE` の内側 SELECT（`sql::cursor::validate_declare_tokens` により
+    /// `Statement::Aggregate`／`Statement::Scan` のいずれかであることが構造
+    /// 検証段で保証済み）専用の実行入口（PR #1049 レビュー指摘 P1 対応）。
+    ///
+    /// `Statement::Scan` は [`crate::sql::scan::execute_scan_with_budget`] を、
+    /// `Statement::Aggregate` は [`Self::run_aggregate_plan`] を、いずれも
+    /// [`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`]（16 MiB）の結果
+    /// バイト予算で直接呼び、行生成中の累積判定を [`Self::
+    /// execute_validated_in_session`] 経由の既定予算（`Statement::Scan` の
+    /// `sql::scan::MAX_SCAN_RESULT_BYTES`＝1 GiB、`Statement::Aggregate` の
+    /// [`crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES`]＝1 GiB）より遥かに
+    /// 手前で打ち切る——`CursorRegistry::declare` のバイト上限判定（16 MiB）は
+    /// 本来カーソルが保持できる上限を表すにも関わらず、既定予算のまま実行する
+    /// とその判定に到達する前に大きな結果をメモリ上に確定させてしまう
+    /// （ネットワーク入力によるメモリ確保量の増幅。security.md「不安全な
+    /// 設計」対応。PR #1049 レビュー指摘 P0 対応: `Statement::Aggregate` は
+    /// `GROUP BY` のグループキー累計バイト数上限（`sql::group_by::
+    /// MAX_GROUP_KEY_TOTAL_BYTES`）・`TEXT` 集計状態の累計バイト数上限が
+    /// それぞれ独立に 16 MiB で頭打ちになるのみで、両者の合計や `GROUP BY`
+    /// なしの単一行経路の `MIN`/`MAX(<TEXT 列>)` 累計（最大
+    /// [`crate::sql::allowlist::MAX_AGGREGATE_ITEMS`] 項目分）を完成した
+    /// [`crate::sql::exec::QueryResult`] 全体の容量として制限していなかった
+    /// ため、既定予算のまま `run_aggregate_plan` へ委譲すると `declare` の
+    /// 16 MiB 判定に到達する前に遥かに大きな結果を確定させてしまう。`run_aggregate_plan`
+    /// 自体に `max_result_bytes` を明示的に渡すことで、`sql::aggregate::
+    /// execute_aggregate_with_cache`／`sql::group_by::execute_grouped_aggregate`
+    /// の行生成ループが 16 MiB 予算を生成中に検査するようにする）。それ以外の
+    /// `Statement` 種別への到達は構造検証段の保証により起き得ないが、防御的に
+    /// 通常の [`Self::execute_validated_in_session`] へ委譲する。
+    ///
+    /// `max_result_bytes` は呼び出し元（[`Self::execute_cursor_in_active_txn`]）が
+    /// 実行前に求めたセッションのカーソル残容量（[`crate::sql::cursor::
+    /// CursorRegistry::remaining_bytes`]＝16 MiB − 既存カーソルの保持量）。
+    /// 上記の 16 MiB は既存カーソルが無い場合の上限であり、既存カーソルが
+    /// 保持している分を差し引いた残容量を生成予算にすることで、`declare` の
+    /// 合計上限判定より前に「既存保持量＋新規結果」が上限を超えて確保される
+    /// ことを防ぐ（PR #1049 レビュー指摘 codex P1 対応）。
+    fn execute_cursor_inner_query(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        inner: &crate::sql::allowlist::Statement,
+        max_result_bytes: usize,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        if let crate::sql::allowlist::Statement::Scan(validated) = inner {
+            let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+            let bound = crate::sql::parser::bind_scan(validated, &schema, session.udfs())?;
+            let result = crate::sql::scan::execute_scan_with_budget(
+                &read_txn,
+                ctx,
+                &schema,
+                &bound,
+                max_result_bytes,
+            )?;
+            return Ok(crate::sql::SqlOutcome::Query(result));
+        }
+        if let crate::sql::allowlist::Statement::Aggregate(validated) = inner {
+            let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+            let bound = crate::sql::parser::bind_aggregate(validated, &schema, session.udfs())?;
+            let result =
+                self.run_aggregate_plan(&read_txn, ctx, &schema, &bound, max_result_bytes)?;
+            return Ok(crate::sql::SqlOutcome::Query(result));
+        }
+        self.execute_validated_in_session(ctx, session, inner.clone())
+    }
+
+    /// [`Self::execute_in_active_txn`] の `ParsedSql::Cursor` 分岐本体
+    /// （WIRE-15・TASK-218）。
+    ///
+    /// - `DECLARE`: 同一トランザクション内で既に書き込み済みのテーブルへの
+    ///   読み取りは `0A000`（[`Self::read_only_in_active_txn`] と同じ既知の
+    ///   逸脱）。カーソル数上限・重複名は内側 SELECT を実行する**前**に判定し
+    ///   （[`crate::sql::cursor::CursorRegistry::ensure_capacity_for_declare`]）、
+    ///   内側 SELECT 自体の実行は [`Self::execute_cursor_inner_query`] へ
+    ///   委譲し、実行後に確定した [`crate::sql::exec::QueryResult`] をバイト
+    ///   上限判定込みで登録する（[`crate::sql::cursor::CursorRegistry::declare`]）。
+    /// - `FETCH`／`CLOSE`: `CursorRegistry` への委譲のみ。検索本体は再実行
+    ///   しない。
+    fn execute_cursor_in_active_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        txn: &mut crate::sql::transaction::SessionTransaction<'e>,
+        stmt: &crate::sql::cursor::CursorStatement,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::cursor::CursorStatement;
+
+        match stmt {
+            CursorStatement::Declare { name, query } => {
+                // 構文解析段（`parse_tokens`）は構造検証のみでカタログを参照
+                // しないため、ここで内側 SELECT を実カタログに対して再検証する
+                // （PR #1049 レビュー指摘 codex P1 対応）。通常の広域取得
+                // `SELECT` と同じ `validate_sql_tokens` を通すことで、FROM が
+                // ビューを指す場合も同じ `sql::view::resolve_from` による展開
+                // （基底テーブル＋ビュー由来述語。RLS は後段の実行経路が参照
+                // セッション自身の `ctx` で暗黙適用する）が適用される。
+                // `table` はビュー展開後の基底テーブル名。
+                let (inner, table) =
+                    crate::sql::cursor::validate_declare_inner(query, &self.storage)?;
+                if txn.table_already_written(&table) {
+                    return Err(SqlSurfaceError::transaction_feature_not_supported(
+                        "reading a table already written in the same transaction is not supported",
+                    ));
+                }
+                let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                registry.ensure_capacity_for_declare(name)?;
+                // 既存カーソルの保持量を差し引いた残容量を内側 SELECT の生成予算に
+                // する（PR #1049 レビュー指摘 codex P1 対応。
+                // `execute_cursor_inner_query` のドキュメント参照）。
+                let remaining_bytes = registry.remaining_bytes();
+                let outcome =
+                    self.execute_cursor_inner_query(ctx, session, &inner, remaining_bytes)?;
+                let result = match outcome {
+                    crate::sql::SqlOutcome::Query(result) => result,
+                    // `inner` は構造検証段で `Statement::Aggregate`／
+                    // `Statement::Scan` のいずれかであることを保証済み
+                    // （`sql::cursor::validate_declare_tokens` 参照）。いずれも
+                    // `execute_validated_in_session` は必ず `SqlOutcome::Query`
+                    // を返すため、この分岐は公開 API の誤用時のみの防御的経路。
+                    _ => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "internal error".to_string(),
+                        })
+                    }
+                };
+                txn.cursors_mut()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?
+                    .declare(name.clone(), result)?;
+                Ok(crate::sql::SqlOutcome::DeclareCursor)
+            }
+            CursorStatement::Fetch { name, count } => {
+                let result = txn
+                    .cursors_mut()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?
+                    .fetch(name, *count)?;
+                Ok(crate::sql::SqlOutcome::Fetch(result))
+            }
+            CursorStatement::Close { name } => {
+                txn.cursors_mut()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    })?
+                    .close(name)?;
+                Ok(crate::sql::SqlOutcome::CloseCursor)
+            }
         }
     }
 
@@ -3127,6 +3350,47 @@ impl EngineCore {
         // `describe_prepared_in_session` のみが使う（PR #1012 レビュー指摘
         // 対応。詳細は同メソッドのコメント参照）。
         self.describe_parsed_in_session_impl(session, parsed, false, &[])
+    }
+
+    /// [`Self::describe_parsed_in_session`] のトランザクション対応版
+    /// （WIRE-15・TASK-218。`wire-server::extended_query::handle_describe`／
+    /// `handle_bind` が接続単位の `SessionTransaction` を渡して呼ぶ）。
+    /// `ParsedSql::Cursor(CursorStatement::Fetch { name, .. })` に限り、`txn` が
+    /// `Active` で `name` のカーソルが実在する場合はその結果列メタデータを
+    /// 返し、実在しない場合は `34000`（検索本体を実行せずに判定できる—— カーソル
+    /// 実行時に確定済みの `QueryResult::columns` を読むだけで済むため）。
+    /// `Declare`／`Close` は結果列を持たない（`CommandComplete` のみ）。
+    /// それ以外の `ParsedSql` は [`Self::describe_parsed_in_session`] と完全に
+    /// 同一の判定へ委譲する。
+    pub fn describe_parsed_in_txn(
+        &self,
+        session: &crate::sql::mode::SessionState,
+        txn: &crate::sql::transaction::SessionTransaction<'_>,
+        parsed: &ParsedSql,
+    ) -> Result<Option<Vec<crate::sql::exec::ColumnMeta>>, crate::sql::allowlist::SqlSurfaceError>
+    {
+        if let ParsedSql::Cursor(stmt) = parsed {
+            return match stmt {
+                crate::sql::cursor::CursorStatement::Declare { .. }
+                | crate::sql::cursor::CursorStatement::Close { .. } => Ok(None),
+                crate::sql::cursor::CursorStatement::Fetch { name, .. } => {
+                    // `Failed` 中はカーソルが既に破棄されているが、Execute と同じく
+                    // `25P02` を返す（`34000` にしない。PR #1049 レビュー指摘
+                    // Cursor Bugbot Low 対応）。`txn` は読み取り専用のため、期限切れ
+                    // 由来の `54000` の 1 回限り報告（`SessionTransaction::
+                    // take_failed_error`）は後続の Execute に委ね、ここでは状態を
+                    // 変えない。
+                    if txn.status() == crate::sql::transaction::TransactionStatus::Failed {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::InFailedSqlTransaction);
+                    }
+                    match txn.cursor_columns(name) {
+                        Some(columns) => Ok(Some(columns)),
+                        None => Err(crate::sql::allowlist::SqlSurfaceError::invalid_cursor_name()),
+                    }
+                }
+            };
+        }
+        self.describe_parsed_in_session(session, parsed)
     }
 
     /// [`Self::describe_parsed_in_session`]／[`Self::describe_prepared_in_session`]
@@ -3295,6 +3559,14 @@ impl EngineCore {
             // `BEGIN`／`COMMIT`／`ROLLBACK`（SQL-31・TASK-221）は結果列を持たない
             // （`CommandComplete` のみ）。
             ParsedSql::Transaction(_) => Ok(None),
+            // WIRE-15・TASK-218: `DECLARE`／`CLOSE` は `CommandComplete` のみを
+            // 返すため結果列を持たない。`FETCH` は本来カーソルの列メタデータを
+            // 持つが、本メソッド（トランザクション文脈を持たない Describe。
+            // [`Self::describe_parsed_in_session`]・[`Self::
+            // describe_prepared_in_session`] が使う）はどのカーソルが開いて
+            // いるかを知り得ないため `None` を返す（fail-safe。実際のカーソル
+            // Describe は [`Self::describe_parsed_in_txn`] が担う）。
+            ParsedSql::Cursor(_) => Ok(None),
         }
     }
 
@@ -3443,7 +3715,13 @@ impl EngineCore {
                 let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
                 let bound =
                     crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
-                let result = self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)?;
+                let result = self.run_aggregate_plan(
+                    &read_txn,
+                    ctx,
+                    &schema,
+                    &bound,
+                    crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+                )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             // Issue #454: 広域取得（ソートなしのフィルタ取得）は `Statement::Aggregate`
@@ -3892,18 +4170,27 @@ impl EngineCore {
     /// （[`Self::execute_bound_aggregate_in_session`]）も SQL テキスト経由と
     /// 同一のキャッシュ最適化を受ける（`sql::aggregate::execute_aggregate`
     /// 〔公開ラッパー・キャッシュ非経由〕とは意図的に差別化する）。
+    ///
+    /// `max_result_bytes`（PR #1049 レビュー指摘 P0 対応）: 通常の（カーソル
+    /// 非経由の）呼び出し元は [`crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES`]
+    /// （既存挙動を変えない大きな既定値）を渡す。[`Self::execute_cursor_inner_query`]
+    /// だけが `DECLARE` の内側実行専用により小さい
+    /// [`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`] を渡す
+    /// （[`crate::sql::scan::execute_scan_with_budget`] と同じ設計判断）。
     fn run_aggregate_plan(
         &self,
         read_txn: &redb::ReadTransaction,
         ctx: &PolicyContext,
         schema: &crate::catalog::TableSchema,
         bound: &crate::sql::parser::BoundAggregate,
+        max_result_bytes: usize,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         crate::sql::aggregate::execute_aggregate_with_cache(
             read_txn,
             ctx,
             schema,
             bound,
+            max_result_bytes,
             Some(crate::sql::visible_cache::VisibleCacheAccess {
                 storage: &self.storage,
                 cache: &self.visible_bitmap_cache,
@@ -4231,7 +4518,13 @@ impl EngineCore {
                 "bound aggregate plan targets a different table than requested",
             ));
         }
-        self.run_aggregate_plan(&read_txn, ctx, &schema, &bound)
+        self.run_aggregate_plan(
+            &read_txn,
+            ctx,
+            &schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+        )
     }
 
     /// 束縛済み複数行 `INSERT` 計画（[`crate::sql::parser::BoundInsert`] の列）を

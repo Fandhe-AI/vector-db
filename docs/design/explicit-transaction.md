@@ -271,3 +271,10 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - 先頭文が 0 行 DELETE の場合に RECOVER-12 の再送判定が成立しない制約
   （SQL-18 の既存契約〔0 行 DELETE は台帳非記録〕との相互作用）。
 - 上限の既定値（20 秒・1,000 件・30 秒）の確定 → オーナー判断。
+
+## カーソルとの関係
+
+`DECLARE`／`FETCH`／`CLOSE`（Issue #937・WIRE-15・TASK-218）は本トランザクション
+機構の上に実装されており、カーソルは `sql::transaction::ActiveTxn` に埋め込
+まれるため、`COMMIT`／`ROLLBACK`／`fail`／期限切れ／接続断のいずれでも自動的に
+クローズされる。詳細は `docs/design/sql-cursor.md` 参照。

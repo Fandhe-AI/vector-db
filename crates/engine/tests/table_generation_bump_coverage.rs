@@ -191,7 +191,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （`sql/exec.rs::execute_insert_with_schema_in`／`execute_truncate_in` →
     // `tenant.rs` 各関数のドキュメント参照）。本呼び出し箇所自体は複数文を
     // まとめて確定させるだけで、新たな `user_rows/{table}` 書き込みを行わない。
-    ("sql/transaction.rs", 248),
+    // base（main）取り込みマージ（PR #1041 の `max_duration` 超過チェック追加）で
+    // 行番号がさらに移動したための追随（旧: 248）。PR #1049 レビュー指摘対応
+    // （`begin()` への世代カウンタ加算・`active_generation`／`cursor_id`
+    // アクセサ追加）でさらに移動（旧: 256）。
+    ("sql/transaction.rs", 293),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を

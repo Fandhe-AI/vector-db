@@ -28,7 +28,13 @@ pub const fn http_status(class: ErrorClass) -> u16 {
     match class {
         ErrorClass::AuthRequired | ErrorClass::AuthInvalid => 401,
         ErrorClass::ForbiddenTenantMismatch => 403,
-        ErrorClass::TableNotFound | ErrorClass::RowNotFound => 404,
+        // `InvalidCursorName`（`34000`。WIRE-15・TASK-218）は NoSQL 表層の `op`
+        // 語彙にカーソル操作が無く構造的に到達しないが、`ErrorClass` の網羅性
+        // のため「対象が存在しない」という同じ意味論を持つ `TableNotFound`／
+        // `RowNotFound` と同じ 404 へ寄せる。
+        ErrorClass::TableNotFound | ErrorClass::RowNotFound | ErrorClass::InvalidCursorName => {
+            404
+        }
         // `DuplicateTable`（`42P07`。SQL-23・TASK-85、Issue #899）は
         // `CREATE TABLE` が指定したテーブル名の既存衝突であり、`UniqueViolation`
         // と同じ「対象が既に存在する」意味論のため同じ 409 とする。
@@ -90,7 +96,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 31] = [
+    const EXPECTED: [(ErrorClass, u16); 32] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -116,6 +122,7 @@ mod tests {
         (ErrorClass::InFailedSqlTransaction, 400),
         (ErrorClass::DuplicateTable, 409),
         (ErrorClass::DuplicateColumn, 400),
+        (ErrorClass::InvalidCursorName, 404),
         (ErrorClass::DependentObjectsStillExist, 400),
         (ErrorClass::WrongObjectType, 400),
         (ErrorClass::NotNullViolation, 400),

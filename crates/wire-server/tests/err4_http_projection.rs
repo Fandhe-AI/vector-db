@@ -15,13 +15,16 @@
 //! [`err4_projection_table_is_closed_over_all_error_classes`] で機械的に
 //! 固定する。production コードは変更しない（テスト専任）。
 //!
-//! 到達不能類型（`42501`・`P0002`・`42701`）の扱い: NoSQL 表層はテナントを
-//! セッション（`SessionPrincipal::policy_context()`）からのみ導出し、
-//! クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの
-//! 位置でも `42601` で先に拒否する（`gate.rs`・`session/middleware.rs`・
-//! `router.rs`）ため、`ForbiddenTenantMismatch`（`42501`）を実要求から誘発
-//! する経路が構造的に存在しない。`RowNotFound`（`P0002`）に対応する op
-//! （更新・削除系）も NoSQL 表層の許可リストに無い。`DuplicateColumn`
+//! 到達不能類型（`42501`・`P0002`・`34000`・`42701`）の扱い: NoSQL 表層は
+//! テナントをセッション（`SessionPrincipal::policy_context()`）からのみ
+//! 導出し、クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パス
+//! いずれの位置でも `42601` で先に拒否する（`gate.rs`・
+//! `session/middleware.rs`・`router.rs`）ため、`ForbiddenTenantMismatch`
+//! （`42501`）を実要求から誘発する経路が構造的に存在しない。`RowNotFound`
+//! （`P0002`）に対応する op（更新・削除系）も NoSQL 表層の許可リストに無い。
+//! `InvalidCursorName`（`34000`。WIRE-15・TASK-218）はカーソル
+//! （`DECLARE`／`FETCH`／`CLOSE`）専用の分類で、NoSQL 表層の `op` 許可
+//! リストにカーソル操作が無いため実要求からは到達しない。`DuplicateColumn`
 //! （`42701`。`ALTER TABLE ADD COLUMN` の列名重複。TASK-202・SQL-23・
 //! Issue #900）に対応する `op` も NoSQL 表層の許可リストに無い（DDL は
 //! NoSQL 表層の対象外）。これらはテナント境界の検査を緩める・バイパスする
@@ -196,11 +199,12 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 30] = [
+const EXPECTED_STATUS: [(&str, u16); 31] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
     ("42501", 403),
+    ("34000", 404),
     ("42P01", 404),
     ("P0002", 404),
     ("23505", 409),
@@ -300,7 +304,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 31);
+const _: () = assert!(ErrorClass::ALL.len() == 32);
 
 /// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
@@ -690,8 +694,9 @@ fn err4_f_internal_error_projects_xx000_to_500() {
     assert_projected(&resp, "XX000");
 }
 
-/// `42501`（テナント越境）・`P0002`（行不在）は NoSQL 表層の実要求からは
-/// 構造的に到達不能（本ファイル冒頭 doc 参照）。`42P07`（`DuplicateTable`）・
+/// `42501`（テナント越境）・`P0002`（行不在）・`34000`（カーソル不在。
+/// WIRE-15・TASK-218）は NoSQL 表層の実要求からは構造的に到達不能
+/// （本ファイル冒頭 doc 参照）。`42P07`（`DuplicateTable`）・
 /// `42701`（`DuplicateColumn`。SQL-23・TASK-85、Issue #899）は SQL 表層専用の
 /// `CREATE TABLE` 分類であり、`2BP01`／`42809`
 /// （TABLE-18・SQL-23・TASK-205、Issue #909）も同様——`CREATE VIEW`／
@@ -717,6 +722,7 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
     for class in [
         ErrorClass::ForbiddenTenantMismatch,
         ErrorClass::RowNotFound,
+        ErrorClass::InvalidCursorName,
         ErrorClass::DuplicateTable,
         ErrorClass::DuplicateColumn,
         ErrorClass::DependentObjectsStillExist,

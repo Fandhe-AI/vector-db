@@ -254,6 +254,16 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
     match first {
         Token::Keyword(Keyword::Select) => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("EXPLAIN") => StatementEffect::ReadOnly,
+        // WIRE-15・TASK-218: `DECLARE`／`FETCH`／`CLOSE`（カーソル）はいずれも
+        // redb の commit を伴わない（`DECLARE` は既存の読み取り経路を 1 回
+        // 実行するのみ・`FETCH`／`CLOSE` はセッション内メモリ状態のみを操作する）
+        // ため `ReadOnly` に分類する。誤って `Write` 扱いにすると、複数文
+        // メッセージ内でトランザクション外の `DECLARE` 等が最後の文以外に
+        // あるだけで `0A000`（`WriteNotLast`）になり、本来の `25P01`／`34000`
+        // より先に紛らわしいエラーへ倒れてしまう。
+        Token::Ident(name) if name.eq_ignore_ascii_case("DECLARE") => StatementEffect::ReadOnly,
+        Token::Ident(name) if name.eq_ignore_ascii_case("FETCH") => StatementEffect::ReadOnly,
+        Token::Ident(name) if name.eq_ignore_ascii_case("CLOSE") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("SET") => StatementEffect::SessionLocal,
         Token::Ident(name) if name.eq_ignore_ascii_case("BEGIN") => {
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)

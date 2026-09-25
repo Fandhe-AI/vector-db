@@ -76,7 +76,10 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::DropIndex(_)
         | SqlOutcome::Begin
         | SqlOutcome::Commit
-        | SqlOutcome::Rollback => None,
+        | SqlOutcome::Rollback
+        | SqlOutcome::DeclareCursor
+        | SqlOutcome::Fetch(_)
+        | SqlOutcome::CloseCursor => None,
     };
 
     assert_eq!(

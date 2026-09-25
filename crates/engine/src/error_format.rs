@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 31;
+    count = 32;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -210,6 +210,10 @@ define_error_classes! {
     /// TABLE-6・TASK-85（Issue #899）が追加。
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateColumn`] の写像。
     DuplicateColumn => ("42701", "DUPLICATE_COLUMN"),
+    /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
+    /// 存在しない（`34000`）。WIRE-15・TASK-218 が追加。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidCursorName`] の写像。
+    InvalidCursorName => ("34000", "INVALID_CURSOR_NAME"),
     /// `DROP TABLE`／`DROP VIEW` の対象に、それを参照するビューが 1 つ以上残って
     /// いるため削除を拒否した（`2BP01`。TABLE-18・SQL-23・TASK-205、Issue #909）。
     /// [`crate::catalog::CatalogError::DependentViewsExist`] の写像。依存する
