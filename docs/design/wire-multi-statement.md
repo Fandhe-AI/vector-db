@@ -147,6 +147,12 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
   対象外であり、HTTP への射影変更もない。
 - 3 クライアント e2e（`three_client_e2e.rs` 等）への追加は opt-in の任意
   追加に留め、本 Issue では必須にしない。
+- `COPY`（WIRE-17・TASK-220・Issue #939）: `COPY` は 1 つの `'Q'` メッセージ
+  中で単独文でなければならない（`handshake::post_auth_loop` が `COPY` の
+  覗き見判定をメッセージ全文へ適用してから本モジュールの複数文経路か
+  `crate::copy::run` かへ分岐するため）。混在時の詳細な fail-closed 挙動は
+  `docs/design/wire-copy-protocol.md`「エラー処理・PostgreSQL 本家との
+  相違点」6. 参照。
 
 ## 挙動変化の明記（受理範囲の拡大）
 

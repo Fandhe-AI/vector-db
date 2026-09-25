@@ -2715,17 +2715,22 @@ fn parse_create_function(tokens: &[Token]) -> Result<(String, Vec<String>, Expr)
 ///    （不存在は [`SqlSurfaceError::UndefinedTable`]）
 pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
-    validate_sql_tokens(tokens, lookup)
+    validate_sql_tokens(&tokens, lookup)
 }
 
-/// [`validate_sql`] の字句解析済みトークン列版（Issue #935・WIRE-12）。
-/// `sql::params`（拡張クエリプロトコルの `$n` 束縛。Bind 時に `Token::Param` を
-/// 実値の `Token::StringLiteral` へ置換したトークン列を、SQL テキストを経由せず
-/// 直接この関数へ渡す入口）が、SQL テキスト経由の [`validate_sql`] と完全に同一の
-/// 判定順序・エラー分類を再利用するための分割（挙動は不変。[`validate_sql`] は
-/// 字句解析した上でここへ委譲するだけの薄いラッパーになった）。
+/// [`validate_sql`] の本体（Issue #939・WIRE-17。COPY プロトコル対応の一環）。
+/// トークン列を受け取ることで、`COPY (<SELECT>) TO STDOUT`
+/// （[`validate_copy_to_tokens`]）の内側 SELECT のように、外側の許可リストが
+/// 括弧で括り出した部分トークン列を再トークナイズせずに検証できる
+/// （`validate_insert_tokens`・Issue #485 と同じ「トークン列を受け取る本体 /
+/// 文字列を受け取り委譲する公開 API」という分割方針）。`validate_sql` は本関数へ
+/// 委譲するだけで挙動・エラー契約は分割前と不変。
+///
+/// `sql::params`（Issue #935・WIRE-12。拡張クエリプロトコルの `$n` 束縛）も、Bind 時に
+/// `Token::Param` を実値のトークンへ置換したトークン列を SQL テキストを経由せず
+/// この関数へ渡し、[`validate_sql`] と同一の判定順序・エラー分類を再利用する。
 pub(crate) fn validate_sql_tokens(
-    tokens: Vec<Token>,
+    tokens: &[Token],
     lookup: &impl TableLookup,
 ) -> Result<Statement, SqlSurfaceError> {
     // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
@@ -2759,7 +2764,7 @@ pub(crate) fn validate_sql_tokens(
             || contains_group_by);
     match tokens.first() {
         Some(Token::Keyword(Keyword::Select)) if is_aggregate_select => {
-            let shape = parse_aggregate_shape(&tokens)?;
+            let shape = parse_aggregate_shape(tokens)?;
             let exists = lookup.table_exists(&shape.table_name)?;
             if !exists {
                 return Err(SqlSurfaceError::undefined_table(shape.table_name));
@@ -2771,7 +2776,7 @@ pub(crate) fn validate_sql_tokens(
                 group_by: shape.group_by,
             }))
         }
-        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(&tokens)? {
+        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(tokens)? {
             ParsedSelect::Search(shape) => {
                 let exists = lookup.table_exists(&shape.table_name)?;
                 if !exists {
@@ -2804,11 +2809,11 @@ pub(crate) fn validate_sql_tokens(
             }
         },
         _ if is_set_statement => {
-            let value = parse_set_search_mode(&tokens)?;
+            let value = parse_set_search_mode(tokens)?;
             Ok(Statement::SetSearchMode { value })
         }
         _ if is_create_function_statement => {
-            let (name, params, body) = parse_create_function(&tokens)?;
+            let (name, params, body) = parse_create_function(tokens)?;
             Ok(Statement::CreateFunction { name, params, body })
         }
         // TASK-78（SQL-6）: `EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置
@@ -3193,6 +3198,268 @@ pub(crate) fn validate_truncate_tokens(
         table_name: shape.table_name,
         operation_id: shape.operation_id,
     })
+}
+
+/// `COPY ... FROM STDIN`／`COPY (...) TO STDOUT` の転送形式（Issue #939・
+/// WIRE-17）。`text`（PostgreSQL 互換のタブ区切り・バックスラッシュエスケープ）・
+/// `csv`（RFC4180 風のカンマ区切り・二重引用符エスケープ）の 2 値のみを受理し、
+/// `HEADER`・`DELIMITER`・`NULL`・`QUOTE`・binary 形式（WIRE-14）は許可リスト外
+/// （`42601`）。フィールド分割・エスケープ解決の実体は [`crate::sql::copy`] が
+/// 担う（本モジュールは構文の許可リスト判定のみ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormat {
+    Text,
+    Csv,
+}
+
+/// 許可形状の構造判定を通過した `COPY <table> (<col>[, <col>]*) FROM STDIN
+/// [WITH] [(FORMAT text|csv)] USING OPERATION_ID '<id>'` 文（Issue #939・
+/// WIRE-17・TASK-220）。`ValidatedInsert` と同様、本モジュールが保証するのは
+/// ここまでの構造情報のみで、列名・値の意味論的妥当性・実際のフレーム
+/// デコードは [`crate::sql::copy`] の責務とする。`RETURNING`・`ON CONFLICT`・
+/// ファイル名指定（`FROM '<path>'`）は許可リスト外。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCopyFrom {
+    /// INTO 相当で指定され、カタログ存在確認を通過したテーブル名。
+    pub table_name: String,
+    /// 列リストの宣言順（`id` 疑似列を必ず含む。重複はここで拒否済み）。
+    pub columns: Vec<String>,
+    pub format: CopyFormat,
+    /// 文末専用句で搬送された、検証済みの `operation_id`。句の欠落・明示
+    /// `NULL` はいずれも `None`（`ValidatedInsert::operation_id` と同じ契約。
+    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション
+    /// 開始前に `23502` で拒否するため、この構成では常に `Some`）。
+    pub operation_id: Option<OperationId>,
+}
+
+/// 許可形状の構造判定を通過した `COPY (<SELECT>) TO STDOUT [[WITH]
+/// (FORMAT text|csv)]` 文（Issue #939・WIRE-17・TASK-220）。内側 `SELECT` は
+/// 広域取得（[`ValidatedScan`]。SQL-15・Issue #454）の形のみを受理し
+/// （順位付け `ORDER BY`／`USING PLAN`・集計は `42601`）、[`validate_sql_tokens`]
+/// と単一の実装を共有する（第 2 の SELECT パーサーを持たない）。テーブル形
+/// `COPY <table> TO STDOUT` は対象外（許可リスト外）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedCopyTo {
+    pub inner: Box<ValidatedScan>,
+    pub format: CopyFormat,
+}
+
+/// [`validate_copy`]（Issue #939・WIRE-17）が返す COPY statement 種別。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CopyStatement {
+    From(ValidatedCopyFrom),
+    To(ValidatedCopyTo),
+}
+
+/// `(<items>)` の対応する丸括弧を見つけ、内側・外側後続のトークン列へ分割する
+/// （`COPY (<SELECT>) TO STDOUT` の内側 SELECT を切り出すための唯一の実装。
+/// 文字列リテラル内の `(`/`)` は字句解析時点で既に 1 個の `Token::StringLiteral`
+/// へ吸収されているため、本関数はトークン列上の `Token::Punct('('/')')` だけを
+/// 深さで数えれば安全に対応を取れる）。`tokens` の先頭は必ず `(` であること
+/// （呼び出し元が確認済み）。添字直接アクセス（`coding-rust.md`）を避け
+/// `enumerate`＋`get` で処理する。
+fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurfaceError> {
+    let mut depth: i32 = 0;
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = tokens.get(1..i).ok_or_else(|| {
+                        SqlSurfaceError::unsupported("malformed COPY (...) clause")
+                    })?;
+                    let after = tokens.get(i + 1..).ok_or_else(|| {
+                        SqlSurfaceError::unsupported("malformed COPY (...) clause")
+                    })?;
+                    return Ok((inner, after));
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(SqlSurfaceError::unsupported(
+        "unterminated parenthesized expression in COPY statement",
+    ))
+}
+
+/// `[WITH] (FORMAT text|csv)` を受理する（省略時は [`CopyFormat::Text`]）。
+/// `WITH` を書いた場合は直後の `(FORMAT ...)` を必須とし、無ければ `42601` で
+/// 拒否する（値を伴わない `WITH` 句を既定 `Text` として誤受理しない）。
+/// `COPY ... FROM STDIN`・`COPY (...) TO STDOUT` の両方から共有する（Issue #939）。
+fn parse_optional_copy_format(p: &mut Parser) -> Result<CopyFormat, SqlSurfaceError> {
+    // `WITH` を消費したら `(FORMAT ...)` の丸括弧を必須とする。`WITH` の直後に
+    // `(` が続かない場合（値を伴わない不正な `WITH` 句）は許可リスト外として
+    // `42601` で拒否する（WIRE-17 の許可形状〔`FORMAT text|csv` のみ〕・
+    // fail-closed 規約。Issue #939 codex-review 指摘の是正）。
+    let with_seen = p.peek_contextual_keyword("WITH");
+    if with_seen {
+        p.advance();
+    }
+    if !matches!(p.peek(), Some(Token::Punct('('))) {
+        if with_seen {
+            return Err(SqlSurfaceError::unsupported(
+                "COPY WITH clause must be followed by (FORMAT ...)",
+            ));
+        }
+        return Ok(CopyFormat::Text);
+    }
+    p.advance();
+    p.expect_contextual_keyword("FORMAT")?;
+    let raw = p.expect_ident()?;
+    let format = match raw.to_ascii_lowercase().as_str() {
+        "text" => CopyFormat::Text,
+        "csv" => CopyFormat::Csv,
+        _ => {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "unsupported COPY FORMAT: {raw}"
+            )))
+        }
+    };
+    p.expect_punct(')')?;
+    Ok(format)
+}
+
+/// `COPY <table> (<col>[, <col>]*) FROM STDIN [WITH] [(FORMAT text|csv)]
+/// USING OPERATION_ID '<id>' [;]` を構造判定する（Issue #939・WIRE-17）。
+fn validate_copy_from_tokens(
+    rest: &[Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let mut p = Parser::new(rest);
+    let table_name = p.expect_ident()?;
+
+    p.expect_punct('(')?;
+    let mut columns = vec![p.expect_ident()?];
+    while matches!(p.peek(), Some(Token::Punct(','))) {
+        p.advance();
+        if columns.len() >= MAX_INSERT_COLUMNS {
+            return Err(SqlSurfaceError::unsupported("too many COPY columns"));
+        }
+        columns.push(p.expect_ident()?);
+    }
+    p.expect_punct(')')?;
+
+    p.expect_keyword(Keyword::From)?;
+    p.expect_contextual_keyword("STDIN")?;
+
+    let format = parse_optional_copy_format(&mut p)?;
+
+    // 文末専用句の構造パースのみをここで行う（`parse_insert`／`parse_truncate`
+    // と同じ設計。必須化の判定は `mode.require` へ委譲する）。
+    let operation_id = p.parse_operation_id_clause()?;
+    p.expect_end_of_statement()?;
+
+    mode.require(operation_id.as_ref())?;
+
+    let exists = lookup.table_exists(&table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(table_name));
+    }
+
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for c in &columns {
+        if !seen.insert(c.as_str()) {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "duplicate column in COPY column list: {c}"
+            )));
+        }
+    }
+    if !columns.iter().any(|c| c == "id") {
+        return Err(SqlSurfaceError::invalid_input(
+            "COPY column list must include the id pseudo-column",
+        ));
+    }
+
+    Ok(CopyStatement::From(ValidatedCopyFrom {
+        table_name,
+        columns,
+        format,
+        operation_id,
+    }))
+}
+
+/// `COPY (<SELECT>) TO STDOUT [[WITH] (FORMAT text|csv)] [;]` を構造判定する
+/// （Issue #939・WIRE-17）。`rest` の先頭は必ず `(` であること（呼び出し元
+/// [`validate_copy_tokens`] が確認済み）。内側 `SELECT` は
+/// [`validate_sql_tokens`] が返す [`Statement::Scan`]（広域取得。SQL-15）のみを
+/// 受理する（第 2 の SELECT パーサーを持たない設計。`Select`（順位付き）・
+/// `Aggregate`・`Explain`・`SetSearchMode`・`CreateFunction` はいずれも
+/// `42601` へ落とす）。
+fn validate_copy_to_tokens(
+    rest: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let (inner, after) = split_parenthesized(rest)?;
+    let scan = match validate_sql_tokens(inner, lookup)? {
+        Statement::Scan(v) => v,
+        _ => {
+            return Err(SqlSurfaceError::unsupported(
+                "COPY (...) TO STDOUT only supports a non-ranked SELECT (no ORDER BY / USING PLAN / aggregate)",
+            ))
+        }
+    };
+
+    let mut p = Parser::new(after);
+    p.expect_contextual_keyword("TO")?;
+    p.expect_contextual_keyword("STDOUT")?;
+    let format = parse_optional_copy_format(&mut p)?;
+    p.expect_end_of_statement()?;
+
+    Ok(CopyStatement::To(ValidatedCopyTo {
+        inner: Box::new(scan),
+        format,
+    }))
+}
+
+/// `COPY` 文（`FROM STDIN`／`TO STDOUT` の両形。Issue #939・WIRE-17・TASK-220）を
+/// トークン化し、許可リスト形式で構造検証してから、`FROM STDIN` 形は `lookup` を
+/// 通じて対象テーブルがカタログに実在するかまで確認する公開 API。`validate_sql`・
+/// `validate_insert` と同じく独立したエントリポイントとする（`COPY` は
+/// [`crate::sql::copy::is_copy_statement`] による先頭トークンの覗き見判定を
+/// 経て `core.rs::execute_sql_in_session` から呼ばれる想定であり、`validate_sql`
+/// の許可形状には含めない）。
+///
+/// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）。
+/// `FROM STDIN` 形の `operation_id` 必須化ガード（`mode.require`。TASK-92・
+/// RECOVER-1）はカタログ照会より前に評価する（[`validate_insert`] と同じ理由。
+/// `TO STDOUT` 形は書き込みを伴わないため `operation_id` を持たない）。
+pub fn validate_copy(
+    sql: &str,
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_copy_tokens(&tokens, lookup, mode)
+}
+
+/// [`validate_copy`] の本体。トークン列を受け取ることで、呼び出し元
+/// （`core.rs::execute_sql_in_session` が先頭トークン判定のために既に
+/// トークナイズ済みの場合）が同一 SQL 文字列を再トークナイズせずに済む
+/// （`validate_insert_tokens`・Issue #485 と同じ設計）。
+pub(crate) fn validate_copy_tokens(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    mode: LedgerMode,
+) -> Result<CopyStatement, SqlSurfaceError> {
+    let (first, rest) = tokens
+        .split_first()
+        .ok_or_else(|| SqlSurfaceError::unsupported("empty COPY statement"))?;
+    match first {
+        Token::Ident(name) if name.eq_ignore_ascii_case("COPY") => {}
+        other => {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "expected COPY, got {other:?}"
+            )))
+        }
+    }
+
+    if matches!(rest.first(), Some(Token::Punct('('))) {
+        validate_copy_to_tokens(rest, lookup)
+    } else {
+        validate_copy_from_tokens(rest, lookup, mode)
+    }
 }
 
 /// `UPDATE` の `WHERE` 句が単一行・id 指定形（SQL-17、TASK-191）か述語形
