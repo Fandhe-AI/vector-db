@@ -12,7 +12,7 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
-use engine::sql::mode::SessionState;
+use engine::sql::mode::{SearchMode, SessionState};
 use engine::sql::transaction::{TransactionLimits, TransactionStatus};
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
@@ -225,6 +225,71 @@ fn nested_begin_fails_the_transaction() {
         SqlOutcome::Rollback
     );
     assert_eq!(txn.status(), TransactionStatus::Idle);
+}
+
+/// Failed 中の `COMMIT`（`25P02`）が BEGIN 時点の `SessionState` を失わせない
+/// 回帰テスト（Issue #942 レビュー指摘）。`BEGIN` 前にセッション状態を既定値
+/// から変えておき、Failed 遷移 → `COMMIT` 拒否 → `ROLLBACK` の後も BEGIN 時点の
+/// `search_mode` へ復元されることを固定する（既定値へ上書きされると `None` に
+/// なる）。トランザクション内で変えた値が巻き戻ることもあわせて確認する。
+#[test]
+fn commit_while_failed_preserves_session_state_at_begin_for_rollback() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "SET search_mode = 'precision'",
+        )
+        .expect("set search_mode before begin");
+    assert_eq!(session.search_mode(), Some(SearchMode::Precision));
+
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "SET search_mode = 'recall'",
+        )
+        .expect("set search_mode inside transaction");
+    assert_eq!(session.search_mode(), Some(SearchMode::Recall));
+
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect_err("nested BEGIN is rejected");
+    assert_eq!(err.wire_code(), "25001");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+
+    // Failed 中の COMMIT は 25P02 で拒否され、Failed のまま据え置かれる。
+    for _ in 0..2 {
+        let err = engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "COMMIT")
+            .expect_err("commit is rejected while failed");
+        assert_eq!(err.wire_code(), "25P02");
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+    }
+
+    assert_eq!(
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback recovers from failed"),
+        SqlOutcome::Rollback
+    );
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+    assert_eq!(
+        session.search_mode(),
+        Some(SearchMode::Precision),
+        "ROLLBACK must restore the session state captured at BEGIN"
+    );
 }
 
 #[test]

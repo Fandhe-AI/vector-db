@@ -2707,16 +2707,9 @@ impl EngineCore {
                 txn.mark_written(&stmt.table_name);
                 Ok(crate::sql::SqlOutcome::Truncate(outcome))
             }
-            ParsedSql::Statement(Statement::SetSearchMode { .. })
-            | ParsedSql::Statement(Statement::CreateFunction { .. }) => self
-                .execute_validated_in_session(
-                    ctx,
-                    session,
-                    match parsed {
-                        ParsedSql::Statement(stmt) => stmt.clone(),
-                        _ => unreachable!(),
-                    },
-                ),
+            ParsedSql::Statement(
+                stmt @ (Statement::SetSearchMode { .. } | Statement::CreateFunction { .. }),
+            ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
             ParsedSql::Statement(stmt @ Statement::Select(v)) => {
                 self.read_only_in_active_txn(ctx, session, txn, &v.table_name, stmt.clone())
             }

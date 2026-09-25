@@ -62,12 +62,13 @@ pub(crate) fn validate_transaction_control_tokens(
         ));
     };
 
-    let rest = &tokens[1..];
-    let rest = match rest.first() {
-        Some(Token::Ident(kw))
+    // 受信 SQL 由来のトークン列のため添字スライスを使わず `split_first` で進める。
+    let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
+    let rest = match rest.split_first() {
+        Some((Token::Ident(kw), tail))
             if kw.eq_ignore_ascii_case("WORK") || kw.eq_ignore_ascii_case("TRANSACTION") =>
         {
-            &rest[1..]
+            tail
         }
         _ => rest,
     };
@@ -187,8 +188,7 @@ impl<'e> SessionTransaction<'e> {
                 // 入れ子の BEGIN はトランザクションを Failed へ遷移させる
                 // （PostgreSQL の "WARNING" 相当ではなく fail-closed に倒す。
                 // `docs/design/explicit-transaction.md` 参照）。
-                let session_at_begin = self.active_session_at_begin();
-                self.state = TxnState::Failed { session_at_begin };
+                self.fail();
                 Err(SqlSurfaceError::ActiveSqlTransaction)
             }
             TxnState::Failed { .. } => Err(SqlSurfaceError::InFailedSqlTransaction),
@@ -220,10 +220,12 @@ impl<'e> SessionTransaction<'e> {
                 self.state = TxnState::Idle;
                 result
             }
-            TxnState::Failed { .. } => {
-                self.state = TxnState::Failed {
-                    session_at_begin: SessionState::default(),
-                };
+            TxnState::Failed { session_at_begin } => {
+                // `Failed` のまま据え置く。`BEGIN` 時点の `SessionState` は後続の
+                // `ROLLBACK` が復元に使うため、取り出したものをそのまま戻す
+                // （既定値で上書きすると `SET search_mode`・`CREATE FUNCTION` 等の
+                // BEGIN 前のセッション状態が失われる）。
+                self.state = TxnState::Failed { session_at_begin };
                 Err(SqlSurfaceError::InFailedSqlTransaction)
             }
         }
@@ -318,13 +320,6 @@ impl<'e> SessionTransaction<'e> {
             self.state = TxnState::Failed {
                 session_at_begin: active.session_at_begin,
             };
-        }
-    }
-
-    fn active_session_at_begin(&self) -> SessionState {
-        match &self.state {
-            TxnState::Active(active) => active.session_at_begin.clone(),
-            _ => SessionState::default(),
         }
     }
 }
