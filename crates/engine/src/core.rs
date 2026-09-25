@@ -1196,7 +1196,11 @@ fn dictionary_required_columns(
 /// `EngineCore::run_scan_plan` 参照）を保持する。
 #[derive(Debug)]
 pub enum CopyPlan {
-    From(crate::sql::copy::CopyInSession),
+    // `Box` で包む: `To` 分岐（`QueryResult` の内容量に比例しない固定サイズ）との
+    // enum サイズ差が大きく、`clippy::large_enum_variant` に抵触するため
+    // （TableSchema へのフィールド追加〔TABLE-19・Issue #901〕で閾値を超えた）。
+    // 意味論は無変更（`CopyInSession` の所有権を移す先が Box 経由になるだけ）。
+    From(Box<crate::sql::copy::CopyInSession>),
     To(
         crate::sql::allowlist::CopyFormat,
         crate::sql::exec::QueryResult,
@@ -3761,14 +3765,16 @@ impl EngineCore {
         match stmt {
             crate::sql::allowlist::CopyStatement::From(v) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
-                Ok(CopyPlan::From(crate::sql::copy::CopyInSession::new(
-                    v.table_name,
-                    v.columns,
-                    v.format,
-                    v.operation_id,
-                    schema,
-                    self.batch_limits,
-                )?))
+                Ok(CopyPlan::From(Box::new(
+                    crate::sql::copy::CopyInSession::new(
+                        v.table_name,
+                        v.columns,
+                        v.format,
+                        v.operation_id,
+                        schema,
+                        self.batch_limits,
+                    )?,
+                )))
             }
             crate::sql::allowlist::CopyStatement::To(v) => {
                 let (read_txn, schema) = self.read_txn_with_schema(v.inner.table_name())?;

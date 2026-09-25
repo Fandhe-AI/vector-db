@@ -610,7 +610,7 @@ pub(crate) fn run(
     match engine.begin_copy(ctx, session, sql) {
         Ok(CopyPlan::To(format, result)) => run_copy_to(stream, format, &result)
             .map(|()| crate::extended_query::LoopSignal::Continue),
-        Ok(CopyPlan::From(copy_session)) => run_copy_from(stream, engine, ctx, copy_session),
+        Ok(CopyPlan::From(copy_session)) => run_copy_from(stream, engine, ctx, *copy_session),
         Err(e) => {
             respond_sql_error(stream, &e).map(|()| crate::extended_query::LoopSignal::Continue)
         }

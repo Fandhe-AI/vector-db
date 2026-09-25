@@ -276,9 +276,9 @@ mod tests {
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
 
     fn schema_with_body() -> TableSchema {
-        TableSchema {
-            name: "documents".to_string(),
-            columns: vec![
+        TableSchema::new(
+            "documents",
+            vec![
                 ColumnDef {
                     name: "embedding".to_string(),
                     ty: ColumnType::Vector(2),
@@ -290,7 +290,7 @@ mod tests {
                     nullable: false,
                 },
             ],
-        }
+        )
     }
 
     fn sample_expansion() -> QueryExpansion {
@@ -357,14 +357,14 @@ mod tests {
 
     #[test]
     fn bind_expansion_rejects_missing_body_column() {
-        let schema = TableSchema {
-            name: "documents".to_string(),
-            columns: vec![ColumnDef {
+        let schema = TableSchema::new(
+            "documents",
+            vec![ColumnDef {
                 name: "embedding".to_string(),
                 ty: ColumnType::Vector(2),
                 nullable: false,
             }],
-        };
+        );
         let stmt = ValidatedStatement::new(
             "documents".to_string(),
             crate::sql::allowlist::Projection::All,
