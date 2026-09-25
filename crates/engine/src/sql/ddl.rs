@@ -1,22 +1,28 @@
-//! DDL（`DROP TABLE` 等）の実行権限ゲートと実行本体（SQL-23、TASK-203、
-//! Issue #902）。
+//! DDL（`CREATE TABLE`・`DROP TABLE` 等）の実行権限ゲートと実行本体
+//! （SQL-23・TASK-85・TASK-202・TASK-203、Issue #899・#902）。
 //!
 //! 責務境界: `core.rs::EngineCore::execute_parsed_in_session` の
-//! `ParsedSql::DropTable` 分岐から呼ばれる唯一の入口として、DDL 実行権限の
-//! 判定（[`require_ddl_permission`]。全 DDL 文が将来通る単一の判定点。
-//! #899〜#901・#907〜#909 の `CREATE TABLE`／`ALTER TABLE`／`VIEW`／
+//! `ParsedSql::CreateTable`／`ParsedSql::DropTable` 分岐から呼ばれる唯一の
+//! 入口として、DDL 実行権限の判定（[`require_ddl_permission`]。全 DDL 文が
+//! 通る単一の判定点。#900・#901・#907〜#909 の `ALTER TABLE`／`VIEW`／
 //! `FOREIGN KEY` 等もここを経由する想定）と、`crate::catalog::Storage::
-//! drop_table`（既存のカタログ削除本体。`PolicyContext` を取らない全テナント
-//! 対象の DDL）を SQL 表層の [`crate::sql::allowlist::SqlSurfaceError`] 契約へ
-//! 写像する実行本体（[`execute_drop_table`]）を担う。
+//! create_table`／`drop_table`（既存のカタログ反映・削除本体。いずれも
+//! `PolicyContext` を取らない全テナント対象の DDL）を SQL 表層の
+//! [`crate::sql::allowlist::SqlSurfaceError`] 契約へ写像する実行本体
+//! （[`execute_create_table`]・[`execute_drop_table`]）を担う。構文の許可
+//! リスト判定は `sql::allowlist` の管轄、ディスパッチ（先頭トークンの
+//! 覗き見・権限ゲートの呼び出し順序）は `core.rs` の管轄。
 //!
-//! **判定順序（fail-closed）**: 構文検証（`sql::allowlist::validate_drop_table_tokens`。
-//! カタログ照会なし）→ [`require_ddl_permission`]（`42501`。カタログ照会なし・
-//! 書き込みトランザクション未開始）→ [`execute_drop_table`]（書き込み
-//! トランザクション内で対象テーブルの存在を判定。`42P01`）。権限を持たない
-//! 主体には対象テーブルの有無を問わず常に `42501` を返し、DDL 権限を
-//! テーブル存在のオラクルにしない（security.md「エラー・ログ経由で他テナントの
-//! データ・存在情報を漏らさない」）。
+//! **判定順序（fail-closed。決定的）**: 構文検証
+//! （`sql::allowlist::validate_create_table_tokens`／
+//! `validate_drop_table_tokens`。いずれもカタログ照会を一切行わない）→
+//! [`require_ddl_permission`]（`42501`。カタログ照会なし・書き込み
+//! トランザクション未開始）→ 実行本体（[`execute_create_table`]／
+//! [`execute_drop_table`]。書き込みトランザクション内で対象テーブルの
+//! 存在・重複を判定。`42P07`／`42P01`）。権限を持たない主体には対象
+//! テーブルの有無を問わず常に `42501` を返し、DDL 権限をテーブル存在の
+//! オラクルにしない（security.md「エラー・ログ経由で他テナントの
+//! データ・存在情報を漏らさない」対応）。
 //!
 //! [`crate::policy::PolicyContext`] はテナント ID と可視性のみを運び認証主体を
 //! 持たないため、DDL 権限は [`crate::sql::mode::SessionState::ddl_allowed`]
@@ -25,21 +31,71 @@
 //! 別軸の権限であり（テーブル・カタログは全テナント共有）、RLS の判定を
 //! 一切変更しない。
 
-use crate::catalog::CatalogError;
-use crate::sql::allowlist::{SqlSurfaceError, ValidatedDropTable};
+use crate::catalog::{CatalogError, TableSchema};
+use crate::sql::allowlist::{SqlSurfaceError, ValidatedCreateTable, ValidatedDropTable};
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
 
-/// DDL 実行権限の唯一の判定点（Issue #902。#899〜#901・#907〜#909 の他の DDL も
-/// 将来ここを経由する想定）。`session.ddl_allowed()` が `false`（既定）の場合、
-/// カタログ照会・書き込みトランザクション開始のいずれよりも前に
-/// `SqlSurfaceError::InsufficientPrivilege`（`42501`）へ fail-closed に落とす。
+/// DDL 実行権限の唯一の判定点。`session.ddl_allowed()` が `false`（既定）の
+/// 場合、カタログ照会・書き込みトランザクション開始のいずれよりも前に
+/// [`SqlSurfaceError::InsufficientPrivilege`]（`42501`）へ fail-closed に落とす。
 pub(crate) fn require_ddl_permission(session: &SessionState) -> Result<(), SqlSurfaceError> {
     if session.ddl_allowed() {
         Ok(())
     } else {
         Err(SqlSurfaceError::InsufficientPrivilege)
     }
+}
+
+/// `CREATE TABLE`（SQL-23・TASK-85）の成功応答。行数・件数のいずれも返さない
+/// （[`DropTableOutcome`] と同じ設計。DDL はテナント横断の共有資源
+///〔カタログ〕を変更するのみで、テナント固有の件数概念を持たない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CreateTableOutcome {}
+
+/// 構造検証済みの `CREATE TABLE`（[`ValidatedCreateTable`]）をカタログへ反映する
+/// （SQL-23・TASK-85・TABLE-4）。実行本体は既存の [`Storage::create_table`]
+/// （単一 write トランザクション内で存在確認・挿入・世代進行・commit を行う。
+/// TOCTOU なし）にそのまま委譲し、第 2 の DDL 実行器を作らない。
+///
+/// `CatalogError` の写像:
+/// - `TableAlreadyExists` → [`SqlSurfaceError::DuplicateTable`]（`42P07`）
+/// - `Invalid`（列数・`VECTOR` 列複数宣言等の意味論的不正。列数・識別子形状の
+///   大半は [`crate::sql::allowlist::validate_create_table_tokens`] が構造検証
+///   段階で既に拒否済みのため、ここに到達するのは主に `VECTOR` の次元範囲・
+///   複数 `VECTOR` 列宣言）→ [`SqlSurfaceError::unsupported`]（`42601`）
+/// - その他（`redb` I/O 等）→ `SqlSurfaceError::Internal`（`XX000`。詳細を
+///   クライアントへ渡さない。security.md「情報漏えい」対応）
+pub(crate) fn execute_create_table(
+    storage: &Storage,
+    validated: &ValidatedCreateTable,
+) -> Result<CreateTableOutcome, SqlSurfaceError> {
+    let schema = TableSchema::new(validated.table_name.clone(), validated.columns.clone());
+    storage.create_table(&schema).map_err(|e| match e {
+        CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
+        CatalogError::Invalid(detail) => {
+            SqlSurfaceError::unsupported(format!("invalid table schema: {detail}"))
+        }
+        CatalogError::Backend(_)
+        | CatalogError::CorruptSchema(_)
+        | CatalogError::TableNotFound(_)
+        | CatalogError::ColumnAlreadyExists(_)
+        | CatalogError::RowNotFound(_)
+        | CatalogError::IncompatibleRowKeyFormat
+        | CatalogError::TableGenerationCounterOverflow
+        | CatalogError::TypeNotFound(_)
+        | CatalogError::TypeAlreadyExists(_)
+        | CatalogError::DependentObjectsStillExist(_)
+        // `ColumnNotFound`／`ProtectedColumn`／`IncompatibleTypeChange` は
+        // `ALTER TABLE`（Issue #901・`Storage::alter_table_drop_column` 等）
+        // 専用の変種で、`Storage::create_table` からは返らない（到達不能）。
+        | CatalogError::ColumnNotFound(_)
+        | CatalogError::ProtectedColumn(_)
+        | CatalogError::IncompatibleTypeChange { .. } => SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        },
+    })?;
+    Ok(CreateTableOutcome {})
 }
 
 /// `DROP TABLE <table>`（SQL-23、TASK-203、Issue #902）の成功応答。
@@ -75,7 +131,7 @@ pub(crate) fn execute_drop_table(
 /// （`catalog::table_lookup_error` と同じ役割分担だが、`TableNotFound` を
 /// `Ok(false)` ではなく `42P01` 応答へ写像する点が異なるため独立させる）。
 /// エラー文言にテナント・行内容・redb 内部詳細は含めない
-/// （security.md「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」）。
+/// （security.md「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」対応）。
 fn map_drop_table_error(e: CatalogError) -> SqlSurfaceError {
     match e {
         // `name` は字句解析済みの識別子（既に長さ上限の対象）で、`CatalogError`
@@ -121,5 +177,66 @@ mod tests {
     fn insufficient_privilege_client_message_has_no_identifying_detail() {
         let msg = SqlSurfaceError::InsufficientPrivilege.client_message();
         assert_eq!(msg, "permission denied for DDL statement");
+    }
+
+    /// 一時 DB の払い出しは Issue #173 の共通ヘルパー（`crate::test_util::
+    /// temp_db`）へ一本化する（重複実装を作らない）。
+    fn tmp_storage(label: &str) -> (Storage, crate::test_util::temp_db::CleanupGuard) {
+        let path = crate::test_util::temp_db::unique_db_path(label);
+        let guard = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        (storage, guard)
+    }
+
+    #[test]
+    fn execute_create_table_succeeds_for_new_table() {
+        let (storage, _guard) = tmp_storage("succeeds");
+        let validated = ValidatedCreateTable {
+            table_name: "docs".to_string(),
+            columns: vec![
+                crate::catalog::ColumnDef::new(
+                    "embedding",
+                    crate::catalog::ColumnType::Vector(4),
+                    false,
+                ),
+                crate::catalog::ColumnDef::new("body", crate::catalog::ColumnType::Text, true),
+            ],
+        };
+        execute_create_table(&storage, &validated).expect("create table must succeed");
+        let schema = storage.get_table_schema("docs").expect("schema must exist");
+        assert_eq!(schema.columns.len(), 2);
+    }
+
+    #[test]
+    fn execute_create_table_rejects_duplicate_name() {
+        let (storage, _guard) = tmp_storage("duplicate-name");
+        let validated = ValidatedCreateTable {
+            table_name: "docs".to_string(),
+            columns: vec![crate::catalog::ColumnDef::new(
+                "body",
+                crate::catalog::ColumnType::Text,
+                true,
+            )],
+        };
+        execute_create_table(&storage, &validated).expect("first create must succeed");
+        let err = execute_create_table(&storage, &validated)
+            .expect_err("second create with same name must fail");
+        assert!(matches!(err, SqlSurfaceError::DuplicateTable { .. }));
+        assert_eq!(err.wire_code(), "42P07");
+    }
+
+    #[test]
+    fn execute_create_table_rejects_two_vector_columns() {
+        let (storage, _guard) = tmp_storage("two-vector");
+        let validated = ValidatedCreateTable {
+            table_name: "docs".to_string(),
+            columns: vec![
+                crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),
+                crate::catalog::ColumnDef::new("b", crate::catalog::ColumnType::Vector(4), false),
+            ],
+        };
+        let err = execute_create_table(&storage, &validated)
+            .expect_err("two VECTOR columns must be rejected");
+        assert_eq!(err.wire_code(), "42601");
     }
 }

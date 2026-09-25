@@ -191,22 +191,24 @@ pub fn resolve_mode_with_planner(
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
     search_mode: Option<SearchMode>,
+    /// DDL（`CREATE TABLE`・`DROP TABLE` 等）実行権限（SQL-23・TASK-202・
+    /// TASK-203、Issue #899・#902）。既定 `false`（fail-closed。
+    /// `#[derive(Default)]` により未設定接続・NoSQL 表層・既存テストが使う
+    /// `SessionState::default()` は構造上すべての DDL を実行できない）。
+    ///
+    /// [`crate::policy::PolicyContext`] はテナント ID と可視性のみを運び認証主体を
+    /// 持たないため、DDL 権限はテナント境界とは別軸の権限として本フィールドが
+    /// 担う（テーブル・カタログは全テナント共有であり、DDL 文はテナント
+    /// スコープの操作ではない）。付与は認証層（wire-server の handshake）が
+    /// 認証成功後に 1 回だけ行う契約——SQL 文経由で自身の権限を昇格する経路は
+    /// 構造的に存在しない（[`Self::allow_ddl`] 以外に本フィールドを変更する
+    /// 公開手段を持たない）。`sql::ddl::require_ddl_permission` が唯一の判定点。
+    ddl_allowed: bool,
     /// TASK-79（SQL-9）: `CREATE FUNCTION` で登録した宣言的 UDF のセッション単位
     /// レジストリ。`SessionState` 自体が接続（＝認証済みテナント）単位の値型であるため、
     /// UDF 定義が他接続・他テナントへ漏れる経路は構造上存在しない。永続化しない
     /// （`crate::sql::udf_call` モジュールドキュメント参照）。
     udfs: crate::sql::udf_call::UdfRegistry,
-    /// DDL 実行権限（SQL-23、TASK-203、Issue #902）。既定 `false`（fail-closed。
-    /// `#[derive(Default)]` により未設定接続は必ず拒否側になる）。
-    ///
-    /// [`crate::policy::PolicyContext`] はテナント ID と可視性のみを運び認証主体を
-    /// 持たないため、DDL 権限はテナント境界とは別軸の権限として本フィールドが
-    /// 担う（テーブル・カタログは全テナント共有であり、`DROP TABLE` はテナント
-    /// スコープの操作ではない）。付与は認証層（wire-server の handshake）が
-    /// 認証成功後に 1 回だけ行う契約——SQL 文経由で自身の権限を昇格する経路は
-    /// 構造的に存在しない（[`Self::allow_ddl`] 以外に本フィールドを変更する
-    /// 公開手段を持たない）。
-    ddl_allowed: bool,
 }
 
 impl SessionState {
