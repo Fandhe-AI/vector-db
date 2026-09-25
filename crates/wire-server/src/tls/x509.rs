@@ -250,13 +250,16 @@ struct ParsedCertificate {
 
 /// `AlgorithmIdentifier ::= SEQUENCE { algorithm OBJECT IDENTIFIER,
 /// parameters ANY DEFINED BY algorithm OPTIONAL }`（RFC 5280 §4.1.1.2）の
-/// 構造を検査する。`tbsCertificate.signature`・外側 `signatureAlgorithm`
-/// はいずれもこの形を満たさなければならないが、両者は `read_any` で
-/// タグが `SEQUENCE` であることしか確認していなかったため、algorithm OID
-/// を持たない空 SEQUENCE 同士でも DER バイト列一致検査（手順 5）を
-/// すり抜けて受理されてしまっていた。ここで「先頭に OID が 1 個存在し、
-/// 続く要素は任意の parameters 高々 1 個までで、それ以外の余剰要素が
-/// 無い」ことを検査し、手順 5 の一致検査より前に必ず通す。
+/// 構造を検査する。`tbsCertificate.signature`・外側 `signatureAlgorithm`・
+/// `subjectPublicKeyInfo` の AlgorithmIdentifier はいずれもこの形を
+/// 満たさなければならないが、`read_any` でタグが `SEQUENCE` であることしか
+/// 確認していなかったため、algorithm OID を持たない空 SEQUENCE や、
+/// 切り詰められた OID・複数の余剰 TLV を含む不正な AlgorithmIdentifier が
+/// そのまま受理されてしまっていた（signature 側は DER バイト列一致検査
+/// （手順 5）を、SPKI 側は葉証明書限定の Ed25519 判定を、それぞれすり抜けて
+/// いた）。ここで「先頭に OID が 1 個存在し、続く要素は任意の parameters
+/// 高々 1 個までで、それ以外の余剰要素が無い」ことを検査し、signature 側は
+/// 手順 5 の一致検査より前に、SPKI 側は葉・中間を問わず必ず通す。
 fn validate_algorithm_identifier_structure(tlv_value: &[u8]) -> Result<(), X509Error> {
     let mut reader = DerReader::new(tlv_value);
     let oid = reader
@@ -269,6 +272,39 @@ fn validate_algorithm_identifier_structure(tlv_value: &[u8]) -> Result<(), X509E
         reader.read_any().map_err(|_| X509Error::Malformed)?;
     }
     reader.expect_end().map_err(|_| X509Error::Malformed)
+}
+
+/// serialNumber INTEGER（RFC 5280 §4.1.2.2）が「正の整数」「20 オクテット
+/// 以下」「最小符号化（不要な先頭 0x00 オクテットを持たない）」であることを
+/// 検査する。`serial.is_empty()` のみの検査では負数・ゼロ・21 オクテット
+/// 以上・非最小符号化（例: 先頭が `0x00 0x7f...` のように不要な `0x00` を
+/// 持つ）を受理してしまい、本パーサが起動時に通した証明書が RFC 5280
+/// 準拠の TLS クライアント側パーサからは不正として拒否されうる
+/// （Issue #963 レビュー指摘）。
+fn validate_serial_number(serial: &[u8]) -> Result<(), X509Error> {
+    let (&first, rest) = serial.split_first().ok_or(X509Error::Malformed)?;
+    // DER INTEGER の最上位ビットが立っていれば負数。RFC 5280 は
+    // serialNumber を正の整数と規定する。
+    if first & 0x80 != 0 {
+        return Err(X509Error::Malformed);
+    }
+    // 全オクテットが 0 ならゼロ（正の整数ではない）。
+    if serial.iter().all(|&b| b == 0) {
+        return Err(X509Error::Malformed);
+    }
+    // 最小符号化: 先頭が 0x00 で、かつ次のオクテットの最上位ビットが
+    // 立っていない場合、その 0x00 は符号ビット確保のために不要（非最小）。
+    if first == 0x00 {
+        if let Some(&second) = rest.first() {
+            if second & 0x80 == 0 {
+                return Err(X509Error::Malformed);
+            }
+        }
+    }
+    if serial.len() > 20 {
+        return Err(X509Error::Malformed);
+    }
+    Ok(())
 }
 
 /// OBJECT IDENTIFIER の値部分（BER/DER の base-128 可変長サブ識別子列）が
@@ -344,13 +380,12 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
         return Err(X509Error::UnsupportedVersion);
     }
 
-    // serialNumber INTEGER（空でないこと）。
+    // serialNumber INTEGER（正の整数・20 オクテット以下・最小符号化。
+    // RFC 5280 §4.1.2.2）。
     let serial = tbs
         .read_expected(TAG_INTEGER)
         .map_err(|_| X509Error::Malformed)?;
-    if serial.is_empty() {
-        return Err(X509Error::Malformed);
-    }
+    validate_serial_number(serial)?;
 
     // signature AlgorithmIdentifier（tbsCertificate 側）。外側の
     // signatureAlgorithm との DER バイト列一致検査は、モジュール doc の
@@ -392,6 +427,14 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     if spki_alg_tlv.tag != TAG_SEQUENCE {
         return Err(X509Error::Malformed);
     }
+    // SPKI 側の AlgorithmIdentifier も tbsCertificate.signature／外側
+    // signatureAlgorithm と同じ構造検査を通す（OID の整形式性・parameters
+    // 高々 1 個・余剰要素なし）。葉証明書では後続の check_leaf_public_key が
+    // Ed25519 OID 完全一致・parameters 不在を要求するため結果的に多くの
+    // 不正形を拒否できていたが、中間証明書にはその検査が無く、切り詰められた
+    // OID や複数の余剰 TLV を含む不正な AlgorithmIdentifier がそのまま
+    // 受理されていた（Issue #963 レビュー指摘）。
+    validate_algorithm_identifier_structure(spki_alg_tlv.value)?;
     let mut spki_alg_reader = DerReader::new(spki_alg_tlv.value);
     let spki_oid = spki_alg_reader
         .read_expected(TAG_OID)
@@ -915,6 +958,54 @@ mod tests {
         assert_eq!(
             check_leaf_public_key(OID_ED25519, false, &key_bits_unused, &expected).unwrap_err(),
             X509Error::InvalidPublicKey
+        );
+    }
+
+    #[test]
+    fn validate_serial_number_accepts_minimal_positive_values() {
+        assert!(validate_serial_number(&[0x01]).is_ok());
+        // 最上位ビットが立つ正の値は、符号ビット確保のための単一の 0x00
+        // 接頭辞が必須（かつそれのみ許容される）。
+        assert!(validate_serial_number(&[0x00, 0x80]).is_ok());
+        assert!(validate_serial_number(&[0x7f]).is_ok());
+        // 20 オクテットちょうどは受理する。
+        assert!(validate_serial_number(&[0x01; 20]).is_ok());
+    }
+
+    #[test]
+    fn validate_serial_number_rejects_negative_zero_and_oversized() {
+        assert_eq!(
+            validate_serial_number(&[]).unwrap_err(),
+            X509Error::Malformed
+        );
+        // 最上位ビットが立っている（DER INTEGER としては負数）。
+        assert_eq!(
+            validate_serial_number(&[0x80]).unwrap_err(),
+            X509Error::Malformed
+        );
+        assert_eq!(
+            validate_serial_number(&[0xff]).unwrap_err(),
+            X509Error::Malformed
+        );
+        // ゼロ（1 オクテット・複数オクテットいずれも）。
+        assert_eq!(
+            validate_serial_number(&[0x00]).unwrap_err(),
+            X509Error::Malformed
+        );
+        assert_eq!(
+            validate_serial_number(&[0x00, 0x00]).unwrap_err(),
+            X509Error::Malformed
+        );
+        // 非最小符号化: 次オクテットの最上位ビットが立っていないのに
+        // 先頭 0x00 を付けている。
+        assert_eq!(
+            validate_serial_number(&[0x00, 0x7f]).unwrap_err(),
+            X509Error::Malformed
+        );
+        // 21 オクテット（RFC 5280 の上限 20 を超える）。
+        assert_eq!(
+            validate_serial_number(&[0x01; 21]).unwrap_err(),
+            X509Error::Malformed
         );
     }
 

@@ -149,6 +149,43 @@ fn build_ed25519_leaf_certificate_der(
     ])
 }
 
+/// テスト専用: `build_ed25519_leaf_certificate_der` の serialNumber
+/// バイト列だけを差し替えられる版（RFC 5280 §4.1.2.2 の serialNumber
+/// 検査を固定するために使う）。
+fn build_ed25519_leaf_certificate_der_with_serial(
+    public_key: &[u8; 32],
+    not_before: &str,
+    not_after: &str,
+    serial: &[u8],
+) -> Vec<u8> {
+    let signature_algorithm = ed25519_algorithm_identifier();
+
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(public_key);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+
+    let validity = sequence(&[&utc_time(not_before), &utc_time(not_after)]);
+
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, serial),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+
+    sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ])
+}
+
 fn pem_wrap_certificate(der: &[u8]) -> String {
     // RFC 8410 §10.2 と同じ 66 文字幅で改行する（PEM lax デコーダの
     // 「行長は強制しない」契約自体は既に固定済みのため、ここでは
@@ -978,6 +1015,187 @@ fn load_server_certificate_chain_file_accepts_handmade_ed25519_leaf() {
     )
     .expect("valid Ed25519 leaf file must be accepted");
     assert_eq!(chain.leaf_public_key(), &RFC8410_10_1_ED25519_PUBLIC_KEY);
+}
+
+#[test]
+fn serial_number_negative_zero_oversized_and_non_minimal_are_rejected() {
+    // 負数（最上位ビットが立つ 1 オクテット）。
+    let negative = build_ed25519_leaf_certificate_der_with_serial(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+        &[0x80],
+    );
+    // ゼロ。
+    let zero = build_ed25519_leaf_certificate_der_with_serial(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+        &[0x00],
+    );
+    // 21 オクテット（RFC 5280 の上限 20 を超える）。
+    let oversized = build_ed25519_leaf_certificate_der_with_serial(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+        &[0x01; 21],
+    );
+    // 非最小符号化（次オクテットの最上位ビットが立っていないのに不要な
+    // 先頭 0x00 を付けている）。
+    let non_minimal = build_ed25519_leaf_certificate_der_with_serial(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+        &[0x00, 0x01],
+    );
+
+    for der in [negative, zero, oversized, non_minimal] {
+        let err = ServerCertificateChain::from_der_chain(
+            vec![der],
+            &RFC8410_10_1_ED25519_PUBLIC_KEY,
+            NOW_WITHIN_RFC8410_10_2_VALIDITY,
+        )
+        .unwrap_err();
+        match err {
+            CertificateChainError::Certificate { index: 0, error } => {
+                assert_eq!(error, X509Error::Malformed);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn serial_number_20_octets_and_minimal_high_bit_encoding_are_accepted() {
+    // 20 オクテットちょうど（上限）は受理される。
+    let max_len = build_ed25519_leaf_certificate_der_with_serial(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+        &[0x7f; 20],
+    );
+    ServerCertificateChain::from_der_chain(
+        vec![max_len],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .expect("20-octet serial number must be accepted");
+
+    // 最上位ビットが立つ正の値に対する、符号ビット確保のための単一の
+    // 0x00 接頭辞は最小符号化として受理される。
+    let minimal_high_bit = build_ed25519_leaf_certificate_der_with_serial(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+        &[0x00, 0x80],
+    );
+    ServerCertificateChain::from_der_chain(
+        vec![minimal_high_bit],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .expect("minimal 0x00-prefixed high-bit serial number must be accepted");
+}
+
+#[test]
+fn intermediate_spki_algorithm_identifier_with_trailing_excess_element_is_rejected() {
+    // 中間証明書（チェーン index 1）の SPKI AlgorithmIdentifier に、
+    // parameters を超える余剰の 2 個目の要素を付けた不正な形。葉証明書側の
+    // Ed25519 判定（OID 完全一致・parameters 不在）は index 0 にしか
+    // 適用されないため、この不正な形が中間証明書側でも構造検査自体で
+    // 拒否されることを固定する（Issue #963 レビュー指摘）。
+    let leaf_der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let spki_algorithm_with_excess = sequence(&[
+        &tlv(0x06, &OID_ED25519_BYTES),
+        &tlv(0x05, &[]), // parameters（NULL）
+        &tlv(0x05, &[]), // 余剰の 2 個目の要素
+    ]);
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&spki_algorithm_with_excess, &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let intermediate_der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![leaf_der, intermediate_der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 1, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn intermediate_spki_algorithm_identifier_with_truncated_oid_is_rejected() {
+    // 中間証明書（index 1）の SPKI OID が「最後のサブ識別子が継続ビット付き
+    // のまま終端」している、切り詰められた不正な OID（`0x2b 0x80`）。
+    let leaf_der = build_ed25519_leaf_certificate_der(
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        "160801121924Z",
+        "401231235959Z",
+    );
+
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let spki_algorithm_truncated = sequence(&[&tlv(0x06, &[0x2b, 0x80])]);
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&spki_algorithm_truncated, &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &empty_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let intermediate_der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+
+    let err = ServerCertificateChain::from_der_chain(
+        vec![leaf_der, intermediate_der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    match err {
+        CertificateChainError::Certificate { index: 1, error } => {
+            assert_eq!(error, X509Error::Malformed);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
