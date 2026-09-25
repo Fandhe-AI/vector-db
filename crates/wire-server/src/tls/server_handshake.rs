@@ -1,0 +1,1128 @@
+//! TLS 1.3 サーバー側ハンドシェイク状態機械（RFC 8446 §2・§4。TASK-228・
+//! WIRE-9・HTTP-10 ポインタ。Issue #965・親 #941。分解 14/20）。
+//!
+//! [`super::record`]（レコード層）・[`super::handshake`]（メッセージ層）・
+//! [`super::client_hello`]（`ClientHello` 受理判定）・[`super::x25519`]・
+//! [`super::key_schedule`]（鍵スケジュール）・[`super::record_protection`]
+//! （[`Sealer`](super::record_protection::Sealer)／[`Opener`]
+//! (super::record_protection::Opener)）・[`super::transcript`]・
+//! [`super::finished`]・[`super::certificate_verify`]・[`super::x509`]を
+//! つなぎ、ClientHello 受信から client Finished 検証までを進める。
+//! [`super::alert`] と組み合わせて fatal alert の送出・受信 alert の
+//! 分類（close_notify／その他）を担う。
+//!
+//! **意図的なモジュール配置の逸脱**: 親 Issue の記述は「`tls/handshake.rs`
+//! の状態機械」だが、`handshake.rs`（Issue #953）は「鍵・状態を持たない
+//! 純粋な codec」であることをモジュール doc で確定済みのため、状態を
+//! 持つ本体は独立モジュールとして新設する（`docs/design/
+//! tls-server-handshake.md` に記録）。
+//!
+//! # 対象外
+//!
+//! - `SSLRequest` への `'S'` 応答・`server.rs`／pg 側 `handshake.rs` への
+//!   接続結線（#966）
+//! - CLI からの証明書・鍵読み込み（#967）・HTTPS 表層（#968）
+//! - 3 クライアント接続テスト（#969）・channel binding（#970）
+//! - KeyUpdate・NewSessionTicket・0-RTT・クライアント証明書（親 #941 の方針）
+//!
+//! 受信データ経路のため `unwrap`／`expect`／添字アクセスを用いず `get()`・
+//! `checked_*`・`Result` で処理する（`.claude/rules/coding-rust.md` P0）。
+//! `unsafe` は使わない。秘密値に依存する分岐は作らない（暗号処理は各
+//! サブモジュールへ委譲し、本モジュール自身は公開値のみで分岐する）。
+
+use std::io::{self, Read, Write};
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::alert::{self, Alert, ReceivedAlert};
+use super::certificate_verify;
+use super::client_hello::{self, ClientHelloDecision, ClientHelloError, NegotiatedClientHello};
+use super::ed25519::SigningKey;
+use super::finished;
+use super::handshake::{self, HandshakeError, HandshakeType, RawHandshake};
+use super::hkdf::{ct_eq, HkdfError};
+use super::key_schedule::{EarlySecret, TrafficSecret};
+use super::record::{self, AlertDescription, ContentType, Record, RecordKind};
+use super::record_protection::{Opener, ProtectionError, Sealer};
+use super::transcript::{Transcript, TranscriptError};
+use super::x25519::{EphemeralSecret, X25519Error};
+use super::x509::ServerCertificateChain;
+
+/// ハンドシェイク中の読み取りタイムアウト（WIRE-5 の簡易クエリ応答と同値。
+/// `crate::limits::READ_TIMEOUT` を単一情報源とする）。
+pub const HANDSHAKE_READ_TIMEOUT: Duration = crate::limits::READ_TIMEOUT;
+
+/// middlebox 互換のダミー `ChangeCipherSpec`（RFC 8446 付録 D.4）を受理する
+/// 上限件数。付録 D.4 に従うクライアントは 1 回しか送らないため、この
+/// 上限は空レコードを送り続ける DoS の抑止が目的の本リポの実装既定値。
+pub const MAX_DUMMY_CCS_RECORDS: u32 = 1;
+
+/// サーバー証明書チェーンと署名鍵の組。接続間で共有する（`Arc`）。
+/// CLI からの構築は #967 の担当で、本モジュールは
+/// [`TlsServerConfig::new`] による整合性検査までを提供する。
+pub struct TlsServerConfig {
+    chain: ServerCertificateChain,
+    key: SigningKey,
+}
+
+/// [`TlsServerConfig::new`] の失敗理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsServerConfigError {
+    /// 署名鍵の公開鍵と、証明書チェーンの葉が保持する公開鍵が一致しない。
+    PublicKeyMismatch,
+}
+
+impl std::fmt::Display for TlsServerConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsServerConfigError::PublicKeyMismatch => {
+                write!(
+                    f,
+                    "TLS server signing key does not match certificate leaf public key"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TlsServerConfigError {}
+
+impl TlsServerConfig {
+    /// `key.public_key()` と `chain.leaf_public_key()` の一致を定数時間で
+    /// 検査してから構築する（起動時エラー。#967 が呼ぶ）。
+    pub fn new(
+        chain: ServerCertificateChain,
+        key: SigningKey,
+    ) -> Result<Self, TlsServerConfigError> {
+        if ct_eq(&key.public_key(), chain.leaf_public_key()) {
+            Ok(TlsServerConfig { chain, key })
+        } else {
+            Err(TlsServerConfigError::PublicKeyMismatch)
+        }
+    }
+}
+
+/// サーバー側ハンドシェイクが必要とする乱数源（server random・一時鍵）を
+/// 抽象化する。本番実装は [`OsEntropy`]、テストは固定値を注入する。
+pub trait HandshakeEntropy {
+    fn server_random(&mut self) -> io::Result<[u8; 32]>;
+    fn ephemeral(&mut self) -> io::Result<EphemeralSecret>;
+}
+
+/// OS の CSPRNG（[`crate::auth::read_urandom`]）を使う本番実装。
+#[derive(Debug, Default)]
+pub struct OsEntropy;
+
+impl HandshakeEntropy for OsEntropy {
+    fn server_random(&mut self) -> io::Result<[u8; 32]> {
+        let raw = crate::auth::read_urandom(32)?;
+        raw.try_into()
+            .map_err(|_| io::Error::other("urandom read returned an unexpected length"))
+    }
+
+    fn ephemeral(&mut self) -> io::Result<EphemeralSecret> {
+        EphemeralSecret::generate()
+    }
+}
+
+/// [`ServerHandshake::handle_record`] が検出しうるエラー全体。全 variant が
+/// `Copy` であり、poison 状態としてそのまま保持・再送出できる
+/// （`handshake::HandshakeBuffer` と同じ fail-closed 流儀）。
+///
+/// `wire_code`（ERR-1/2/4）への写像は追加しない。TLS 層の失敗は
+/// `ErrorResponse` ではなく alert と切断で表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerHandshakeError {
+    Handshake(HandshakeError),
+    ClientHello(ClientHelloError),
+    Transcript(TranscriptError),
+    X25519(X25519Error),
+    Hkdf(HkdfError),
+    Finished(finished::FinishedError),
+    Protection(ProtectionError),
+    /// 乱数取得（server random・一時鍵）の I/O 失敗。
+    Entropy,
+    /// 状態外のメッセージ（型は正しいが時期が違う）・整列違反。
+    UnexpectedMessage,
+    /// 受信 alert の parse 失敗（2 バイト長・level 値の違反）。
+    AlertDecode(AlertDescription),
+    /// HelloRetryRequest 送出済みの接続で再度 `RetryRequestX25519` が
+    /// 返った（防御用の分岐。`negotiate`／`Transcript` の契約上到達しない）。
+    DuplicateHelloRetryRequest,
+    /// 相手から fatal alert を受け取った（応答は送らない）。
+    ReceivedFatalAlert(u8),
+    /// レコード層で検出された違反（[`record::RecordError`] 由来。
+    /// 呼び出し元（driver）がこの alert 種別をそのまま渡す）。
+    RecordLayer(AlertDescription),
+    /// 一度でも `Err` を返した後の呼び出し（poison）。
+    AlreadyFailed,
+    /// `ClosedByPeer` 後の呼び出し。
+    AlreadyClosed,
+}
+
+impl std::fmt::Display for ServerHandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerHandshakeError::Handshake(e) => write!(f, "{e}"),
+            ServerHandshakeError::ClientHello(e) => write!(f, "{e}"),
+            ServerHandshakeError::Transcript(e) => write!(f, "{e}"),
+            ServerHandshakeError::X25519(e) => write!(f, "{e}"),
+            ServerHandshakeError::Hkdf(e) => write!(f, "{e}"),
+            ServerHandshakeError::Finished(e) => write!(f, "{e}"),
+            ServerHandshakeError::Protection(e) => write!(f, "{e}"),
+            ServerHandshakeError::Entropy => write!(f, "entropy source failed"),
+            ServerHandshakeError::UnexpectedMessage => {
+                write!(f, "unexpected TLS handshake message or ordering violation")
+            }
+            ServerHandshakeError::AlertDecode(_) => write!(f, "received alert failed to parse"),
+            ServerHandshakeError::DuplicateHelloRetryRequest => {
+                write!(f, "HelloRetryRequest already sent for this connection")
+            }
+            ServerHandshakeError::ReceivedFatalAlert(d) => {
+                write!(f, "peer sent a fatal TLS alert (description {d})")
+            }
+            ServerHandshakeError::RecordLayer(_) => write!(f, "TLS record layer violation"),
+            ServerHandshakeError::AlreadyFailed => write!(f, "TLS handshake already failed"),
+            ServerHandshakeError::AlreadyClosed => write!(f, "TLS handshake already closed"),
+        }
+    }
+}
+
+impl std::error::Error for ServerHandshakeError {}
+
+/// クライアントへ送出すべき fatal alert の種別。`None` は alert を送らずに
+/// 切断する種別（[`ProtectionError::SequenceExhausted`]・受信済み fatal
+/// alert への応答・poison 後の再呼び出し）を表す。
+fn fatal_alert_of(err: &ServerHandshakeError) -> Option<AlertDescription> {
+    match err {
+        ServerHandshakeError::Handshake(e) => e.alert_description(),
+        ServerHandshakeError::ClientHello(e) => Some(e.alert_description()),
+        ServerHandshakeError::Transcript(e) => Some(e.alert_description()),
+        ServerHandshakeError::X25519(_) => Some(AlertDescription::HandshakeFailure),
+        ServerHandshakeError::Hkdf(_) => Some(AlertDescription::InternalError),
+        ServerHandshakeError::Finished(e) => Some(e.alert_description()),
+        ServerHandshakeError::Protection(e) => e.alert_description(),
+        ServerHandshakeError::Entropy => Some(AlertDescription::InternalError),
+        ServerHandshakeError::UnexpectedMessage => Some(AlertDescription::UnexpectedMessage),
+        ServerHandshakeError::AlertDecode(desc) => Some(*desc),
+        ServerHandshakeError::DuplicateHelloRetryRequest => {
+            Some(AlertDescription::HandshakeFailure)
+        }
+        ServerHandshakeError::RecordLayer(desc) => Some(*desc),
+        ServerHandshakeError::ReceivedFatalAlert(_)
+        | ServerHandshakeError::AlreadyFailed
+        | ServerHandshakeError::AlreadyClosed => None,
+    }
+}
+
+/// [`negotiate`](client_hello::negotiate) の判定結果を、HelloRetryRequest
+/// を 1 回までに制限する状態機械の観点で分類する。`negotiate` 自身が
+/// 「`after_hrr` が `Some` のときは `RetryRequestX25519` を返さない」契約を
+/// 持つため、`hrr_already_sent` な状態でこの分岐に到達することは
+/// `negotiate`／[`Transcript`] の契約上構造的に到達しないが、多層防御として
+/// 直接テストできる純粋関数へ切り出す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientHelloAction {
+    SendHelloRetryRequest,
+    Accept(NegotiatedClientHello),
+    RejectDuplicateHelloRetryRequest,
+}
+
+fn decide_after_client_hello(
+    decision: ClientHelloDecision,
+    hrr_already_sent: bool,
+) -> ClientHelloAction {
+    match decision {
+        ClientHelloDecision::Accept(negotiated) => ClientHelloAction::Accept(negotiated),
+        ClientHelloDecision::RetryRequestX25519 => {
+            if hrr_already_sent {
+                ClientHelloAction::RejectDuplicateHelloRetryRequest
+            } else {
+                ClientHelloAction::SendHelloRetryRequest
+            }
+        }
+    }
+}
+
+/// ハンドシェイクの現在位置。
+#[derive(Debug, Clone, Copy)]
+enum HandshakeState {
+    /// `after_hrr`: HelloRetryRequest を送出済みか（1 回のみ許可）。
+    ExpectClientHello {
+        after_hrr: bool,
+    },
+    ExpectClientFinished,
+    /// client Finished 検証まで完了（[`ServerHandshake::handle_record`]
+    /// はこの状態には遷移しない。[`Step::Complete`] を返した時点で
+    /// 呼び出し元が [`TlsSession`] を受け取り、以後このインスタンスへは
+    /// 触れない契約とする）。
+    Complete,
+    /// fatal alert を送出済み（またはこれから送出を試みる）。以後の
+    /// `handle_record` は同じ理由の `Err` を返し続ける。
+    Failed(ServerHandshakeError),
+    /// `close_notify`／`user_canceled` を受けて正常終了した。
+    Closed,
+}
+
+/// [`ServerHandshake::handle_record`] の戻り値。
+#[derive(Debug)]
+pub enum Step {
+    /// ハンドシェイク継続中。`0` 件のこともある（次のレコードを待つ、
+    /// またはダミー CCS を読み捨てただけ）。
+    Continue(Vec<Record>),
+    /// client Finished の検証まで完了した。
+    Complete(Vec<Record>, Box<TlsSession>),
+    /// 相手から `close_notify`／`user_canceled` を受けた（正常終了）。
+    ClosedByPeer(Vec<Record>),
+}
+
+/// TLS 1.3 サーバー側ハンドシェイク状態機械本体。ソケットを持たず、
+/// レコード単位の push 型 API（[`ServerHandshake::handle_record`]）のみを
+/// 提供する。I/O は [`perform_server_handshake`] が担う。
+pub struct ServerHandshake<E: HandshakeEntropy = OsEntropy> {
+    config: Arc<TlsServerConfig>,
+    entropy: E,
+    state: HandshakeState,
+    buffer: handshake::HandshakeBuffer,
+    transcript: Transcript,
+    sealer: Sealer,
+    opener: Opener,
+    /// 1 回目の ClientHello（HRR 経由の 2 回目 `negotiate` 呼び出しへ渡す）。
+    first_client_hello: Option<handshake::ClientHello>,
+    /// client Finished 検証用（`ExpectClientFinished` に入った時点で必ず
+    /// `Some`）。
+    client_hs_traffic: Option<TrafficSecret>,
+    /// client Finished 検証対象の transcript hash（ClientHello..server
+    /// Finished）。
+    th_ch_sf: Option<[u8; 32]>,
+    /// application 鍵切替用（`ExpectClientFinished` に入った時点で必ず
+    /// `Some`）。
+    client_ap_secret: Option<TrafficSecret>,
+    dummy_ccs_sent: bool,
+    dummy_ccs_received: u32,
+    /// [`ServerHandshake::handle_record`] が `Err` を返した際に、直前に
+    /// 送出（を試行）した fatal alert のレコード列を一時的に保持する。
+    /// `Result` の `Err` 側へ出力バイト列を同時に載せる型を作らず、
+    /// 呼び出し元は `Err` を受け取った直後に
+    /// [`ServerHandshake::take_pending_alert_output`] で取り出す 2 段構え
+    /// とする。
+    pending_alert_output: Vec<Record>,
+}
+
+impl ServerHandshake<OsEntropy> {
+    /// OS の CSPRNG を乱数源とするサーバー側状態機械を構築する。
+    pub fn new(config: Arc<TlsServerConfig>) -> Self {
+        Self::with_entropy(config, OsEntropy)
+    }
+}
+
+impl<E: HandshakeEntropy> ServerHandshake<E> {
+    /// 乱数源を明示的に注入して構築する（テスト用の入口。本番は
+    /// [`ServerHandshake::new`] を使う）。
+    pub fn with_entropy(config: Arc<TlsServerConfig>, entropy: E) -> Self {
+        ServerHandshake {
+            config,
+            entropy,
+            state: HandshakeState::ExpectClientHello { after_hrr: false },
+            buffer: handshake::HandshakeBuffer::new(),
+            transcript: Transcript::new(),
+            sealer: Sealer::new(),
+            opener: Opener::new(),
+            first_client_hello: None,
+            client_hs_traffic: None,
+            th_ch_sf: None,
+            client_ap_secret: None,
+            dummy_ccs_sent: false,
+            dummy_ccs_received: 0,
+            pending_alert_output: Vec::new(),
+        }
+    }
+
+    /// 直前の `handle_record` の `Err` に伴って送出（を試行）した alert の
+    /// レコード列を取り出す。呼び出し元（driver）は `Err` を受けた直後に
+    /// 一度だけ呼ぶ契約（呼ばなくても次の `handle_record` 呼び出しで
+    /// 上書きされるため、内部状態が壊れることはない）。
+    pub fn take_pending_alert_output(&mut self) -> Vec<Record> {
+        std::mem::take(&mut self.pending_alert_output)
+    }
+
+    /// 呼び出し元（driver）が次のレコードを読む際に使うべき [`RecordKind`]。
+    pub fn record_kind(&self) -> RecordKind {
+        self.opener.record_kind()
+    }
+
+    /// レコード層で検出された違反（[`record::RecordError`]）を、この
+    /// ハンドシェイクの現在の送信鍵で fatal alert として送出しようと試み、
+    /// この接続を poison する。driver が `read_record` の `Err` を受けた
+    /// 際に呼ぶ（[`ServerHandshake::handle_record`] にはレコード層の生の
+    /// バイト列は渡らないため、この経路だけ別に公開する）。
+    pub fn fail_on_record_error(&mut self, alert_desc: Option<AlertDescription>) -> Vec<Record> {
+        let Some(desc) = alert_desc else {
+            self.state = HandshakeState::Failed(ServerHandshakeError::RecordLayer(
+                AlertDescription::InternalError,
+            ));
+            return Vec::new();
+        };
+        let output = self
+            .sealer
+            .seal_fragmented(ContentType::Alert, &Alert::encode_fatal(desc))
+            .unwrap_or_default();
+        self.state = HandshakeState::Failed(ServerHandshakeError::RecordLayer(desc));
+        output
+    }
+
+    /// 1 レコードを処理する。
+    pub fn handle_record(&mut self, record: &Record) -> Result<Step, ServerHandshakeError> {
+        match self.state {
+            HandshakeState::Failed(e) => return Err(e),
+            HandshakeState::Closed => return Err(ServerHandshakeError::AlreadyClosed),
+            HandshakeState::Complete => return Err(ServerHandshakeError::AlreadyFailed),
+            _ => {}
+        }
+        match self.step_inner(record) {
+            Ok(step) => Ok(step),
+            Err(err) => {
+                let output = match fatal_alert_of(&err) {
+                    Some(desc) => self
+                        .sealer
+                        .seal_fragmented(ContentType::Alert, &Alert::encode_fatal(desc))
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                self.state = HandshakeState::Failed(err);
+                // `Result::Err` には送出すべき alert のバイト列を同時に
+                // 載せられないため、フィールドへ一時保存し、呼び出し元は
+                // `Err` を受け取った直後に
+                // [`ServerHandshake::take_pending_alert_output`] で取り出す
+                // 契約とする。
+                self.pending_alert_output = output;
+                Err(err)
+            }
+        }
+    }
+
+    fn step_inner(&mut self, record: &Record) -> Result<Step, ServerHandshakeError> {
+        // ダミー CCS（middlebox 互換。RFC 8446 付録 D.4）は Opener を経由
+        // せず、ClientHello 受信後から client Finished 受信前までに限り
+        // 読み捨てる。
+        if record.content_type == ContentType::ChangeCipherSpec {
+            let in_ccs_window = matches!(
+                self.state,
+                HandshakeState::ExpectClientHello { after_hrr: true }
+                    | HandshakeState::ExpectClientFinished
+            );
+            if !in_ccs_window
+                || record.fragment != [0x01]
+                || self.dummy_ccs_received >= MAX_DUMMY_CCS_RECORDS
+            {
+                return Err(ServerHandshakeError::UnexpectedMessage);
+            }
+            self.dummy_ccs_received += 1;
+            return Ok(Step::Continue(Vec::new()));
+        }
+
+        let inner = self
+            .opener
+            .open(record)
+            .map_err(ServerHandshakeError::Protection)?;
+
+        match inner.content_type {
+            ContentType::Alert => self.handle_alert(&inner.content),
+            ContentType::Handshake => self.handle_handshake_content(&inner.content),
+            // `Opener::open` は epoch ごとに ApplicationData の内側 type を
+            // 既に拒否済み（Plaintext は外側 ApplicationData を
+            // UnexpectedOuterType、Handshake epoch は内側 ApplicationData
+            // を ForbiddenInnerType として拒否する）。Application epoch は
+            // ハンドシェイク完了後にのみ到達するため、この経路には
+            // 到達しない（`Complete` 状態は `handle_record` 冒頭で
+            // `Err(AlreadyFailed)` に短絡する）。
+            ContentType::ApplicationData | ContentType::ChangeCipherSpec => {
+                Err(ServerHandshakeError::UnexpectedMessage)
+            }
+        }
+    }
+
+    fn handle_alert(&mut self, content: &[u8]) -> Result<Step, ServerHandshakeError> {
+        let alert = Alert::parse(content).map_err(ServerHandshakeError::AlertDecode)?;
+        match alert::classify_received(alert) {
+            ReceivedAlert::Closed => {
+                self.state = HandshakeState::Closed;
+                Ok(Step::ClosedByPeer(Vec::new()))
+            }
+            ReceivedAlert::Fatal(code) => Err(ServerHandshakeError::ReceivedFatalAlert(code)),
+        }
+    }
+
+    fn handle_handshake_content(&mut self, content: &[u8]) -> Result<Step, ServerHandshakeError> {
+        self.buffer
+            .feed(content)
+            .map_err(ServerHandshakeError::Handshake)?;
+        let Some(raw) = self
+            .buffer
+            .next_message()
+            .map_err(ServerHandshakeError::Handshake)?
+        else {
+            // まだメッセージがそろっていない（レコード境界をまたぐ途中）。
+            return Ok(Step::Continue(Vec::new()));
+        };
+
+        match self.state {
+            HandshakeState::ExpectClientHello { after_hrr } => {
+                self.handle_client_hello(raw, after_hrr)
+            }
+            HandshakeState::ExpectClientFinished => self.handle_client_finished(raw),
+            HandshakeState::Complete | HandshakeState::Failed(_) | HandshakeState::Closed => {
+                Err(ServerHandshakeError::AlreadyFailed)
+            }
+        }
+    }
+
+    /// 現在バッファに残っている・またはこれから取り出せるメッセージが
+    /// 無いことを確認する（RFC 8446 §5.1 の鍵変更境界の整列検査）。
+    fn check_buffer_alignment(&mut self) -> Result<(), ServerHandshakeError> {
+        if self.buffer.has_partial() {
+            return Err(ServerHandshakeError::UnexpectedMessage);
+        }
+        match self.buffer.next_message() {
+            Ok(Some(_)) => Err(ServerHandshakeError::UnexpectedMessage),
+            Ok(None) => Ok(()),
+            Err(e) => Err(ServerHandshakeError::Handshake(e)),
+        }
+    }
+
+    fn handle_client_hello(
+        &mut self,
+        raw: RawHandshake,
+        after_hrr: bool,
+    ) -> Result<Step, ServerHandshakeError> {
+        if raw.msg_type != HandshakeType::ClientHello {
+            return Err(ServerHandshakeError::UnexpectedMessage);
+        }
+        let ch =
+            handshake::ClientHello::parse(&raw.body).map_err(ServerHandshakeError::Handshake)?;
+        self.transcript
+            .append_client_hello(&raw)
+            .map_err(ServerHandshakeError::Transcript)?;
+
+        let first_ch_ref = if after_hrr {
+            self.first_client_hello.as_ref()
+        } else {
+            None
+        };
+        let decision = client_hello::negotiate(&ch, first_ch_ref)
+            .map_err(ServerHandshakeError::ClientHello)?;
+
+        self.check_buffer_alignment()?;
+
+        match decide_after_client_hello(decision, after_hrr) {
+            ClientHelloAction::RejectDuplicateHelloRetryRequest => {
+                Err(ServerHandshakeError::DuplicateHelloRetryRequest)
+            }
+            ClientHelloAction::SendHelloRetryRequest => {
+                let hrr = client_hello::build_hello_retry_request(&ch.legacy_session_id);
+                let mut body = Vec::new();
+                hrr.serialize_body_into(&mut body)
+                    .map_err(ServerHandshakeError::Handshake)?;
+                let raw_hrr = RawHandshake {
+                    msg_type: HandshakeType::ServerHello,
+                    body,
+                };
+                self.transcript
+                    .append_hello_retry_request(&raw_hrr)
+                    .map_err(ServerHandshakeError::Transcript)?;
+                let wire = raw_hrr
+                    .to_bytes()
+                    .map_err(ServerHandshakeError::Handshake)?;
+                let mut output = self
+                    .sealer
+                    .seal_fragmented(ContentType::Handshake, &wire)
+                    .map_err(ServerHandshakeError::Protection)?;
+                output.extend(self.maybe_dummy_ccs(&ch.legacy_session_id));
+                self.first_client_hello = Some(ch);
+                self.state = HandshakeState::ExpectClientHello { after_hrr: true };
+                Ok(Step::Continue(output))
+            }
+            ClientHelloAction::Accept(negotiated) => self.accept_client_hello(&ch, negotiated),
+        }
+    }
+
+    /// 互換モード（`legacy_session_id` が空でない。RFC 8446 付録 D.4）かつ
+    /// 未送出であれば、ダミー `ChangeCipherSpec` レコードを 1 個返す。
+    fn maybe_dummy_ccs(&mut self, legacy_session_id: &[u8]) -> Vec<Record> {
+        if !legacy_session_id.is_empty() && !self.dummy_ccs_sent {
+            self.dummy_ccs_sent = true;
+            vec![Record {
+                content_type: ContentType::ChangeCipherSpec,
+                legacy_version: record::LEGACY_RECORD_VERSION,
+                fragment: vec![0x01],
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn accept_client_hello(
+        &mut self,
+        ch: &handshake::ClientHello,
+        negotiated: NegotiatedClientHello,
+    ) -> Result<Step, ServerHandshakeError> {
+        let mut output = Vec::new();
+
+        let server_random = self
+            .entropy
+            .server_random()
+            .map_err(|_| ServerHandshakeError::Entropy)?;
+        let ephemeral = self
+            .entropy
+            .ephemeral()
+            .map_err(|_| ServerHandshakeError::Entropy)?;
+        let server_x25519_public = *ephemeral.public_key().as_bytes();
+
+        let server_hello = build_server_hello(
+            server_random,
+            &negotiated.legacy_session_id,
+            server_x25519_public,
+        );
+        let mut sh_body = Vec::new();
+        server_hello
+            .serialize_body_into(&mut sh_body)
+            .map_err(ServerHandshakeError::Handshake)?;
+        let raw_sh = RawHandshake {
+            msg_type: HandshakeType::ServerHello,
+            body: sh_body,
+        };
+        self.transcript
+            .append_server_hello(&raw_sh)
+            .map_err(ServerHandshakeError::Transcript)?;
+
+        let shared = ephemeral
+            .diffie_hellman(&negotiated.client_x25519_public)
+            .map_err(ServerHandshakeError::X25519)?;
+        let early = EarlySecret::new_without_psk();
+        let handshake_secret = early
+            .into_handshake(&shared)
+            .map_err(ServerHandshakeError::Hkdf)?;
+        let th_ch_sh = self
+            .transcript
+            .hash_through_server_hello()
+            .map_err(ServerHandshakeError::Transcript)?;
+        let traffic = handshake_secret
+            .traffic_secrets(&th_ch_sh)
+            .map_err(ServerHandshakeError::Hkdf)?;
+
+        let sh_wire = raw_sh.to_bytes().map_err(ServerHandshakeError::Handshake)?;
+        output.extend(
+            self.sealer
+                .seal_fragmented(ContentType::Handshake, &sh_wire)
+                .map_err(ServerHandshakeError::Protection)?,
+        );
+        output.extend(self.maybe_dummy_ccs(&ch.legacy_session_id));
+
+        let server_hs_keys = traffic
+            .server
+            .traffic_keys()
+            .map_err(ServerHandshakeError::Hkdf)?;
+        let client_hs_keys = traffic
+            .client
+            .traffic_keys()
+            .map_err(ServerHandshakeError::Hkdf)?;
+        self.sealer
+            .install_handshake_keys(&server_hs_keys)
+            .map_err(ServerHandshakeError::Protection)?;
+        self.opener
+            .install_handshake_keys(&client_hs_keys)
+            .map_err(ServerHandshakeError::Protection)?;
+
+        // EncryptedExtensions（拡張なし）。
+        let ee = handshake::EncryptedExtensions {
+            extensions: Vec::new(),
+        };
+        let mut ee_body = Vec::new();
+        ee.serialize_body_into(&mut ee_body)
+            .map_err(ServerHandshakeError::Handshake)?;
+        let raw_ee = RawHandshake {
+            msg_type: HandshakeType::EncryptedExtensions,
+            body: ee_body,
+        };
+        self.transcript
+            .append_encrypted_extensions(&raw_ee)
+            .map_err(ServerHandshakeError::Transcript)?;
+
+        // Certificate。
+        let cert_msg = self.config.chain.certificate_message();
+        let mut cert_body = Vec::new();
+        cert_msg
+            .serialize_body_into(&mut cert_body)
+            .map_err(ServerHandshakeError::Handshake)?;
+        let raw_cert = RawHandshake {
+            msg_type: HandshakeType::Certificate,
+            body: cert_body,
+        };
+        self.transcript
+            .append_certificate(&raw_cert)
+            .map_err(ServerHandshakeError::Transcript)?;
+        let th_ch_cert = self
+            .transcript
+            .hash_through_certificate()
+            .map_err(ServerHandshakeError::Transcript)?;
+
+        // CertificateVerify。
+        let cv = certificate_verify::build_server_certificate_verify(&self.config.key, &th_ch_cert);
+        let mut cv_body = Vec::new();
+        cv.serialize_body_into(&mut cv_body)
+            .map_err(ServerHandshakeError::Handshake)?;
+        let raw_cv = RawHandshake {
+            msg_type: HandshakeType::CertificateVerify,
+            body: cv_body,
+        };
+        self.transcript
+            .append_certificate_verify(&raw_cv)
+            .map_err(ServerHandshakeError::Transcript)?;
+        let th_ch_cv = self
+            .transcript
+            .hash_through_certificate_verify()
+            .map_err(ServerHandshakeError::Transcript)?;
+
+        // server Finished。
+        let server_finished = finished::build_server_finished(&traffic.server, &th_ch_cv)
+            .map_err(ServerHandshakeError::Finished)?;
+        let mut sf_body = Vec::new();
+        server_finished
+            .serialize_body_into(&mut sf_body)
+            .map_err(ServerHandshakeError::Handshake)?;
+        let raw_sf = RawHandshake {
+            msg_type: HandshakeType::Finished,
+            body: sf_body,
+        };
+        self.transcript
+            .append_server_finished(&raw_sf)
+            .map_err(ServerHandshakeError::Transcript)?;
+        let th_ch_sf = self
+            .transcript
+            .hash_through_server_finished()
+            .map_err(ServerHandshakeError::Transcript)?;
+
+        // server flight（EE・Certificate・CertificateVerify・Finished）を
+        // 1 まとめに seal する。
+        let mut flight = Vec::new();
+        flight.extend(raw_ee.to_bytes().map_err(ServerHandshakeError::Handshake)?);
+        flight.extend(
+            raw_cert
+                .to_bytes()
+                .map_err(ServerHandshakeError::Handshake)?,
+        );
+        flight.extend(raw_cv.to_bytes().map_err(ServerHandshakeError::Handshake)?);
+        flight.extend(raw_sf.to_bytes().map_err(ServerHandshakeError::Handshake)?);
+        output.extend(
+            self.sealer
+                .seal_fragmented(ContentType::Handshake, &flight)
+                .map_err(ServerHandshakeError::Protection)?,
+        );
+
+        // Master secret → application traffic secret（server Finished 送出
+        // 直後。client Finished の受信は不要）。
+        let master = handshake_secret
+            .into_master()
+            .map_err(ServerHandshakeError::Hkdf)?;
+        let app = master
+            .application_traffic_secrets(&th_ch_sf)
+            .map_err(ServerHandshakeError::Hkdf)?;
+        let server_ap_keys = app
+            .server
+            .traffic_keys()
+            .map_err(ServerHandshakeError::Hkdf)?;
+        self.sealer
+            .install_application_keys(&server_ap_keys)
+            .map_err(ServerHandshakeError::Protection)?;
+
+        self.client_hs_traffic = Some(traffic.client);
+        self.th_ch_sf = Some(th_ch_sf);
+        self.client_ap_secret = Some(app.client);
+        self.state = HandshakeState::ExpectClientFinished;
+
+        Ok(Step::Continue(output))
+    }
+
+    fn handle_client_finished(&mut self, raw: RawHandshake) -> Result<Step, ServerHandshakeError> {
+        if raw.msg_type != HandshakeType::Finished {
+            return Err(ServerHandshakeError::UnexpectedMessage);
+        }
+        let received =
+            handshake::Finished::parse(&raw.body).map_err(ServerHandshakeError::Handshake)?;
+
+        let client_hs_traffic = self
+            .client_hs_traffic
+            .as_ref()
+            .ok_or(ServerHandshakeError::UnexpectedMessage)?;
+        let th_ch_sf = self
+            .th_ch_sf
+            .ok_or(ServerHandshakeError::UnexpectedMessage)?;
+        finished::verify_client_finished(client_hs_traffic, &th_ch_sf, &received)
+            .map_err(ServerHandshakeError::Finished)?;
+
+        self.transcript
+            .append_client_finished(&raw)
+            .map_err(ServerHandshakeError::Transcript)?;
+        self.check_buffer_alignment()?;
+
+        let client_ap_secret = self
+            .client_ap_secret
+            .take()
+            .ok_or(ServerHandshakeError::UnexpectedMessage)?;
+        let client_ap_keys = client_ap_secret
+            .traffic_keys()
+            .map_err(ServerHandshakeError::Hkdf)?;
+        self.opener
+            .install_application_keys(&client_ap_keys)
+            .map_err(ServerHandshakeError::Protection)?;
+
+        let sealer = std::mem::take(&mut self.sealer);
+        let opener = std::mem::take(&mut self.opener);
+        self.state = HandshakeState::Complete;
+
+        Ok(Step::Complete(
+            Vec::new(),
+            Box::new(TlsSession {
+                sealer,
+                opener,
+                poisoned: false,
+            }),
+        ))
+    }
+}
+
+fn build_server_hello(
+    server_random: [u8; 32],
+    legacy_session_id: &[u8],
+    server_x25519_public: [u8; 32],
+) -> handshake::ServerHello {
+    let mut key_share_data = Vec::with_capacity(4 + 32);
+    key_share_data.extend_from_slice(&client_hello::GROUP_X25519.to_be_bytes());
+    key_share_data.extend_from_slice(&(32u16).to_be_bytes());
+    key_share_data.extend_from_slice(&server_x25519_public);
+    let key_share_ext = handshake::Extension {
+        extension_type: 0x0033,
+        extension_data: key_share_data,
+    };
+    let supported_versions_ext = handshake::Extension {
+        extension_type: 0x002b,
+        extension_data: client_hello::TLS13_VERSION.to_be_bytes().to_vec(),
+    };
+    handshake::ServerHello {
+        legacy_version: 0x0303,
+        random: server_random,
+        legacy_session_id_echo: legacy_session_id.to_vec(),
+        cipher_suite: client_hello::TLS_AES_128_GCM_SHA256,
+        legacy_compression_method: 0,
+        extensions: vec![key_share_ext, supported_versions_ext],
+    }
+}
+
+/// ハンドシェイク完了後のアプリケーションデータ往復（#966 が接続する
+/// 最小 API）。
+#[derive(Debug)]
+pub struct TlsSession {
+    sealer: Sealer,
+    opener: Opener,
+    /// 送信側で fatal alert を送出した後は `true` にし、以後の
+    /// `seal_application_data` を拒否する（fail-closed）。
+    poisoned: bool,
+}
+
+/// [`TlsSession::open_record`] の戻り値。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppEvent {
+    ApplicationData(Vec<u8>),
+    CloseNotify,
+}
+
+/// [`TlsSession`] の操作が起こしうる失敗。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsSessionError {
+    Protection(ProtectionError),
+    AlertDecode(AlertDescription),
+    ReceivedFatalAlert(u8),
+    /// 送信側が既に fatal alert を送出済み（poison）。
+    Poisoned,
+}
+
+impl std::fmt::Display for TlsSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsSessionError::Protection(e) => write!(f, "{e}"),
+            TlsSessionError::AlertDecode(_) => write!(f, "received alert failed to parse"),
+            TlsSessionError::ReceivedFatalAlert(d) => {
+                write!(f, "peer sent a fatal TLS alert (description {d})")
+            }
+            TlsSessionError::Poisoned => write!(f, "TLS session already failed"),
+        }
+    }
+}
+
+impl std::error::Error for TlsSessionError {}
+
+impl TlsSession {
+    /// アプリケーションデータを 1 個以上のレコードへ seal する。
+    pub fn seal_application_data(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<Vec<Record>, TlsSessionError> {
+        if self.poisoned {
+            return Err(TlsSessionError::Poisoned);
+        }
+        self.sealer
+            .seal_fragmented(ContentType::ApplicationData, payload)
+            .map_err(TlsSessionError::Protection)
+    }
+
+    /// 受信した 1 レコードを open する。alert（`close_notify`／
+    /// `user_canceled`）は [`AppEvent::CloseNotify`] へ写像し、それ以外の
+    /// alert は `Err(ReceivedFatalAlert)`。
+    pub fn open_record(&mut self, record: &Record) -> Result<AppEvent, TlsSessionError> {
+        if self.poisoned {
+            return Err(TlsSessionError::Poisoned);
+        }
+        let inner = self
+            .opener
+            .open(record)
+            .map_err(TlsSessionError::Protection)?;
+        match inner.content_type {
+            ContentType::ApplicationData => Ok(AppEvent::ApplicationData(inner.content)),
+            ContentType::Alert => {
+                let alert = Alert::parse(&inner.content).map_err(TlsSessionError::AlertDecode)?;
+                match alert::classify_received(alert) {
+                    ReceivedAlert::Closed => Ok(AppEvent::CloseNotify),
+                    ReceivedAlert::Fatal(code) => Err(TlsSessionError::ReceivedFatalAlert(code)),
+                }
+            }
+            ContentType::Handshake | ContentType::ChangeCipherSpec => Err(
+                TlsSessionError::Protection(ProtectionError::UnexpectedOuterType),
+            ),
+        }
+    }
+
+    /// `close_notify` レコードを組み立てる。以後 `seal_application_data`
+    /// は拒否しない（呼び出し元が接続を閉じる判断を担う）。
+    pub fn close_notify(&mut self) -> Result<Vec<Record>, TlsSessionError> {
+        if self.poisoned {
+            return Err(TlsSessionError::Poisoned);
+        }
+        self.sealer
+            .seal_fragmented(ContentType::Alert, &Alert::close_notify())
+            .map_err(TlsSessionError::Protection)
+    }
+
+    /// 送信側で fatal alert を送出した後に呼ぶ（以後 poison）。
+    pub fn mark_poisoned(&mut self) {
+        self.poisoned = true;
+    }
+}
+
+/// blocking な `Read`／`Write` に加え、ハンドシェイク中の読み取り
+/// タイムアウト設定・切断を提供するトランスポート抽象。`TcpStream` に
+/// 実装する（#966 の実接続結線がこの trait を経由する）。
+pub trait HandshakeTransport: Read + Write {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+    fn shutdown(&mut self) -> io::Result<()>;
+}
+
+impl HandshakeTransport for std::net::TcpStream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        std::net::TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn shutdown(&mut self) -> io::Result<()> {
+        std::net::TcpStream::shutdown(self, std::net::Shutdown::Both)
+    }
+}
+
+/// [`perform_server_handshake`] の失敗理由。
+#[derive(Debug)]
+pub enum ServerHandshakeDriverError {
+    Handshake(ServerHandshakeError),
+    Record(record::RecordError),
+    /// 接続が `close_notify`／`user_canceled` で正常終了した。
+    ClosedByPeer,
+}
+
+impl std::fmt::Display for ServerHandshakeDriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerHandshakeDriverError::Handshake(e) => write!(f, "{e}"),
+            ServerHandshakeDriverError::Record(e) => write!(f, "{e}"),
+            ServerHandshakeDriverError::ClosedByPeer => {
+                write!(f, "TLS handshake closed by peer before completion")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServerHandshakeDriverError {}
+
+/// OS の CSPRNG・[`HANDSHAKE_READ_TIMEOUT`] を使ってサーバー側ハンドシェイクを
+/// 進める（#966 が実接続へ結線する入口）。
+pub fn perform_server_handshake<S: HandshakeTransport>(
+    stream: &mut S,
+    config: Arc<TlsServerConfig>,
+) -> Result<Box<TlsSession>, ServerHandshakeDriverError> {
+    perform_server_handshake_with(stream, config, OsEntropy, HANDSHAKE_READ_TIMEOUT)
+}
+
+/// テスト用: タイムアウトを明示的に注入する（乱数源は本番と同じ
+/// [`OsEntropy`]）。結合テスト（`tests/tls_server_handshake.rs`）から
+/// 短いタイムアウトを注入するために `pub` とする。
+pub fn perform_server_handshake_with_timeout<S: HandshakeTransport>(
+    stream: &mut S,
+    config: Arc<TlsServerConfig>,
+    timeout: Duration,
+) -> Result<Box<TlsSession>, ServerHandshakeDriverError> {
+    perform_server_handshake_with(stream, config, OsEntropy, timeout)
+}
+
+/// テスト用: 乱数源・タイムアウトを両方注入する完全形。
+pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeEntropy>(
+    stream: &mut S,
+    config: Arc<TlsServerConfig>,
+    entropy: E,
+    timeout: Duration,
+) -> Result<Box<TlsSession>, ServerHandshakeDriverError> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| ServerHandshakeDriverError::Record(record::RecordError::Io(e)))?;
+    let mut core = ServerHandshake::with_entropy(config, entropy);
+    loop {
+        match record::read_record(stream, core.record_kind()) {
+            Ok(Some(record)) => match core.handle_record(&record) {
+                Ok(Step::Continue(output)) => {
+                    write_all_records(stream, &output, core.record_kind())
+                        .map_err(ServerHandshakeDriverError::Record)?;
+                }
+                Ok(Step::Complete(output, session)) => {
+                    write_all_records(stream, &output, core.record_kind())
+                        .map_err(ServerHandshakeDriverError::Record)?;
+                    return Ok(session);
+                }
+                Ok(Step::ClosedByPeer(output)) => {
+                    let _ = write_all_records(stream, &output, core.record_kind());
+                    let _ = stream.shutdown();
+                    return Err(ServerHandshakeDriverError::ClosedByPeer);
+                }
+                Err(err) => {
+                    let alert_output = core.take_pending_alert_output();
+                    let _ = write_all_records(stream, &alert_output, core.record_kind());
+                    let _ = stream.shutdown();
+                    return Err(ServerHandshakeDriverError::Handshake(err));
+                }
+            },
+            Ok(None) => {
+                let _ = stream.shutdown();
+                return Err(ServerHandshakeDriverError::Record(
+                    record::RecordError::Truncated,
+                ));
+            }
+            Err(e) => {
+                let alert_output = core.fail_on_record_error(e.alert_description());
+                let _ = write_all_records(stream, &alert_output, core.record_kind());
+                let _ = stream.shutdown();
+                return Err(ServerHandshakeDriverError::Record(e));
+            }
+        }
+    }
+}
+
+fn write_all_records<S: Write>(
+    stream: &mut S,
+    records: &[Record],
+    kind: RecordKind,
+) -> Result<(), record::RecordError> {
+    let mut buf = Vec::new();
+    for record in records {
+        record.serialize_into(&mut buf, kind)?;
+    }
+    if !buf.is_empty() {
+        stream.write_all(&buf).map_err(record::RecordError::Io)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tls::client_hello::NegotiatedClientHello;
+
+    fn dummy_negotiated() -> NegotiatedClientHello {
+        NegotiatedClientHello {
+            client_random: [0u8; 32],
+            legacy_session_id: Vec::new(),
+            client_x25519_public: [0u8; 32],
+            server_name: None,
+        }
+    }
+
+    /// HelloRetryRequest 未送出であれば `RetryRequestX25519` を素直に
+    /// `SendHelloRetryRequest` へ写像する。
+    #[test]
+    fn decide_after_client_hello_sends_hrr_when_not_yet_sent() {
+        let action = decide_after_client_hello(ClientHelloDecision::RetryRequestX25519, false);
+        assert_eq!(action, ClientHelloAction::SendHelloRetryRequest);
+    }
+
+    /// 防御用の分岐: HRR 送出済みの接続で再度 `RetryRequestX25519` が
+    /// 返った場合は `RejectDuplicateHelloRetryRequest`（handshake_failure）。
+    /// `negotiate`／`Transcript` の契約上到達しないが、多層防御として
+    /// 直接固定する。
+    #[test]
+    fn decide_after_client_hello_rejects_second_hrr() {
+        let action = decide_after_client_hello(ClientHelloDecision::RetryRequestX25519, true);
+        assert_eq!(action, ClientHelloAction::RejectDuplicateHelloRetryRequest);
+    }
+
+    /// `Accept` はそのまま素通しする。
+    #[test]
+    fn decide_after_client_hello_accepts_regardless_of_hrr_state() {
+        let negotiated = dummy_negotiated();
+        let action =
+            decide_after_client_hello(ClientHelloDecision::Accept(negotiated.clone()), false);
+        assert_eq!(action, ClientHelloAction::Accept(negotiated.clone()));
+        let action =
+            decide_after_client_hello(ClientHelloDecision::Accept(negotiated.clone()), true);
+        assert_eq!(action, ClientHelloAction::Accept(negotiated));
+    }
+
+    /// `fatal_alert_of` の網羅的な写像固定（`RecordLayer`／`AlertDecode` は
+    /// 渡された `AlertDescription` をそのまま返す。`ReceivedFatalAlert`・
+    /// poison 系は応答しない）。
+    #[test]
+    fn fatal_alert_of_covers_all_variants() {
+        assert_eq!(
+            fatal_alert_of(&ServerHandshakeError::UnexpectedMessage),
+            Some(AlertDescription::UnexpectedMessage)
+        );
+        assert_eq!(
+            fatal_alert_of(&ServerHandshakeError::Entropy),
+            Some(AlertDescription::InternalError)
+        );
+        assert_eq!(
+            fatal_alert_of(&ServerHandshakeError::X25519(
+                X25519Error::AllZeroSharedSecret
+            )),
+            Some(AlertDescription::HandshakeFailure)
+        );
+        assert_eq!(
+            fatal_alert_of(&ServerHandshakeError::DuplicateHelloRetryRequest),
+            Some(AlertDescription::HandshakeFailure)
+        );
+        assert_eq!(
+            fatal_alert_of(&ServerHandshakeError::ReceivedFatalAlert(10)),
+            None
+        );
+        assert_eq!(fatal_alert_of(&ServerHandshakeError::AlreadyFailed), None);
+        assert_eq!(fatal_alert_of(&ServerHandshakeError::AlreadyClosed), None);
+        assert_eq!(
+            fatal_alert_of(&ServerHandshakeError::RecordLayer(
+                AlertDescription::RecordOverflow
+            )),
+            Some(AlertDescription::RecordOverflow)
+        );
+    }
+}

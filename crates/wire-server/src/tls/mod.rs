@@ -73,13 +73,25 @@
 //!   [`key_schedule::TrafficSecret::finished_key`]・[`transcript`] の
 //!   チェックポイントをつなぐ
 //!
-//! alert の実送出やハンドシェイク状態機械（#965）・接続への結線
-//! （#966 以降）はいずれも後続 sub-issue の担当であり、本モジュールは
-//! 対象外のまま。並列開発時のコンフリクトを避けるため、後続 sub-issue は
-//! `pub mod` を 1 行ずつ追加していく想定。
+//! - [`alert`]: alert メッセージ（RFC 8446 §6）の parse／serialize と
+//!   受信 alert の分類（Issue #965）。実送出は [`server_handshake`] が担う
+//! - [`server_handshake`][]: サーバー側ハンドシェイク状態機械
+//!   （ClientHello 受信から client Finished 検証まで。Issue #965）。
+//!   [`handshake`]・[`client_hello`]・[`x25519`]・[`key_schedule`]・
+//!   [`record_protection`]・[`transcript`]・[`finished`]・
+//!   [`certificate_verify`]・[`x509`] をつなぎ、alert の実送出・
+//!   ハンドシェイク中の読み取りタイムアウトを提供する
+//!
+//! 接続への結線（`SSLRequest` への `'S'` 応答・`server.rs`／
+//! `handshake.rs` の実接続、CLI からの証明書・鍵読み込み、HTTPS 表層、
+//! 3 クライアント接続テスト、channel binding）はいずれも #966 以降の
+//! 後続 sub-issue の担当であり、本モジュールは対象外のまま。並列開発時の
+//! コンフリクトを避けるため、後続 sub-issue は `pub mod` を 1 行ずつ
+//! 追加していく想定。
 
 pub mod aes;
 pub mod aes_gcm;
+pub mod alert;
 pub mod certificate_verify;
 pub mod client_hello;
 pub(crate) mod der;
@@ -93,6 +105,7 @@ pub mod pem;
 pub mod pkcs8;
 pub mod record;
 pub mod record_protection;
+pub mod server_handshake;
 pub mod sha512;
 pub mod transcript;
 pub mod x25519;
