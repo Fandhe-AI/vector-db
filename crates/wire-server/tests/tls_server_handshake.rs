@@ -928,7 +928,7 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let addr = listener.local_addr().expect("local addr");
 
-    let server_thread = std::thread::spawn(move || -> (Vec<u8>, Vec<u8>) {
+    let server_thread = std::thread::spawn(move || -> (Vec<u8>, Vec<u8>, Option<Duration>) {
         let (mut socket, _) = listener.accept().expect("accept connection");
         let mut session =
             wire_server::tls::server_handshake::perform_server_handshake_with_timeout(
@@ -937,6 +937,17 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
                 Duration::from_secs(5),
             )
             .expect("handshake must complete over the driver");
+
+        // #965 レビュー指摘の回帰: ハンドシェイク中に `DeadlineReader` が
+        // 残り時間で設定した読み取りタイムアウト（注入した overall
+        // timeout=5s 由来。`limits::READ_TIMEOUT`=30s とは異なる値）が、
+        // 成功時に通常運用値へ戻されていることを確認する。ここで戻して
+        // いなければ、5s の期限にどれだけ食い込んだかに依存する短い
+        // タイムアウトのまま残り、以降のアプリケーションデータ読み取りが
+        // 意図より大幅に早くタイムアウトし得る。
+        let read_timeout_after_handshake = socket
+            .read_timeout()
+            .expect("querying the socket read timeout must succeed");
 
         // サーバー → クライアントのアプリケーションデータ。
         let payload = b"hello from server (driver)".to_vec();
@@ -965,7 +976,7 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
                 panic!("expected application data, got close_notify")
             }
         };
-        (payload, received)
+        (payload, received, read_timeout_after_handshake)
     });
 
     let mut client_socket = TcpStream::connect(addr).expect("connect to loopback listener");
@@ -1133,10 +1144,17 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
         .write_all(&client_app_buf)
         .expect("write client application data");
 
-    let (server_sent_payload, server_received_payload) =
+    let (server_sent_payload, server_received_payload, read_timeout_after_handshake) =
         server_thread.join().expect("server thread must not panic");
     assert_eq!(inner.content, server_sent_payload);
     assert_eq!(server_received_payload, client_payload);
+    assert_eq!(
+        read_timeout_after_handshake,
+        Some(wire_server::limits::READ_TIMEOUT),
+        "read timeout must be restored to the normal operating value \
+         (limits::READ_TIMEOUT) immediately after a successful handshake, \
+         not left at the short deadline-derived value from the handshake itself"
+    );
 }
 
 /// 改ざんした client Finished（verify_data を 1 bit 反転）は

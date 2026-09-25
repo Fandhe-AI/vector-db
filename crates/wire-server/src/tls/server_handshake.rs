@@ -1093,6 +1093,20 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
                 Ok(Step::Complete(output, session)) => {
                     write_all_records(stream, &output, core.write_record_kind())
                         .map_err(ServerHandshakeDriverError::Record)?;
+                    // DeadlineReader はハンドシェイク中の各読み取りで
+                    // 「絶対期限までの残り時間」を set_read_timeout へ設定する
+                    // （上記コメント参照）。ハンドシェイクが期限直前まで
+                    // かかった接続では、この短いタイムアウトが読み取り
+                    // タイムアウトとしてソケットへ残ったまま次のアプリ
+                    // ケーションデータ読み取りへ入ってしまい、意図
+                    // （`limits::READ_TIMEOUT`）より大幅に早くタイムアウト
+                    // する（#965 レビュー指摘）。ハンドシェイク成功時は
+                    // 呼び出し元へ返す直前に通常運用値へ明示的に戻す。
+                    stream
+                        .set_read_timeout(Some(crate::limits::READ_TIMEOUT))
+                        .map_err(|e| {
+                            ServerHandshakeDriverError::Record(record::RecordError::Io(e))
+                        })?;
                     return Ok(session);
                 }
                 Ok(Step::ClosedByPeer(output)) => {
