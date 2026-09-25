@@ -2362,16 +2362,27 @@ impl EngineCore {
     /// `sql::view::resolve_from` とは別の入口だが、いずれも
     /// `catalog::Storage::view_definition` を単一の情報源とする）。他の
     /// エラー（構文エラー等）はそのまま透過する。
+    ///
+    /// ビュー定義の読み直し自体が失敗した場合（redb I/O エラー・破損した
+    /// ビュー定義〔`CatalogError::CorruptSchema`〕等）は「ビューではない」と
+    /// 同一視して `UndefinedTable` を返してはならない（破損したビューを
+    /// 「存在しない」と誤報告する fail-open になる。codex-review P1・PR #1048）。
+    /// `Ok(None)`（ビューとして存在しない）と `Err` を分け、`Err` は
+    /// `impl TableLookup for Storage::view_definition` と同じ
+    /// [`crate::catalog::table_lookup_error`] で写像する（`Backend`／
+    /// `CorruptSchema` は `Internal`〔`XX000`〕。第 2 の写像を作らない）。
     fn reclassify_write_to_view_error(
         &self,
         e: crate::sql::allowlist::SqlSurfaceError,
     ) -> crate::sql::allowlist::SqlSurfaceError {
         if let crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name } = &e {
-            if let Ok(Some(_)) = self.storage.view_definition(name) {
-                return crate::sql::allowlist::SqlSurfaceError::WrongObjectType {
-                    name: name.clone(),
-                };
-            }
+            return match self.storage.view_definition(name) {
+                Ok(Some(_)) => {
+                    crate::sql::allowlist::SqlSurfaceError::WrongObjectType { name: name.clone() }
+                }
+                Ok(None) => e,
+                Err(lookup_err) => crate::catalog::table_lookup_error(lookup_err),
+            };
         }
         e
     }
@@ -7945,5 +7956,57 @@ mod tests {
             result.is_err(),
             "array framing overhead must count toward the per-row byte limit (INDEX-4 ②)"
         );
+    }
+
+    /// 書き込み系文の対象名がテーブルとして見つからない（`42P01`）場合に行う
+    /// ビュー定義の読み直し（`reclassify_write_to_view_error`）が失敗したとき、
+    /// その失敗を「ビューではない」と同一視して `42P01` を返してはならない
+    /// （codex-review P1・Cursor Bugbot・PR #1048。TABLE-18・SQL-23・TASK-205）。
+    /// 破損したビュー定義を `VIEWS_TABLE` へ直接書き込み、`INSERT`／`TRUNCATE`
+    /// のいずれも内部エラー（`XX000`）へ倒れること、ビューとしても存在しない
+    /// 名前は従来どおり `42P01` のままであることを固定する。
+    #[test]
+    fn write_to_corrupt_view_definition_is_internal_error_not_undefined_table() {
+        let dir = tempdir();
+        let storage =
+            crate::storage::Storage::open(dir.path().join("corrupt-view.redb")).expect("open");
+        // テスト専用のセットアップ書き込みのため `commit_boundary` を経由せず
+        // `commit_raw_for_test` で commit する（`catalog.rs` の破損カタログ
+        // テストと同じ流儀。`table_generation_bump_coverage.rs` の走査対象外）。
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::VIEWS_TABLE)
+                .expect("open views table");
+            table
+                .insert("v", [0xff_u8, 0xfe, 0xfd].as_slice())
+                .expect("insert corrupt view definition");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt view definition");
+        let core = EngineCore::from_storage(storage, Box::new(crate::kernel::CpuScalarProvider));
+
+        for sql in [
+            "INSERT INTO v (id, embedding) VALUES (1, '[1,1]') USING OPERATION_ID 'op-corrupt-1'",
+            "TRUNCATE TABLE v USING OPERATION_ID 'op-corrupt-2'",
+        ] {
+            let err = core
+                .parse_sql(sql)
+                .err()
+                .unwrap_or_else(|| panic!("write to a corrupt view must fail: {sql}"));
+            assert_eq!(
+                err.wire_code(),
+                "XX000",
+                "corrupt view definition must not be reported as 42P01/42809: {sql} -> {err:?}"
+            );
+        }
+
+        // ビューとしても存在しない名前（`Ok(None)` 経路）は従来どおり `42P01`。
+        let err = core
+            .parse_sql("TRUNCATE TABLE nosuch USING OPERATION_ID 'op-corrupt-3'")
+            .err()
+            .unwrap_or_else(|| panic!("truncate of an unknown relation must fail"));
+        assert_eq!(err.wire_code(), "42P01");
     }
 }

@@ -64,7 +64,7 @@ const ENUM_TYPES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("enu
 /// 許可リストパーサー（`sql::allowlist::parse_view_body`）で再検証してから使う
 /// （第 2 の SQL パーサー・実行器を作らない設計。spec-confidentiality に配慮し
 /// 本コメントには TABLE-18・SQL-23 のポインタのみを記す）。
-const VIEWS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
+pub(crate) const VIEWS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("views");
 
 /// 登録可能なビューの総数上限（[`MAX_LIST_TABLES`] と同じ既定値。本リポの
 /// 実装既定値であり DoS 対策）。
