@@ -125,6 +125,20 @@ fn expected_json_type_for_oid(oid: i32) -> &'static str {
     match oid {
         1700 => "numeric",
         25 => "text",
+        23 => "int4",
+        20 => "int8",
+        // WIRE-13・TASK-200・Issue #895 で追加された型（この固定表を独立表
+        // として維持する契約上、新型を使う fixture が追加されたら本表も
+        // 更新が必要になる。忘れた場合は fail-closed に `panic!` する）。
+        16 => "bool",
+        700 => "float4",
+        701 => "float8",
+        1082 => "date",
+        1114 => "timestamp",
+        17 => "bytea",
+        2950 => "uuid",
+        114 => "json",
+        3802 => "jsonb",
         other => panic!("unexpected type oid: {other}"),
     }
 }
