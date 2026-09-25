@@ -112,7 +112,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // （`sql/exec.rs::execute_insert_with_schema_in`／`execute_truncate_in` →
     // `tenant.rs` 各関数のドキュメント参照）。本呼び出し箇所自体は複数文を
     // まとめて確定させるだけで、新たな `user_rows/{table}` 書き込みを行わない。
-    ("sql/transaction.rs", 235),
+    ("sql/transaction.rs", 247),
     // `tenant::WriteTarget::with_txn`（SQL-31・TASK-221。`insert_row_unchecked`・
     // `insert_rows_unchecked`・`insert_typed_row_unchecked`・
     // `truncate_table_unchecked` が autocommit／明示トランザクションの本体を
@@ -122,7 +122,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 4 呼び出し元はいずれも自分のクロージャの最後で
     // `bump_table_generation_in_txn` を呼んでから `Ok(())` を返すことを目視で
     // 確認済み（各関数のドキュメントコメント参照）。
-    ("tenant.rs", 390),
+    ("tenant.rs", 397),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

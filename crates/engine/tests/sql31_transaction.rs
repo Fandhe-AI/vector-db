@@ -357,6 +357,47 @@ fn commit_while_failed_preserves_session_state_at_begin_for_rollback() {
     );
 }
 
+/// `Failed` 中は `ROLLBACK` 以外の文を parse より前に `25P02` で拒否する
+/// （構文エラー・字句エラーの文も `42601` ではなく `25P02`）。`ROLLBACK` は
+/// 受理して `Idle` へ戻る（PR #1041 レビュー指摘）。
+#[test]
+fn statements_while_failed_are_rejected_before_parsing_except_rollback() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect_err("nested BEGIN fails the transaction");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+
+    for bad_sql in [
+        "SELEC id FROM documents",
+        "SELECT 'unterminated",
+        "DROP TABLE documents",
+        "",
+    ] {
+        let err = engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, bad_sql)
+            .expect_err("rejected while failed");
+        assert_eq!(err.wire_code(), "25P02", "sql: {bad_sql:?}");
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+    }
+
+    assert_eq!(
+        engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, "rollback work")
+            .expect("rollback is accepted while failed"),
+        SqlOutcome::Rollback
+    );
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+}
+
 #[test]
 fn commit_or_rollback_without_begin_is_rejected() {
     let (engine, path) = new_core();

@@ -80,6 +80,18 @@ pub(crate) fn validate_transaction_control_tokens(
     Ok(ctrl)
 }
 
+/// SQL テキストの先頭トークンが `ROLLBACK`（大小無視）かどうか。明示トランザクションが
+/// `Failed` の間に受理してよい文かを parse 前に判定するために使う（SQL-31・TASK-221。
+/// `core::EngineCore::execute_sql_in_txn`、wire-server の拡張クエリ Parse が呼ぶ）。
+/// `ROLLBACK` の規範形の検証は通常どおり parse に任せる。字句解析に失敗した入力は
+/// `false`（fail-closed。`25P02` で拒否される側に倒す）。
+pub fn is_rollback_statement(sql: &str) -> bool {
+    matches!(
+        crate::sql::lexer::tokenize(sql).ok().as_deref().and_then(|t| t.first()),
+        Some(Token::Ident(name)) if name.eq_ignore_ascii_case("ROLLBACK")
+    )
+}
+
 /// [`SessionTransaction`] の対外的な状態（#943・`WIRE-19` が `ReadyForQuery` の
 /// 状態バイトへ写像する予定の入口。本 Issue では照会 API の公開までとし、
 /// `'I'` 固定の送出は変更しない）。

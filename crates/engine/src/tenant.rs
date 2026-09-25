@@ -379,20 +379,38 @@ impl<'a> WriteTarget<'a> {
     /// 既存 `*_unchecked` 関数群と同じ「TOCTOU なし・部分書き込みを残さない」
     /// 契約を保つ）。`InTxn` は commit を一切呼ばず、`f` の結果をそのまま返す
     /// （commit／abort は `COMMIT`／`ROLLBACK` 文が一括で行う。SQL-31・RECOVER-12）。
+    ///
+    /// `f` が [`TxnEffect::NoOp`] を返した場合（空バッチ等、何も書き込まなかった
+    /// 場合）、`Autocommit` は commit せず abort して閉じる。commit すると
+    /// グローバル世代が進み、世代で失効するキャッシュを無駄に捨ててしまうため
+    /// （main の `insert_rows_unchecked` が空バッチで commit 前に早期 return
+    /// していた挙動を保つ。PR #1041 レビュー指摘）。
     fn with_txn<T>(
         &self,
-        f: impl FnOnce(&redb::WriteTransaction) -> Result<T, TenantWriteError>,
+        f: impl FnOnce(&redb::WriteTransaction) -> Result<(T, TxnEffect), TenantWriteError>,
     ) -> Result<T, TenantWriteError> {
         match self {
             WriteTarget::Autocommit(storage) => {
                 let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
-                let value = f(&write_txn)?;
-                crate::recovery::commit_boundary::commit(write_txn)?;
+                let (value, effect) = f(&write_txn)?;
+                match effect {
+                    TxnEffect::Wrote => crate::recovery::commit_boundary::commit(write_txn)?,
+                    // 何も書いていないため drop（abort）で閉じ、世代を進めない。
+                    TxnEffect::NoOp => drop(write_txn),
+                }
                 Ok(value)
             }
-            WriteTarget::InTxn(write_txn) => f(write_txn),
+            WriteTarget::InTxn(write_txn) => f(write_txn).map(|(value, _)| value),
         }
     }
+}
+
+/// [`WriteTarget::with_txn`] に渡すクロージャが、書き込みを行ったかどうかを
+/// 返すための印。`NoOp` のとき autocommit 経路は commit しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxnEffect {
+    Wrote,
+    NoOp,
 }
 
 impl TenantWriteError {
@@ -690,7 +708,7 @@ pub(crate) fn insert_row_unchecked(
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         drop(row_table);
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
-        Ok(())
+        Ok(((), TxnEffect::Wrote))
     })
 }
 
@@ -775,12 +793,9 @@ pub(crate) fn insert_rows_unchecked(
     target.with_txn(|write_txn| {
         let schema = require_table_schema_write(write_txn, table)?;
         if rows.is_empty() {
-            // 空バッチは書き込みを一切行わない（[`WriteTarget::with_txn`] の
-            // autocommit 経路では、この後の `Ok(())` を受けて空の write_txn を
-            // そのまま commit する。行を 1 件も書かないため commit しても
-            // 世代・データいずれも変化せず、以前の「drop で abort する」実装と
-            // 観測可能な挙動は変わらない）。
-            return Ok(());
+            // 空バッチは書き込みを一切行わない。`NoOp` を返し、autocommit 経路では
+            // commit せずに abort させる（グローバル世代を進めない。main と同じ挙動）。
+            return Ok(((), TxnEffect::NoOp));
         }
         // エンコードは行ごとに 1 回のみ（Issue #397）: 台帳ハッシュ計算用
         // （`content_hash::for_insert_batch` 内部）と redb 書き込み用で
@@ -869,7 +884,7 @@ pub(crate) fn insert_rows_unchecked(
         }
         drop(row_table);
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
-        Ok(())
+        Ok(((), TxnEffect::Wrote))
     })
 }
 
@@ -1023,7 +1038,7 @@ pub(crate) fn insert_typed_row_unchecked(
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         drop(row_table);
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
-        Ok(())
+        Ok(((), TxnEffect::Wrote))
     })
 }
 
@@ -3242,7 +3257,7 @@ pub(crate) fn truncate_table_unchecked(
             .map_err(CatalogError::from)?;
         drop(row_table);
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
-        Ok(())
+        Ok(((), TxnEffect::Wrote))
     })
 }
 
@@ -4181,13 +4196,21 @@ mod tests {
         assert_eq!(read_gen("sibling"), sibling_gen);
 
         // 空バッチは commit 自体を行わない既存契約（`insert_rows_unchecked` の
-        // ドキュメントコメント参照）のとおり、世代を進めない。
+        // ドキュメントコメント参照）のとおり、世代を進めない。テーブル単位世代に
+        // 加え、commit でのみ進むグローバル世代も進まないこと（空の write_txn を
+        // commit しない）を確認する（PR #1041 レビュー指摘）。
+        let global_before = storage.current_generation().expect("global generation");
         insert_rows(&storage, "docs", &a, &[], &op("bump-insert-rows-empty"))
             .expect("insert_rows (empty)");
         assert_eq!(
             read_gen("docs"),
             prev,
             "insert_rows with an empty batch must not bump the generation"
+        );
+        assert_eq!(
+            storage.current_generation().expect("global generation"),
+            global_before,
+            "insert_rows with an empty batch must not commit (global generation advanced)"
         );
         assert_eq!(read_gen("sibling"), sibling_gen);
 

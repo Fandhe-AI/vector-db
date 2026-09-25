@@ -2582,6 +2582,17 @@ impl EngineCore {
         txn: &mut crate::sql::transaction::SessionTransaction<'e>,
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // `Failed` 中は `ROLLBACK` 以外を parse より前に `25P02` で拒否する
+        // （PR #1041 レビュー指摘: parse を先に行うと、不正な SQL に対して
+        // `42601` 等が返り `Failed` であることがクライアントへ伝わらない）。
+        // `ROLLBACK` かどうかは先頭トークンだけで判定し、`ROLLBACK` の規範形の
+        // 検証は通常どおり parse に任せる。字句解析自体に失敗した入力は
+        // `ROLLBACK` ではないものとして `25P02` に倒す。
+        if txn.status() == crate::sql::transaction::TransactionStatus::Failed
+            && !crate::sql::transaction::is_rollback_statement(sql)
+        {
+            return Err(txn.take_failed_error());
+        }
         // 構文・許可リスト検証のエラーも、明示トランザクション中なら種類を問わず
         // `Failed` へ遷移させる（PostgreSQL と同じ。`Active` のまま残すと後続の
         // `COMMIT` が先行する書き込みを永続化してしまう。PR #1041 レビュー指摘）。
@@ -5618,7 +5629,6 @@ impl VectorCore for EngineCore {
         Ok(row)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
