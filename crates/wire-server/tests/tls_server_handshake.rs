@@ -438,6 +438,106 @@ fn handshake_absolute_deadline_bounds_slow_drip_client() {
     );
 }
 
+/// PR #1046 レビュー指摘の回帰（driver 経由）: ClientHello を送ったあと
+/// 受信を止めた相手に対しても、server flight（ServerHello・証明書等）の
+/// 送出はハンドシェイク全体の絶対期限内に `Err` で打ち切られ、受信側の
+/// 期限超過と同じく接続が shutdown されること。
+///
+/// 実 loopback ソケットは送信バッファが server flight より十分大きく
+/// 書き込みブロックを再現できないため、「OS が `set_write_timeout` を
+/// 尊重し、相手が読まないまま指定時間だけブロックしたのちタイムアウトを
+/// 返す」挙動をモックで再現する。
+#[test]
+fn server_flight_write_is_bounded_by_absolute_deadline_when_peer_stops_reading() {
+    struct StalledReader {
+        inbound: std::io::Cursor<Vec<u8>>,
+        write_timeout: Option<Duration>,
+        write_attempts: usize,
+        shutdown_called: bool,
+    }
+
+    impl Read for StalledReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inbound.read(buf)
+        }
+    }
+
+    impl Write for StalledReader {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            self.write_attempts += 1;
+            // 期限の設定が無ければテスト全体が長時間止まるのを防ぐため、
+            // 上限として 5 秒だけ待つ（この場合は下の経過時間アサーションで
+            // 失敗として検出される）。
+            std::thread::sleep(self.write_timeout.unwrap_or(Duration::from_secs(5)));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "peer never reads",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl wire_server::tls::server_handshake::HandshakeTransport for StalledReader {
+        fn set_read_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn set_write_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()> {
+            self.write_timeout = timeout;
+            Ok(())
+        }
+
+        fn shutdown(&mut self) -> std::io::Result<()> {
+            self.shutdown_called = true;
+            Ok(())
+        }
+    }
+
+    let client_ephemeral = EphemeralSecret::from_bytes([0x33u8; 32]);
+    let (client_hello_record, _) = build_client_hello(*client_ephemeral.public_key().as_bytes());
+    let mut inbound = Vec::new();
+    client_hello_record
+        .serialize_into(&mut inbound, RecordKind::Plaintext)
+        .expect("serialize client hello record");
+
+    let mut peer = StalledReader {
+        inbound: std::io::Cursor::new(inbound),
+        write_timeout: None,
+        write_attempts: 0,
+        shutdown_called: false,
+    };
+    let overall_timeout = Duration::from_millis(150);
+
+    let started = Instant::now();
+    let result = wire_server::tls::server_handshake::perform_server_handshake_with_timeout(
+        &mut peer,
+        test_config(),
+        overall_timeout,
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "a peer that stops reading must not complete the handshake"
+    );
+    assert!(
+        peer.write_attempts > 0,
+        "the server flight must actually have been attempted (non-vacuous)"
+    );
+    assert!(
+        elapsed < overall_timeout * 4,
+        "server flight write must be bounded by the absolute deadline, \
+         got {elapsed:?} for timeout {overall_timeout:?}"
+    );
+    assert!(
+        peer.shutdown_called,
+        "a write-side deadline failure must shut the connection down"
+    );
+}
+
 // ---- 独立クライアントによる完全な往復（受け入れ条件 3 以外の全体結合）。
 // ----
 
@@ -928,56 +1028,68 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let addr = listener.local_addr().expect("local addr");
 
-    let server_thread = std::thread::spawn(move || -> (Vec<u8>, Vec<u8>, Option<Duration>) {
-        let (mut socket, _) = listener.accept().expect("accept connection");
-        let mut session =
-            wire_server::tls::server_handshake::perform_server_handshake_with_timeout(
-                &mut socket,
-                test_config(),
-                Duration::from_secs(5),
-            )
-            .expect("handshake must complete over the driver");
+    let server_thread = std::thread::spawn(
+        move || -> (Vec<u8>, Vec<u8>, Option<Duration>, Option<Duration>) {
+            let (mut socket, _) = listener.accept().expect("accept connection");
+            let mut session =
+                wire_server::tls::server_handshake::perform_server_handshake_with_timeout(
+                    &mut socket,
+                    test_config(),
+                    Duration::from_secs(5),
+                )
+                .expect("handshake must complete over the driver");
 
-        // #965 レビュー指摘の回帰: ハンドシェイク中に `DeadlineReader` が
-        // 残り時間で設定した読み取りタイムアウト（注入した overall
-        // timeout=5s 由来。`limits::READ_TIMEOUT`=30s とは異なる値）が、
-        // 成功時に通常運用値へ戻されていることを確認する。ここで戻して
-        // いなければ、5s の期限にどれだけ食い込んだかに依存する短い
-        // タイムアウトのまま残り、以降のアプリケーションデータ読み取りが
-        // 意図より大幅に早くタイムアウトし得る。
-        let read_timeout_after_handshake = socket
-            .read_timeout()
-            .expect("querying the socket read timeout must succeed");
+            // #965 レビュー指摘の回帰: ハンドシェイク中に `DeadlineReader` が
+            // 残り時間で設定した読み取りタイムアウト（注入した overall
+            // timeout=5s 由来。`limits::READ_TIMEOUT`=30s とは異なる値）が、
+            // 成功時に通常運用値へ戻されていることを確認する。ここで戻して
+            // いなければ、5s の期限にどれだけ食い込んだかに依存する短い
+            // タイムアウトのまま残り、以降のアプリケーションデータ読み取りが
+            // 意図より大幅に早くタイムアウトし得る。
+            let read_timeout_after_handshake = socket
+                .read_timeout()
+                .expect("querying the socket read timeout must succeed");
+            // 送信側も同様に、`DeadlineWriter` が残り時間で設定した書き込み
+            // タイムアウトが成功時に通常運用値へ戻されていることを確認する。
+            let write_timeout_after_handshake = socket
+                .write_timeout()
+                .expect("querying the socket write timeout must succeed");
 
-        // サーバー → クライアントのアプリケーションデータ。
-        let payload = b"hello from server (driver)".to_vec();
-        let records = session
-            .seal_application_data(&payload)
-            .expect("valid application data");
-        let mut buf = Vec::new();
-        for record in &records {
-            record
-                .serialize_into(&mut buf, RecordKind::Ciphertext)
-                .expect("serialize application data record");
-        }
-        socket.write_all(&buf).expect("write application data");
-
-        // クライアント → サーバーのアプリケーションデータを読み、
-        // 中身をそのままテスト側（メインスレッド）へ持ち帰って照合する。
-        let record = record::read_record(&mut socket, RecordKind::Ciphertext)
-            .expect("read client application data")
-            .expect("client application data record present");
-        let event = session
-            .open_record(&record)
-            .expect("valid application record");
-        let received = match event {
-            wire_server::tls::server_handshake::AppEvent::ApplicationData(data) => data,
-            wire_server::tls::server_handshake::AppEvent::CloseNotify => {
-                panic!("expected application data, got close_notify")
+            // サーバー → クライアントのアプリケーションデータ。
+            let payload = b"hello from server (driver)".to_vec();
+            let records = session
+                .seal_application_data(&payload)
+                .expect("valid application data");
+            let mut buf = Vec::new();
+            for record in &records {
+                record
+                    .serialize_into(&mut buf, RecordKind::Ciphertext)
+                    .expect("serialize application data record");
             }
-        };
-        (payload, received, read_timeout_after_handshake)
-    });
+            socket.write_all(&buf).expect("write application data");
+
+            // クライアント → サーバーのアプリケーションデータを読み、
+            // 中身をそのままテスト側（メインスレッド）へ持ち帰って照合する。
+            let record = record::read_record(&mut socket, RecordKind::Ciphertext)
+                .expect("read client application data")
+                .expect("client application data record present");
+            let event = session
+                .open_record(&record)
+                .expect("valid application record");
+            let received = match event {
+                wire_server::tls::server_handshake::AppEvent::ApplicationData(data) => data,
+                wire_server::tls::server_handshake::AppEvent::CloseNotify => {
+                    panic!("expected application data, got close_notify")
+                }
+            };
+            (
+                payload,
+                received,
+                read_timeout_after_handshake,
+                write_timeout_after_handshake,
+            )
+        },
+    );
 
     let mut client_socket = TcpStream::connect(addr).expect("connect to loopback listener");
 
@@ -1144,14 +1256,25 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
         .write_all(&client_app_buf)
         .expect("write client application data");
 
-    let (server_sent_payload, server_received_payload, read_timeout_after_handshake) =
-        server_thread.join().expect("server thread must not panic");
+    let (
+        server_sent_payload,
+        server_received_payload,
+        read_timeout_after_handshake,
+        write_timeout_after_handshake,
+    ) = server_thread.join().expect("server thread must not panic");
     assert_eq!(inner.content, server_sent_payload);
     assert_eq!(server_received_payload, client_payload);
     assert_eq!(
         read_timeout_after_handshake,
         Some(wire_server::limits::READ_TIMEOUT),
         "read timeout must be restored to the normal operating value \
+         (limits::READ_TIMEOUT) immediately after a successful handshake, \
+         not left at the short deadline-derived value from the handshake itself"
+    );
+    assert_eq!(
+        write_timeout_after_handshake,
+        Some(wire_server::limits::READ_TIMEOUT),
+        "write timeout must be restored to the normal operating value \
          (limits::READ_TIMEOUT) immediately after a successful handshake, \
          not left at the short deadline-derived value from the handshake itself"
     );

@@ -171,6 +171,21 @@ Issue #965 の PR（#1046）に対する codex・Bugbot の指摘（いずれも
    単体テスト `write_all_records_is_bounded_by_absolute_deadline_when_
    peer_stops_reading`（相手が受信を止めた状況を模したモックで、
    書き込みが絶対期限に束縛されることを固定）を追加した。
+5. **送信側期限の後始末と失敗経路の整合**（上記 4 の追補）: 接続受理時の
+   `limits::apply_read_timeout` は読み書き双方へ `limits::READ_TIMEOUT` を
+   設定するが、`DeadlineWriter` が設定した「残り時間」の書き込み
+   タイムアウトはハンドシェイク成功後もソケットに残り、以後の
+   アプリケーションデータ送出を早期にタイムアウトさせ得た（読み取り側で
+   既に是正した残留と同型）。成功時に読み取りタイムアウトと同じく書き込み
+   タイムアウトも `limits::READ_TIMEOUT` へ戻すよう変更した。あわせて
+   server flight の送出失敗（期限超過を含む）時は、受信側の期限超過と
+   同じく接続を shutdown してから `Record` エラーを返すよう揃えた（相手が
+   受信を止めているため alert は送らない）。結合テスト
+   `server_flight_write_is_bounded_by_absolute_deadline_when_peer_stops_
+   reading`（ClientHello 受信後に受信を止めた相手に対し、driver 経由で
+   期限内に失敗し shutdown されることを固定）を追加し、
+   `full_handshake_round_trip_over_driver_with_loopback_stream` に成功後の
+   書き込みタイムアウト復元の検証を加えた。
 
 ## 対象外（後続 sub-issue の担当）
 
@@ -204,7 +219,8 @@ KeyUpdate・NewSessionTicket・0-RTT・クライアント証明書は親 Issue �
     上限撤廃に合わせ更新）
   - ハンドシェイク全体の絶対期限（低速送信クライアントに対する強制。
     PR #1046 で追加。読み取り側に加え、相手が受信を止めた場合の
-    送信側（server flight 送出）の束縛も単体テストで固定）
+    送信側（server flight 送出）の束縛も単体・driver 経由の結合テストで
+    固定。成功後の読み書きタイムアウトの通常値への復元も検証）
   - `TlsSession` の終端状態（`close_notify` 送信/受信後・復号失敗後の
     poison。PR #1046 で追加）
   - 状態外メッセージ（`ApplicationData` 早期受信）・解析失敗

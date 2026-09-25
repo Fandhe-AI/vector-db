@@ -1130,12 +1130,24 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
         match record_result {
             Ok(Some(record)) => match core.handle_record(&record) {
                 Ok(Step::Continue(output)) => {
-                    write_all_records(stream, &output, core.write_record_kind(), deadline)
-                        .map_err(ServerHandshakeDriverError::Record)?;
+                    // 送出失敗（`DeadlineWriter` の絶対期限超過を含む）は
+                    // 受信側の期限超過（下の `Err(e)` 腕）と同じく接続を
+                    // shutdown してから `Record` エラーで返す。相手が受信を
+                    // 止めている以上 alert は届かないため送らない。
+                    if let Err(e) =
+                        write_all_records(stream, &output, core.write_record_kind(), deadline)
+                    {
+                        let _ = stream.shutdown();
+                        return Err(ServerHandshakeDriverError::Record(e));
+                    }
                 }
                 Ok(Step::Complete(output, session)) => {
-                    write_all_records(stream, &output, core.write_record_kind(), deadline)
-                        .map_err(ServerHandshakeDriverError::Record)?;
+                    if let Err(e) =
+                        write_all_records(stream, &output, core.write_record_kind(), deadline)
+                    {
+                        let _ = stream.shutdown();
+                        return Err(ServerHandshakeDriverError::Record(e));
+                    }
                     // DeadlineReader はハンドシェイク中の各読み取りで
                     // 「絶対期限までの残り時間」を set_read_timeout へ設定する
                     // （上記コメント参照）。ハンドシェイクが期限直前まで
@@ -1147,6 +1159,17 @@ pub(crate) fn perform_server_handshake_with<S: HandshakeTransport, E: HandshakeE
                     // 呼び出し元へ返す直前に通常運用値へ明示的に戻す。
                     stream
                         .set_read_timeout(Some(crate::limits::READ_TIMEOUT))
+                        .map_err(|e| {
+                            ServerHandshakeDriverError::Record(record::RecordError::Io(e))
+                        })?;
+                    // 送信側も同様: `DeadlineWriter` が残り時間で設定した
+                    // 書き込みタイムアウトを、接続受理時に
+                    // `limits::apply_read_timeout` が読み書き双方へ設定する
+                    // 通常運用値（`limits::READ_TIMEOUT`）へ戻す。戻さないと
+                    // 以降のアプリケーションデータ送出がハンドシェイクの
+                    // 残り時間で早期にタイムアウトし得る。
+                    stream
+                        .set_write_timeout(Some(crate::limits::READ_TIMEOUT))
                         .map_err(|e| {
                             ServerHandshakeDriverError::Record(record::RecordError::Io(e))
                         })?;
