@@ -142,6 +142,14 @@ impl EdwardsPoint {
         self.t.zeroize();
     }
 
+    /// 射影座標のまま単位元判定（`X/Z=0 かつ Y/Z=1` を、逆元計算を経ず
+    /// `X=0 かつ Y=Z` として判定する。**公開値専用**（[`verify`] の
+    /// 低位数公開鍵チェックが使う。逆元計算を避けるのは
+    /// [`EdwardsPoint::compress`] と異なり検証の都度呼ばれるため）。
+    fn is_identity(&self) -> bool {
+        self.x.equals(&Fe::ZERO) && self.y.equals(&self.z)
+    }
+
     /// 圧縮エンコード（RFC 8032 §5.1.2）。y 座標の 32 バイトに x 座標の
     /// 偶奇を最上位ビットへ埋め込む。
     fn compress(&self) -> [u8; POINT_LEN] {
@@ -629,6 +637,15 @@ impl fmt::Debug for SigningKey {
     }
 }
 
+/// 低位数点（曲線の cofactor 8 が誘導する小さい捩れ部分群に属する点。
+/// 位数が 1・2・4・8 のいずれか）かどうかを判定する。`[8]P == identity`
+/// を、cofactor が 2^3 であることを利用して doubling を 3 回適用する
+/// だけで計算する（full [`scalar_mul`] は不要）。**公開値専用**
+/// （[`verify`] の公開鍵検査が使う。分岐があってもよい）。
+fn is_low_order(p: &EdwardsPoint) -> bool {
+    p.double().double().double().is_identity()
+}
+
 /// 署名検証（RFC 8032 §5.1.7）。自己整合性テスト用（サーバーはクライアント
 /// 証明書を扱わないため、production 経路での検証呼び出し元は無い）。
 /// すべて公開値（`public_key`・`message`・`signature`）を扱うため分岐が
@@ -663,6 +680,13 @@ pub fn verify(
     }
 
     let a = EdwardsPoint::decompress(public_key).map_err(|_| Ed25519Error::InvalidPublicKey)?;
+    if is_low_order(&a) {
+        // 公開鍵が単位元等の低位数点だと [k]A が常に単位元になり、
+        // R = [S]B を満たす署名であればメッセージ・k に関係なく
+        // [S]B == R + [k]A が成立してしまう（署名の偽造）。
+        // cofactor 8 由来の低位数公開鍵はここで一律拒否する。
+        return Err(Ed25519Error::LowOrderPublicKey);
+    }
     let r = EdwardsPoint::decompress(r_bytes).map_err(|_| Ed25519Error::InvalidSignaturePoint)?;
 
     let mut hasher = Sha512::new();
@@ -701,6 +725,10 @@ pub enum Ed25519Error {
     /// 公開鍵の圧縮エンコードが不正（非正準・平方根が存在しない・
     /// x=0 かつ符号ビットが 1 のいずれか）。
     InvalidPublicKey,
+    /// 公開鍵が低位数点（cofactor 8 由来の小さい捩れ部分群に属する点。
+    /// 単位元を含む）。放置するとメッセージに依存しない署名偽造を許す
+    /// ため拒否する。
+    LowOrderPublicKey,
     /// 署名の `R` の圧縮エンコードが不正（`InvalidPublicKey` と同種の
     /// 判定を R に対して行った結果）。
     InvalidSignaturePoint,
@@ -720,6 +748,7 @@ impl Ed25519Error {
             Ed25519Error::InvalidSignatureLength => super::record::AlertDescription::DecodeError,
             Ed25519Error::NonCanonicalScalar
             | Ed25519Error::InvalidPublicKey
+            | Ed25519Error::LowOrderPublicKey
             | Ed25519Error::InvalidSignaturePoint
             | Ed25519Error::VerificationFailed => super::record::AlertDescription::DecryptError,
         }
@@ -732,6 +761,7 @@ impl fmt::Display for Ed25519Error {
             Ed25519Error::InvalidSignatureLength => "Ed25519 signature must be 64 bytes",
             Ed25519Error::NonCanonicalScalar => "Ed25519 signature S is not canonical mod L",
             Ed25519Error::InvalidPublicKey => "Ed25519 public key point is invalid",
+            Ed25519Error::LowOrderPublicKey => "Ed25519 public key has low order",
             Ed25519Error::InvalidSignaturePoint => "Ed25519 signature R point is invalid",
             Ed25519Error::VerificationFailed => "Ed25519 signature verification failed",
         };
@@ -938,6 +968,48 @@ mod tests {
         let mut bad = [0u8; 32];
         bad[0] = 2;
         assert!(verify(&bad, &msg, &sig).is_err());
+    }
+
+    #[test]
+    fn identity_public_key_is_rejected_as_low_order() {
+        // 単位元 (0,1) の圧縮エンコード。y=1・符号ビット 0（x=0 の正準表現）。
+        let key = SigningKey::from_seed_bytes(hex32(TEST_1.sk));
+        let msg = hex_vec(TEST_1.msg);
+        let sig = key.sign(&msg);
+        let mut identity_pk = [0u8; 32];
+        identity_pk[0] = 1;
+        assert_eq!(
+            verify(&identity_pk, &msg, &sig),
+            Err(Ed25519Error::LowOrderPublicKey)
+        );
+    }
+
+    #[test]
+    fn order_two_public_key_is_rejected_as_low_order() {
+        // 位数 2 の点 (0,-1)。y = p-1（正準表現。符号ビット 0 で x=0 と両立）。
+        let key = SigningKey::from_seed_bytes(hex32(TEST_1.sk));
+        let msg = hex_vec(TEST_1.msg);
+        let sig = key.sign(&msg);
+        // p - 1 の LE バイト列（field25519 のテストが使う p = 2^255-19 由来）。
+        let order_two_pk: [u8; 32] =
+            hex32("ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f");
+        assert_eq!(
+            verify(&order_two_pk, &msg, &sig),
+            Err(Ed25519Error::LowOrderPublicKey)
+        );
+    }
+
+    #[test]
+    fn low_order_public_key_with_arbitrary_signature_bytes_is_rejected() {
+        // 位数検査が S/R の値に関わらず先に働くことを確認する
+        // （メッセージに依存しない偽造を許さないことの直接的な回帰）。
+        let mut identity_pk = [0u8; 32];
+        identity_pk[0] = 1;
+        let sig = [0u8; SIGNATURE_LEN];
+        assert_eq!(
+            verify(&identity_pk, b"any message", &sig),
+            Err(Ed25519Error::LowOrderPublicKey)
+        );
     }
 
     #[test]
