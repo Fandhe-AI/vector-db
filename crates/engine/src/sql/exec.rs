@@ -3358,6 +3358,9 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
+        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約
+        // 違反。行キー衝突（`IdConflict`）と原因は異なるが `23505` は共有する。
+        TenantWriteError::UniqueViolation => SqlSurfaceError::unique_violation(),
         // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked`／
         // `update_row_columns_unchecked` 自体は `operation_id` 必須化ガード
         // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs`
@@ -3395,10 +3398,6 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         TenantWriteError::TooManyRowsScanned => {
             SqlSurfaceError::payload_too_large("too many rows scanned")
         }
-        // UNIQUE 制約違反（TABLE-16・TASK-204、Issue #905）。`_` 節（`XX000`）へ
-        // 丸めると `23505` を失い、クライアントが再送不能なエラーとして
-        // 誤って再試行判断してしまう。
-        TenantWriteError::UniqueViolation => SqlSurfaceError::UniqueViolation,
         // 同じく commit 前 abort の内部事象版（型不整合等。untrusted 入力起因では
         // ないため `XX000`。`_` 節と同じ分類だが意図を明示する）。
         TenantWriteError::ReturningProjectionFailed(_) => SqlSurfaceError::Internal {
@@ -3962,6 +3961,14 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         }
         IncrementalError::Write(TenantWriteError::OperationIdContentMismatch) => {
             SqlSurfaceError::OperationIdContentMismatch
+        }
+        // `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。TABLE-16・TASK-204）のテナント内一意性制約違反
+        // （`replace_typed_rows_by_text_key` の採番 id 範囲検査。`constraint.rs`
+        // ドキュメント参照）。行形 INSERT（[`map_write_error`]）と同じ `23505` へ
+        // 写像し、`_` 節（`XX000`）へ丸めない（クライアントが一意制約違反を内部
+        // エラーと取り違えないようにする）。
+        IncrementalError::Write(TenantWriteError::UniqueViolation) => {
+            SqlSurfaceError::unique_violation()
         }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),

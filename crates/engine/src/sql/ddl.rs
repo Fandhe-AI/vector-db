@@ -72,19 +72,24 @@ pub(crate) fn execute_create_table(
     storage: &Storage,
     validated: &ValidatedCreateTable,
 ) -> Result<CreateTableOutcome, SqlSurfaceError> {
-    let schema = TableSchema::new(validated.table_name.clone(), validated.columns.clone())
-        .with_unique_constraints(validated.unique_constraints.clone());
+    let mut schema = TableSchema::new(validated.table_name.clone(), validated.columns.clone());
+    // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
+    // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
+    // 正規化済みのため、ここでは素通しするだけでよい。
+    if let Some(primary_key) = validated.primary_key.clone() {
+        schema = schema.with_primary_key(primary_key);
+    }
+    // UNIQUE 制約（TABLE-16・TASK-204、Issue #905）。参照列の実在・型適格性は
+    // `sql::allowlist` が構造検証段階で判定済みで、`catalog::validate_schema`
+    // （`create_table` 内）が同じ不変条件を再検証する（違反は `Invalid` として
+    // 下記の `42601` へ写像される）。
+    if !validated.unique_constraints.is_empty() {
+        schema = schema.with_unique_constraints(validated.unique_constraints.clone());
+    }
     storage.create_table(&schema).map_err(|e| match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
         CatalogError::Invalid(detail) => {
             SqlSurfaceError::unsupported(format!("invalid table schema: {detail}"))
-        }
-        // UNIQUE 制約（TABLE-16・TASK-204、Issue #905）の宣言不正は、構文自体は
-        // 受理された後の意味論的検証（`sql::allowlist` 側で既に大半は拒否
-        // 済みだが、`validate_schema` が二重に検証する）であるため `Invalid` と
-        // 同じ `42601` へ丸める。
-        CatalogError::InvalidUniqueConstraint(detail) => {
-            SqlSurfaceError::unsupported(format!("invalid unique constraint: {detail}"))
         }
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の書き込み入口と同じく `55P03` を返す。
@@ -230,6 +235,7 @@ mod tests {
                 ),
                 crate::catalog::ColumnDef::new("body", crate::catalog::ColumnType::Text, true),
             ],
+            primary_key: None,
             unique_constraints: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table must succeed");
@@ -247,6 +253,7 @@ mod tests {
                 crate::catalog::ColumnType::Text,
                 true,
             )],
+            primary_key: None,
             unique_constraints: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("first create must succeed");
@@ -265,6 +272,7 @@ mod tests {
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),
                 crate::catalog::ColumnDef::new("b", crate::catalog::ColumnType::Vector(4), false),
             ],
+            primary_key: None,
             unique_constraints: Vec::new(),
         };
         let err = execute_create_table(&storage, &validated)

@@ -4,14 +4,17 @@
 //!
 //! `sql_create_table.rs` と同じ流儀（実 `Storage` ＋ `CpuScalarProvider`、
 //! `unique_db_path`／`CleanupGuard`）。SQL 表層（`CREATE TABLE ... UNIQUE`・
-//! `INSERT`・`UPDATE`・`UPSERT`）経由の検証を主とし、Rust API（`tenant::` の
-//! 生 `RowInput` 経路）・`Storage::alter_table_add_unique_constraint` は
-//! 単一検査点であることの確認のみ最小限行う。
+//! `INSERT`・`UPDATE`・`UPSERT`・明示トランザクション）経由の検証を主とし、
+//! `Storage::alter_table_add_unique_constraint` は最小限の確認に留める。
+//! 一意性検査は主キー（Issue #903）と共有する単一の検査点
+//! `constraint::enforce_unique_keys_in_txn` が担う。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::mode::SessionState;
+use engine::sql::transaction::TransactionStatus;
+use engine::sql::SqlOutcome;
 use engine::storage::Storage;
 
 #[path = "../src/test_util/temp_db.rs"]
@@ -374,10 +377,9 @@ fn upsert_do_update_rejects_conflicting_value() {
 /// （`DO UPDATE` 分岐を経由しない）が UNIQUE 列で衝突するケース（codex-review
 /// 指摘・Issue #905 PR レビュー: 単一行版・`DO UPDATE` 版・INSERT バッチ内衝突版の
 /// 結合テストは既存だったが、この組み合わせが欠けていた）。
-/// `tenant::upsert_typed_rows_unchecked` の第 1 パス（read-merge・plan 決定）→
-/// 第 2 パス（候補全体への 1 回の UNIQUE 制約検査）という構成では、新規挿入行
-/// 同士のバッチ内重複も候補集合の `HashSet` 経由で検出される
-/// （`tenant/unique_check.rs::check_against_table` のバッチ内重複検出）。
+/// 単一の検査点 `constraint::enforce_unique_keys_in_txn` は、書き込んだ行
+/// （`written_ids`）同士のキー衝突を第 1 段で検出するため、新規挿入行同士の
+/// バッチ内重複もここで拒否される。
 #[test]
 fn multi_row_upsert_rejects_internal_duplicate_among_new_insert_branches() {
     let (core, path) = new_core("uniq-upsert-batch-new-insert");
@@ -496,4 +498,225 @@ fn alter_table_drop_column_rejects_when_column_is_used_by_a_unique_constraint() 
         err,
         engine::catalog::CatalogError::DependentObjectsStillExist(_)
     ));
+}
+
+// --- 主キーとの併用 -------------------------------------------------------
+
+/// `PRIMARY KEY`（Issue #903）と UNIQUE 制約を同一テーブルで併用した場合も、
+/// 単一の検査点がそれぞれのキーを独立に判定する（主キー列は NULL 不可、UNIQUE
+/// 列は NULLS DISTINCT）。
+#[test]
+fn primary_key_and_unique_constraints_are_enforced_independently() {
+    let (core, path) = new_core("uniq-with-pk");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (code TEXT PRIMARY KEY, a TEXT UNIQUE)",
+    )
+    .expect("create table");
+
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, code, a) VALUES (1, 'k1', 'x') USING OPERATION_ID 'op-1'",
+    )
+    .expect("first insert must succeed");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, code, a) VALUES (2, 'k2', 'x') USING OPERATION_ID 'op-2'",
+        )
+        .expect_err("UNIQUE violation must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, code, a) VALUES (3, 'k1', 'y') USING OPERATION_ID 'op-3'",
+        )
+        .expect_err("PRIMARY KEY violation must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+    // UNIQUE 列の NULL は何行でも共存できる。
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, code) VALUES (4, 'k4') USING OPERATION_ID 'op-4'",
+    )
+    .expect("NULL in UNIQUE column must be accepted");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, code) VALUES (5, 'k5') USING OPERATION_ID 'op-5'",
+    )
+    .expect("second NULL in UNIQUE column must be accepted");
+}
+
+// --- 明示トランザクション（SQL-31・TASK-221） -----------------------------
+
+fn count_rows(core: &EngineCore, caller: &PolicyContext) -> usize {
+    core.execute_sql(caller, "SELECT id FROM docs LIMIT 100")
+        .expect("scan should succeed")
+        .rows
+        .len()
+}
+
+/// 明示トランザクション内の書き込みは共有 write トランザクションに未 commit の
+/// まま積まれる。一意性検査は同じ write トランザクション内で走査するため、同一
+/// トランザクション内の先行文が書いた未 commit 行との重複も見落とさず `23505`
+/// で拒否し、トランザクションは `Failed` へ遷移する（ROLLBACK 後は何も残らない）。
+#[test]
+fn explicit_transaction_detects_duplicate_against_uncommitted_row_in_same_transaction() {
+    let (core, path) = new_core("uniq-txn-dup");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut ddl_session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut ddl_session,
+        "CREATE TABLE docs (a TEXT UNIQUE)",
+    )
+    .expect("create table");
+
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    assert_eq!(
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+            .expect("begin"),
+        SqlOutcome::Begin
+    );
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-t1'",
+    )
+    .expect("first insert inside the transaction must succeed");
+    let err = core
+        .execute_sql_in_txn(
+            &alice,
+            &mut session,
+            &mut txn,
+            "INSERT INTO docs (id, a) VALUES (2, 'x') USING OPERATION_ID 'op-t2'",
+        )
+        .expect_err("duplicate against an uncommitted row of the same transaction");
+    assert_eq!(err.wire_code(), "23505");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+    assert_eq!(
+        count_rows(&core, &alice),
+        0,
+        "nothing must remain after ROLLBACK"
+    );
+}
+
+/// 明示トランザクション内の distinct な値は受理され、COMMIT 後は autocommit の
+/// 書き込みに対しても一意性が効く。また同一トランザクション内で先に TRUNCATE
+/// した（未 commit の削除）行の値は、後続 INSERT の衝突相手にならない。
+#[test]
+fn explicit_transaction_commits_distinct_values_and_sees_uncommitted_truncate() {
+    let (core, path) = new_core("uniq-txn-commit");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut ddl_session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut ddl_session,
+        "CREATE TABLE docs (a TEXT UNIQUE)",
+    )
+    .expect("create table");
+
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "INSERT INTO docs (id, a) VALUES (1, 'x') USING OPERATION_ID 'op-c1'",
+    )
+    .expect("insert x");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "INSERT INTO docs (id, a) VALUES (2, 'y') USING OPERATION_ID 'op-c2'",
+    )
+    .expect("insert y");
+    assert_eq!(
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+            .expect("commit"),
+        SqlOutcome::Commit
+    );
+    assert_eq!(count_rows(&core, &alice), 2);
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a) VALUES (3, 'x') USING OPERATION_ID 'op-c3'",
+        )
+        .expect_err("committed values must be enforced for later autocommit writes");
+    assert_eq!(err.wire_code(), "23505");
+
+    // 同一トランザクション内で TRUNCATE してから同じ値を入れ直すのは成功する
+    // （未 commit の削除も同じ write トランザクションの走査に反映される）。
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "TRUNCATE TABLE docs USING OPERATION_ID 'op-trunc'",
+    )
+    .expect("truncate inside the transaction");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut session,
+        &mut txn,
+        "INSERT INTO docs (id, a) VALUES (4, 'x') USING OPERATION_ID 'op-c4'",
+    )
+    .expect("re-inserting a value removed by an uncommitted TRUNCATE must succeed");
+    core.execute_sql_in_txn(&alice, &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+    assert_eq!(count_rows(&core, &alice), 1);
+}
+
+/// 一意性違反の応答は、他テナントが同じ値を持つかどうかに依存しない（他テナント
+/// の値は母集合に含まれず、違反時の文言も値・テナントを含まない固定文言）。
+#[test]
+fn unique_violation_response_does_not_depend_on_other_tenants_rows() {
+    let (core, path) = new_core("uniq-no-leak");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+
+    // bob だけが 'secret' を保持している状態で、alice の書き込みは成功する。
+    core.execute_insert_sql(
+        &bob,
+        "INSERT INTO docs (id, a) VALUES (1, 'secret') USING OPERATION_ID 'op-b1'",
+    )
+    .expect("bob insert");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 'secret') USING OPERATION_ID 'op-a1'",
+    )
+    .expect("alice insert of a value only bob holds must succeed");
+
+    // alice 自身の重複による違反の文言には値もテナント名も含まれない。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a) VALUES (2, 'secret') USING OPERATION_ID 'op-a2'",
+        )
+        .expect_err("alice's own duplicate must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+    let message = err.to_string();
+    assert!(!message.contains("secret"), "{message}");
+    assert!(!message.contains("bob"), "{message}");
+    assert!(!message.contains("alice"), "{message}");
 }

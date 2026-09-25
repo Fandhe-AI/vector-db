@@ -142,8 +142,11 @@ impl ClassifiedError for InsertError {
 /// `rows` 配列の要素 1 件（`JsonValue::Object` 前提。非オブジェクトは
 /// `InsertError::Shape`）から `schema` の列順に対応する `Vec<Value>` と行キー
 /// `id` を取り出す。`sql::parser::bind_insert` の束縛規則を JSON 入力向けに
-/// 焼き直したもので、束縛結果の意味（未知列・型不一致・非 nullable 列欠落は
-/// すべて `22000`）は SQL 表層と同一に保つ。
+/// 焼き直したもので、束縛結果の意味（未知列・型不一致は `22000`、非 nullable
+/// 列欠落は `23502`。`VECTOR` 列のみ `nullable` の値に関わらず必須という
+/// NoSQL 表層固有の制約が上乗せされ、`nullable = false` なら `23502`・
+/// `nullable = true` なら `22000` に分岐する。TABLE-16・TASK-204、
+/// Issue #904 レビュー指摘）は SQL 表層と同一に保つ。
 ///
 /// untrusted な列名・値をエラー文言へ埋め込まない（JSON 文字列はバックスラッシュ
 /// `\u0000` エスケープ経由で NUL を含み得るため、`error_response::encode` の NUL
@@ -220,14 +223,25 @@ fn bind_row(
                 "INSERT row references an unknown column",
             )));
         };
-        // JSON `null` は列を省略する契約（`insert` op。列を省略すれば
-        // nullable 列は `bind_insert` が `Value::Null` で埋め、非 nullable
-        // 列は「値が提供されていない」（`22000`）で拒否する。`update` op が
-        // `InsertLiteral::Null` をそのまま渡すのとは異なる——`bind_insert_row`
-        // は明示 `NULL` リテラルを列型を問わず一律拒否する契約のため、
-        // ここで `InsertLiteral::Null` を渡すと nullable 列でもエラーになる。
-        // NOSQL-17 束縛表「null の扱い」節参照）。
+        // JSON `null` の扱い（TABLE-16・TASK-204、Issue #904 D5）: `VECTOR` 列は
+        // 引き続き列を省略する契約のまま維持する（`VECTOR` は
+        // `tenant::insert_typed_rows_unchecked` の既存契約により `nullable` の
+        // 値に関わらず常に必須で、下の「VECTOR 列は常に必須」ループが
+        // `nullable = false` なら `23502`・`nullable = true` なら `22000` で
+        // 拒否する〔レビュー指摘・Issue #904: SQL 表層〔`fill_omitted_columns`〕
+        // との `wire_code` パリティのため非 nullable 側のみ `23502` へ分岐〕。
+        // TABLE-16 の `DEFAULT`／`NOT NULL` は `VECTOR` に適用できないため
+        // 対象外）。それ以外の列は `InsertLiteral::Null` を
+        // そのまま `bind_insert` へ渡し、「省略」（`DEFAULT` 適用対象）と
+        // 「明示 NULL」（`DEFAULT` を適用せず nullable なら NULL・非 nullable
+        // なら `23502`）を区別する（TABLE-16 の確定契約。NOSQL-17 束縛表
+        // 「null の扱い」節参照）。
         if matches!(raw, JsonValue::Null) {
+            if matches!(column.ty, ColumnType::Vector(_)) {
+                continue;
+            }
+            columns.push(key.clone());
+            literals.push(engine::sql::allowlist::InsertLiteral::Null);
             continue;
         }
         let literal = typed_json::map_json_to_literal(column, raw).map_err(InsertError::Set)?;
@@ -240,9 +254,24 @@ fn bind_row(
     // 経路と合流させることで、明示 `null`・値の丸ごと省略のいずれも同じ
     // 「値が提供されていない」拒否になる。PR #823 レビュー指摘の非対称解消を
     // 引き続き維持する）。
+    //
+    // `wire_code` の分岐（TABLE-16・TASK-204、Issue #904 レビュー指摘）: 対象列が
+    // `nullable == false` の場合、SQL 表層の同一操作（`fill_omitted_columns`
+    // 経由。`ColumnType::Vector` に `DEFAULT` は付けられないため常に
+    // `column.default.is_none()`）は `23502`（`NotNullViolation`）を返す。
+    // NoSQL 表層だけが `22000` のまま据え置くと表層間で `wire_code` が食い違う
+    // ため、非 nullable な VECTOR 列に限り SQL 表層と同じ `NotNullViolation`
+    // へ写像する。`nullable == true` な VECTOR 列の省略拒否（PR #823 が導入した
+    // 「VECTOR は nullable でも常に必須」という NoSQL 表層固有の制約。NOT NULL
+    // 違反ではない）は従来どおり `22000` のまま変更しない。
     for column in &schema.columns {
         if matches!(column.ty, ColumnType::Vector(_)) && !columns.iter().any(|c| c == &column.name)
         {
+            if !column.nullable {
+                return Err(InsertError::Bind(SqlSurfaceError::NotNullViolation {
+                    column: column.name.clone(),
+                }));
+            }
             return Err(InsertError::Bind(invalid_input_error(
                 "INSERT row is missing a value for a required column",
             )));
@@ -549,7 +578,34 @@ mod tests {
     fn bind_rows_rejects_missing_non_nullable_column() {
         let items = rows_from(r#"[{"id":1,"embedding":[1,0,0,0]}]"#);
         let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
-        assert_eq!(err.wire_code(), "22000");
+        // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
+        // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    // Issue #904 レビュー指摘: 非 nullable `VECTOR` 列（`schema()` の
+    // `embedding`）を省略した INSERT が SQL 表層（`execute_insert_sql` 経由の
+    // `crates/engine/tests/sql_create_table.rs::create_table_succeeds_with_vector_and_text_columns`）
+    // と同じ `23502`（`NotNullViolation`）を返すことを固定する。`VECTOR` 列は
+    // `fill_omitted_columns` を経由しない専用ループ（上記）で判定されるため、
+    // SQL 表層とパリティが崩れやすい箇所として個別に検証する。
+    fn bind_rows_rejects_omitted_non_nullable_vector_column() {
+        let items = rows_from(r#"[{"id":1,"lang":"ja"}]"#);
+        let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    // Issue #904 レビュー指摘: 上のコメントは「明示 `null`・値の丸ごと省略の
+    // いずれも同じ「値が提供されていない」拒否になる」と述べる。
+    // `bind_rows_rejects_explicit_null_vector_column` は nullable スキーマ
+    // （`22000`）のみを固定していたため、非 nullable スキーマ（`schema()`）
+    // に対する明示 `null` も同じ `23502` になることを併せて固定する。
+    fn bind_rows_rejects_explicit_null_on_non_nullable_vector_column() {
+        let items = rows_from(r#"[{"id":1,"embedding":null,"lang":"ja"}]"#);
+        let err = bind_rows(&items, "docs", None, &schema()).expect_err("must reject");
+        assert_eq!(err.wire_code(), "23502");
     }
 
     // id 精度（PR #823 レビュー指摘対応）: `JsonNumber::PosInt` は `f64` へ丸める
