@@ -34,11 +34,16 @@
 //! - [`key_schedule`]: TLS 1.3 鍵スケジュール本体（RFC 8446 §7.1。Issue #956）。
 //!   Early → Handshake → Master の secret 遷移と各段の traffic secret／
 //!   key／iv 導出を型状態で提供する
+//! - [`record_protection`]: レコード保護層（RFC 8446 §5.2〜§5.5。Issue #959）。
+//!   [`record`]・[`key_schedule`]・[`aes_gcm`] をつなぎ、per-record nonce・
+//!   シーケンス番号・`TLSInnerPlaintext`（内容型・パディング）・AAD の構成・
+//!   handshake 鍵 → application 鍵の方向別切替（[`record_protection::
+//!   Sealer`]／[`record_protection::Opener`]）を提供する
 //!
-//! alert の実送出やハンドシェイク状態機械（#965）・レコード保護／暗号化
-//! （#959）・接続への結線（#966 以降）はいずれも後続 sub-issue の担当で
-//! あり、本モジュールは対象外のまま。並列開発時のコンフリクトを避ける
-//! ため、後続 sub-issue は `pub mod` を 1 行ずつ追加していく想定。
+//! alert の実送出やハンドシェイク状態機械（#965）・接続への結線
+//! （#966 以降）はいずれも後続 sub-issue の担当であり、本モジュールは
+//! 対象外のまま。並列開発時のコンフリクトを避けるため、後続 sub-issue は
+//! `pub mod` を 1 行ずつ追加していく想定。
 
 pub mod aes;
 pub mod aes_gcm;
@@ -48,4 +53,5 @@ pub mod handshake;
 pub mod hkdf;
 pub mod key_schedule;
 pub mod record;
+pub mod record_protection;
 pub mod x25519;

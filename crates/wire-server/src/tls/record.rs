@@ -16,9 +16,10 @@
 //!   ここでは拒否しない。理由は [`RecordHeader`] のドキュメンテーション
 //!   コメントを参照）
 //! - レコード保護（nonce・シーケンス番号・`TLSInnerPlaintext` の内側
-//!   content type・パディング・AEAD 最小長）は #959 が担う。[`RecordKind::
-//!   Ciphertext`] はあくまで「このレコードに暗号文用の長さ上限を適用するか」
-//!   を表すのみで、AEAD の復号・検証はこの層の責務外
+//!   content type・パディング・AEAD 最小長）は [`super::record_protection`]
+//!   （#959）が担う。[`RecordKind::Ciphertext`] はあくまで「このレコードに
+//!   暗号文用の長さ上限を適用するか」を表すのみで、AEAD の復号・検証は
+//!   この層の責務外
 //! - alert の送出・状態機械・middlebox 互換 `ChangeCipherSpec` の破棄判定は
 //!   #965 が担う。本モジュールは [`AlertDescription`] という定型コードの
 //!   対応表を提供するのみで、実際に alert を送出しない
@@ -166,6 +167,10 @@ pub enum AlertDescription {
     UnexpectedMessage,
     RecordOverflow,
     DecodeError,
+    /// AEAD タグ検証の失敗（レコード保護層。#959）。
+    BadRecordMac,
+    /// 呼び出し契約違反（レコード保護層の送信側長さ超過・不正な状態遷移。#959）。
+    InternalError,
     /// TLS 1.3 の必須暗号スイート（`TLS_AES_128_GCM_SHA256`）を含まない
     /// （RFC 8446 §4.1.1。判定は `client_hello::negotiate` が担う）。
     HandshakeFailure,
@@ -186,6 +191,8 @@ impl AlertDescription {
             AlertDescription::UnexpectedMessage => 10,
             AlertDescription::RecordOverflow => 22,
             AlertDescription::DecodeError => 50,
+            AlertDescription::BadRecordMac => 20,
+            AlertDescription::InternalError => 80,
             AlertDescription::HandshakeFailure => 40,
             AlertDescription::IllegalParameter => 47,
             AlertDescription::ProtocolVersion => 70,
