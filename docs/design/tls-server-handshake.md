@@ -39,8 +39,15 @@ ExpectClientHello{after_hrr:false}
   → (RetryRequestX25519) → ExpectClientHello{after_hrr:true}
   → (Accept) → ExpectClientFinished
   → (client Finished 検証成功) → Complete（TlsSession を払い出す）
+
+（Complete 以前の任意の状態）
+  → (close_notify 受信) → Closed
+  → (user_canceled 受信) → Canceled → (close_notify 受信) → Closed
 ```
 
+`Canceled` は `user_canceled` 受信後に `close_notify` を待つ状態で、後続
+レコードは解釈せず読み捨てる（ハンドシェイクは進まない。PR #1046 で追加。
+下記「レビュー指摘の是正」7 参照）。
 `Failed(ServerHandshakeError)`・`Closed` は終端状態。`ServerHandshakeError`
 は全 variant が `Copy` であり、`HandshakeBuffer`・`RecordBuffer` と同じ
 fail-closed な poison 契約（一度 `Err` を返したら以後同じ理由の `Err` を
