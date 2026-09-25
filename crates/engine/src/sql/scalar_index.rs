@@ -65,7 +65,7 @@ use redb::ReadableDatabase;
 use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::{FilterOp, MetadataFilter};
 use crate::policy::PolicyContext;
-use crate::row_codec::scan_scalar_columns;
+use crate::row_codec::{scan_scalar_columns, ScalarRef};
 use crate::sql::arena_cache::SqlArenaSnapshot;
 use crate::storage::Storage;
 
@@ -294,6 +294,191 @@ fn per_column_accumulator_reservation_bytes(row_count: usize) -> usize {
     row_count.saturating_mul(std::mem::size_of::<(String, u32)>())
 }
 
+/// `2^53`（`f64` の仮数部が整数値を正確に表現できる上限）。`BIGINT`／
+/// `TIMESTAMP` 列の順序索引化は、まだ確定していない `#891` の評価器の比較
+/// 意味論（f64 経由の損失ある比較になる可能性がある）に対して保守的に倒し、
+/// 絶対値がこれを超える値を 1 件でも含む列は索引全体を対象外（`None`）へ
+/// 縮退する（`sql::scalar_plan::MAX_EXACT_ID`・`id_index` と同じ判断基準）。
+/// `INTEGER`（`i32`）・`DATE`（`i32` の日数）はこの上限に構造的に収まるため
+/// 対象外にしない。
+const MAX_EXACT_TYPED_I64_ABS: u64 = 1u64 << 53;
+
+/// `v` の絶対値が [`MAX_EXACT_TYPED_I64_ABS`] 以内かどうか。`i64::MIN` は
+/// `unsigned_abs()` で安全に扱う（`i64::MIN.abs()` は overflow する）。
+fn i64_within_exact_f64_range(v: i64) -> bool {
+    v.unsigned_abs() <= MAX_EXACT_TYPED_I64_ABS
+}
+
+/// 数値・日時・`NUMERIC`・`UUID` 列向けの順序索引（Issue #893。モジュール
+/// ドキュメント「データモデル」の `TEXT` 用 [`TextColumnIndex`] に相当する、
+/// 全順序キーを持つスカラー型向けの索引本体）。各 variant は「キー昇順・
+/// 同一キー内はスロット昇順」に整列した `(key, slot)` 列を保持する。
+/// `INTEGER`／`BIGINT`／`DATE`／`TIMESTAMP` は `i64` へ昇格して `I64` を、
+/// `REAL`／`DOUBLE` は全順序比較可能な `u64` ビット表現（[`f64_to_sortable_bits`]）
+/// へ写像して `F64Sortable` を、`NUMERIC` は列固定の `scale` のもとで
+/// `unscaled`（`i128`）の大小がそのまま値の大小になることを利用して `I128` を、
+/// `UUID` はネットワークバイトオーダーのバイト列を `u128`（ビッグエンディアン）
+/// として `U128` を、それぞれ使う。
+///
+/// `NULL` はいずれの variant にもエントリを作らない（`TextColumnIndex` と同じ
+/// 契約）。
+///
+/// `I128`（`NUMERIC` 列）のみ列固定の `scale` を第 2 要素として保持する
+/// （Issue #893 production 接続。`declarative_filter::TypedLiteral::Numeric`
+/// が保持するリテラルは `parse_literal_exact` 由来の任意 `scale` を持つため、
+/// `candidates_for` が境界計算時に列側の `scale` を必要とする——
+/// `numeric::rescale_bounds_for_column` 参照）。他の variant は列型から
+/// キー型が一意に決まるため付随情報を持たない。
+enum OrderedColumnIndex {
+    I64(Vec<(i64, u32)>),
+    F64Sortable(Vec<(u64, u32)>),
+    I128(Vec<(i128, u32)>, u8),
+    U128(Vec<(u128, u32)>),
+}
+
+/// `f64`（有限値・`-0.0` は `+0.0` へ正規化済みである契約——`scalar_float.rs`
+/// 参照）を、ビット表現の大小関係が元の数値の大小関係と一致する `u64` へ
+/// 写像する。IEEE 754 の符号なし整数としてのビットパターンは、正の値同士では
+/// 数値順と一致するが、符号ビット・負数側の並びは数値順と逆になるため、
+/// 符号ビットが立っている（負）場合は全ビット反転、立っていない（非負）場合は
+/// 符号ビットだけを立てる（標準的な「浮動小数点を符号なし整数の全順序へ写像
+/// する」変換）。`NaN`・無限大は呼び出し元が事前に拒否する契約（`is_finite`
+/// を満たさない値を渡すと結果は未定義の順序になり得るが panic はしない）。
+fn f64_to_sortable_bits(v: f64) -> u64 {
+    let bits = v.to_bits();
+    if bits & (1u64 << 63) != 0 {
+        !bits
+    } else {
+        bits | (1u64 << 63)
+    }
+}
+
+/// `UUID` の 16 バイト（ネットワークバイトオーダー）を `u128`（ビッグエンディアン
+/// 解釈）へ変換する。[`crate::uuid::Uuid`] の `Ord`（derive によるバイト列辞書順）
+/// と同じ大小関係になる（ビッグエンディアン変換はバイト列辞書順を保つ）。
+fn uuid_to_sortable_u128(bytes: &[u8; 16]) -> u128 {
+    u128::from_be_bytes(*bytes)
+}
+
+/// [`ScalarIndex::candidates_typed_range`]（テスト専用。モジュール
+/// ドキュメント参照）の照会に使う正規化済みキー（Issue #893）。列側の
+/// variant と一致する場合に限り照会を実行する（型不一致は `None`＝
+/// 索引未対応として全走査へ縮退する契機。呼び出し元はこの型不一致を
+/// 「一致 0 件」と混同しない）。production 経路（`Self::candidates_for` の
+/// `TypedCompare` 分岐）は `MetadataFilter::TypedCompare` を直接消費し
+/// 本型へは正規化しないため、`candidates_typed_range` と同じくテスト専用
+/// 到達パターンになる。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TypedKey {
+    I64(i64),
+    F64Sortable(u64),
+    I128(i128),
+    U128(u128),
+}
+
+/// `pairs`（キー昇順・同一キー内はスロット昇順に整列済み）から `[lower, upper]`
+/// 範囲に一致する候補スロットを求める（[`ScalarIndex::candidates_id_range`]
+/// と同じ二分探索による区間複製。区間内はキー昇順だがスロット昇順とは限らない
+/// ため、返す前に `sort_unstable` でスロット昇順へ揃える）。
+fn range_slots<K: Ord + Copy>(
+    pairs: &[(K, u32)],
+    lower: std::ops::Bound<K>,
+    upper: std::ops::Bound<K>,
+) -> Option<Vec<u32>> {
+    use std::ops::Bound;
+    let start = match lower {
+        Bound::Unbounded => 0,
+        Bound::Included(l) => pairs.partition_point(|(k, _)| *k < l),
+        Bound::Excluded(l) => pairs.partition_point(|(k, _)| *k <= l),
+    };
+    let end = match upper {
+        Bound::Unbounded => pairs.len(),
+        Bound::Included(u) => pairs.partition_point(|(k, _)| *k <= u),
+        Bound::Excluded(u) => pairs.partition_point(|(k, _)| *k < u),
+    };
+    if start >= end {
+        return Some(Vec::new());
+    }
+    let mut out: Vec<u32> = Vec::new();
+    out.try_reserve_exact(end - start).ok()?;
+    out.extend(pairs[start..end].iter().map(|(_, slot)| *slot));
+    out.sort_unstable(); // sort-determinism: allow u32 スロット番号の全順序（重複なし）による昇順整列
+    Some(out)
+}
+
+/// 数値・日時・`NUMERIC`・`UUID` 列 1 件分の順序索引が確保する `(key, slot)`
+/// 配列の概算バイト量（`text_column_reservation_bytes` の固定長キー版。
+/// これらの型は文字列のような可変長の中身を持たないため、行走査前に
+/// `row_count` 件分をちょうど一括確保すれば実確保量と一致し、`TEXT` 列のような
+/// 重複排除後の再確保・別建ての `equality` テーブルは不要）。
+fn typed_column_reservation_bytes(row_count: usize, entry_size: usize) -> usize {
+    row_count.saturating_mul(entry_size)
+}
+
+/// `value`（`scan_scalar_columns` が返した非 `NULL` のスキャン結果）から
+/// `accum`（[`OrderedColumnIndex`] の作業領域。`schema` 由来の列型と対応する
+/// variant が呼び出し元〔[`ScalarIndex::build`]〕によって選ばれている契約）へ
+/// `(key, slot)` を 1 件追加する。
+///
+/// `false` を返すのは次のいずれか（呼び出し元はこれを「この列は索引対象外」
+/// として列全体を `None` へ縮退する契機として扱う。fail-closed。モジュール
+/// ドキュメント「`MAX_EXACT_TYPED_I64_ABS`」参照）:
+/// - `BIGINT`／`TIMESTAMP` の絶対値が `2^53` を超える。
+/// - `REAL`／`DOUBLE` が非有限（`scalar_float.rs` の不変条件への多層防御）。
+/// - `accum` の variant と `value` の型が一致しない（構造的に到達しない
+///   はずだが、untrusted な行 metadata に由来する分岐のため防御的に扱う）。
+fn push_typed_value(accum: &mut OrderedColumnIndex, value: &ScalarRef<'_>, slot: u32) -> bool {
+    match (accum, value) {
+        (OrderedColumnIndex::I64(acc), ScalarRef::Integer(v)) => {
+            acc.push((i64::from(*v), slot));
+            true
+        }
+        (OrderedColumnIndex::I64(acc), ScalarRef::BigInt(v)) => {
+            if !i64_within_exact_f64_range(*v) {
+                return false;
+            }
+            acc.push((*v, slot));
+            true
+        }
+        (OrderedColumnIndex::I64(acc), ScalarRef::Date(v)) => {
+            acc.push((i64::from(*v), slot));
+            true
+        }
+        (OrderedColumnIndex::I64(acc), ScalarRef::Timestamp(v)) => {
+            if !i64_within_exact_f64_range(*v) {
+                return false;
+            }
+            acc.push((*v, slot));
+            true
+        }
+        (OrderedColumnIndex::F64Sortable(acc), ScalarRef::Real(v)) => {
+            let widened = f64::from(*v);
+            if !widened.is_finite() {
+                return false;
+            }
+            acc.push((f64_to_sortable_bits(widened), slot));
+            true
+        }
+        (OrderedColumnIndex::F64Sortable(acc), ScalarRef::Double(v)) => {
+            if !v.is_finite() {
+                return false;
+            }
+            acc.push((f64_to_sortable_bits(*v), slot));
+            true
+        }
+        (OrderedColumnIndex::I128(acc, _scale), ScalarRef::Numeric(d)) => {
+            acc.push((d.unscaled(), slot));
+            true
+        }
+        (OrderedColumnIndex::U128(acc), ScalarRef::Uuid(u)) => {
+            acc.push((uuid_to_sortable_u128(u.as_bytes()), slot));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// 1 つの `TEXT` 列に対する索引（等価直引き＋前方一致範囲走査の両方を支える
 /// 共有データ構造。モジュールドキュメント「データモデル」参照）。
 ///
@@ -409,8 +594,14 @@ pub(crate) struct ScalarIndex {
     built_ctx: PolicyContext,
     built_table_generation: u64,
     row_count: usize,
-    /// `schema.columns` と同じ長さ・順序。`TEXT` 列のみ `Some`。
+    /// `schema.columns` と同じ長さ・順序。`TEXT`／`ENUM` 列のみ `Some`。
     columns: Vec<Option<TextColumnIndex>>,
+    /// `schema.columns` と同じ長さ・順序。`INTEGER`／`BIGINT`／`REAL`／
+    /// `DOUBLE`／`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID` 列のみ `Some`
+    /// （Issue #893。`columns` と排他——同じ添字が両方 `Some` になることは
+    /// ない。`BOOLEAN`／`BYTEA`／`JSON`／`JSONB`／`ARRAY`／`VECTOR` 列は
+    /// いずれも `None` のまま索引対象外。モジュールドキュメント参照）。
+    typed_columns: Vec<Option<OrderedColumnIndex>>,
     /// `id` 昇順（同一 `id` 内はスロット昇順）に整列した `(id, slot)`。全行が
     /// `id_as_finite_scalar` を満たす場合のみ `Some`（1 件でも `id > 2^53` が
     /// あれば `None`。モジュールドキュメント参照）。
@@ -479,9 +670,50 @@ impl ScalarIndex {
     /// untrusted な行 metadata のデコード検証は [`scan_scalar_columns`] が
     /// 一切弱めずに行う（`.claude/rules/coding-rust.md`「untrusted 入力の
     /// 扱い」）。
+    ///
+    /// `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID` 列の順序索引（Issue #893。
+    /// レーン B——`declarative_filter::FilterOp::TypedCompare`。Issue #891・
+    /// TASK-199 で production 結線済み）は、[`Self::candidates_for`] が
+    /// `TypedCompare` 述語を直接照会できるため常に構築する。一方
+    /// `INTEGER`／`BIGINT`／`REAL`／`DOUBLE` 列（レーン A——算術式・
+    /// `sql::udf_call`／`sql::expr_program` 経由の `WHERE` 比較。#891 の
+    /// 対象外として別 Issue へ切り出し済み・未着手）は、これらの型を
+    /// 対象にした `WHERE` 述語表現が SQL 表層にまだ存在せず
+    /// `resolve_candidates` から一度も照会されないため、構築自体を
+    /// 遅延させ `BOOLEAN` 等と同じ非索引化 (`None`) 扱いとする
+    /// （未接続の typed 索引だけが原因で `MAX_SCALAR_INDEX_BYTES` 超過に
+    /// より既存の `TEXT`／`ENUM` 索引まで巻き添えで `TooLarge`（plain scan
+    /// 縮退）になるのを防ぐ。codex-review P2 指摘・PR #1032）。レーン A の
+    /// 構築ロジック自体（`OrderedColumnIndex::I64`／`F64Sortable` の値
+    /// 変換・`2^53` ゲート等）を検証するテスト専用の入口は
+    /// [`Self::build_including_unwired_typed_range_columns`]（`#[cfg(test)]`）
+    /// を使う。
     pub(crate) fn build(
         schema: &TableSchema,
         snapshot: &SqlArenaSnapshot,
+    ) -> Result<Self, ScalarIndexBuildError> {
+        Self::build_internal(schema, snapshot, false)
+    }
+
+    /// [`Self::build`] のうち、レーン A（`INTEGER`／`BIGINT`／`REAL`／
+    /// `DOUBLE`。まだ `WHERE` 述語表現を持たず production からは一度も
+    /// 照会されない）の順序索引構築ロジックそのものを検証するテスト専用の
+    /// 入口。production 経路（`sql::exec`／`sql::aggregate`／
+    /// `sql::group_by`）はレーン A 列を索引化しない [`Self::build`] を使い、
+    /// この入口は呼ばない（codex-review P2 指摘・PR #1032。レーン A の
+    /// `WHERE` 述語表現が実装され次第 [`Self::build`] 側へ合流する想定）。
+    #[cfg(test)]
+    fn build_including_unwired_typed_range_columns(
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+    ) -> Result<Self, ScalarIndexBuildError> {
+        Self::build_internal(schema, snapshot, true)
+    }
+
+    fn build_internal(
+        schema: &TableSchema,
+        snapshot: &SqlArenaSnapshot,
+        include_unwired_lane_a_columns: bool,
     ) -> Result<Self, ScalarIndexBuildError> {
         let row_count = snapshot.arena().len();
         let column_count = schema.columns.len();
@@ -492,11 +724,30 @@ impl ScalarIndex {
         // ドキュメント「fail-closed の適用範囲」参照）。
         let mut approx_bytes: usize = 0;
 
-        // 列ごとに (value, slot) を蓄積する作業領域（`TEXT` 列のみ `Some`）。
+        // 列ごとに (value, slot) を蓄積する作業領域（`TEXT`／`ENUM` 列のみ
+        // `Some`）。
         let mut per_column: Vec<Option<Vec<(String, u32)>>> = Vec::new();
         per_column
             .try_reserve_exact(column_count)
             .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+
+        // 列ごとに (key, slot) を蓄積する作業領域（Issue #893。数値・日時・
+        // `NUMERIC`・`UUID` 列のみ `Some`。`per_column` と排他）。固定長キー
+        // のため `TEXT` 列と異なり `row_count` ちょうどの一括確保のみで
+        // 十分（重複排除・別建ての `equality` テーブルは不要）。
+        let mut per_column_typed: Vec<Option<OrderedColumnIndex>> = Vec::new();
+        per_column_typed
+            .try_reserve_exact(column_count)
+            .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+        // 列単位の `2^53` ゲート（`BIGINT`／`TIMESTAMP`。モジュールドキュメント
+        // 「`MAX_EXACT_TYPED_I64_ABS`」参照）・非有限値の防御ゲート（`REAL`／
+        // `DOUBLE`。`scalar_float.rs` の不変条件が崩れた場合の多層防御）で
+        // 列を除外する際に差し戻す、初期確保分の予算計上額。
+        let mut typed_col_reservation_bytes: Vec<usize> = Vec::new();
+        typed_col_reservation_bytes
+            .try_reserve_exact(column_count)
+            .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+        typed_col_reservation_bytes.resize(column_count, 0);
 
         // 列単位の平均値長ゲート（Issue #632。モジュールドキュメント「列単位の
         // 索引対象除外」参照）が使う作業領域。列ごとに (a) 初期 `acc` 確保分
@@ -543,39 +794,135 @@ impl ScalarIndex {
                     acc.try_reserve_exact(row_count)
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     per_column.push(Some(acc));
+                    per_column_typed.push(None);
                 }
-                // `INTEGER`／`BIGINT` 列の索引対応は Issue #893 の担当。本 Issue
-                // （#881）では `Vector` 列と同じく未索引のまま扱う。`BOOLEAN` 列も
-                // 索引対象外（Issue #883・D-e。値域が 2 値のため索引化コストに
-                // 見合わず、対応述語 `BoolEquals` は常に plain scan——
-                // `scalar_plan.rs` 参照——のまま据え置く）。`DATE`／`TIMESTAMP` 列も
-                // 同じ理由で索引対象外（TABLE-13・TASK-197、Issue #884。等価・範囲
-                // 述語自体が未実装〔Issue #891〕のため索引化する対応述語がまだ
-                // 無い）。`NUMERIC` 列も同じく索引対象外（本索引が TEXT 列の等価・
-                // 前方一致向け辞書索引のみを対象とする設計であり、WHERE 述語
-                // 自体が束縛時点で NUMERIC 列を拒否済み〔TABLE-13〔検討中〕・
-                // TASK-197、Issue #885〕のため到達しない）。`ARRAY` 列（TABLE-14・
-                // Issue #888）・`BYTEA` 列（Issue #886）・`JSON`／`JSONB` 列
-                // （TABLE-14・Issue #889。拡張は Issue #893 へ申し送り）もいずれも
-                // 等価・前方一致述語を持たないため同じく非索引化。REAL/DOUBLE
-                // 列の索引化も #893 の担当（F10・Issue #882 計画）。
+                // `INTEGER`／`BIGINT` 列（レーン A: 算術式・`sql::udf_call`／
+                // `sql::expr_program` 経由の `WHERE` 比較。#891 の対象外として
+                // 切り出し済み・未着手）は `WHERE` 述語表現が SQL 表層に
+                // まだ無く `resolve_candidates` から一度も照会されないため、
+                // production 経路（`include_unwired_lane_a_columns == false`）
+                // では構築自体を遅延させる（`Self::build` ドキュメント参照。
+                // codex-review P2・PR #1032）。構築ロジック自体は
+                // [`Self::build_including_unwired_typed_range_columns`]
+                // からのみ検証する。
+                ColumnType::Integer | ColumnType::BigInt => {
+                    per_column.push(None);
+                    if !include_unwired_lane_a_columns {
+                        per_column_typed.push(None);
+                        continue;
+                    }
+                    let entry_size = std::mem::size_of::<(i64, u32)>();
+                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                        *slot = reservation_bytes;
+                    }
+                    let mut acc: Vec<(i64, u32)> = Vec::new();
+                    acc.try_reserve_exact(row_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    per_column_typed.push(Some(OrderedColumnIndex::I64(acc)));
+                }
+                // `DATE`／`TIMESTAMP` 列（レーン B:
+                // `declarative_filter::FilterOp::TypedCompare`。Issue #891・
+                // TASK-199 で production 結線済み）は `i64` へ昇格した
+                // 順序索引（`OrderedColumnIndex::I64`。Issue #893）で扱い、
+                // `Self::candidates_for` から常に照会されるため常に構築する。
+                // `TIMESTAMP` は行走査中に `2^53` を超える値が 1 件でも見つかった
+                // 時点で列単位に `None` へ縮退する（モジュールドキュメント
+                // 「`MAX_EXACT_TYPED_I64_ABS`」参照）。
+                ColumnType::Date | ColumnType::Timestamp => {
+                    per_column.push(None);
+                    let entry_size = std::mem::size_of::<(i64, u32)>();
+                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                        *slot = reservation_bytes;
+                    }
+                    let mut acc: Vec<(i64, u32)> = Vec::new();
+                    acc.try_reserve_exact(row_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    per_column_typed.push(Some(OrderedColumnIndex::I64(acc)));
+                }
+                // `REAL`／`DOUBLE` 列（レーン A。上と同じ理由で production
+                // 経路では構築を遅延させる）は全順序比較可能な `u64` ビット
+                // 表現（[`f64_to_sortable_bits`]）で扱う。値は `scalar_float.rs`
+                // の不変条件（常に有限・`-0.0` は `+0.0` に正規化済み）を前提と
+                // するが、崩れていた場合は防御的に列単位で `None` へ縮退する。
+                ColumnType::Real | ColumnType::Double => {
+                    per_column.push(None);
+                    if !include_unwired_lane_a_columns {
+                        per_column_typed.push(None);
+                        continue;
+                    }
+                    let entry_size = std::mem::size_of::<(u64, u32)>();
+                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                        *slot = reservation_bytes;
+                    }
+                    let mut acc: Vec<(u64, u32)> = Vec::new();
+                    acc.try_reserve_exact(row_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    per_column_typed.push(Some(OrderedColumnIndex::F64Sortable(acc)));
+                }
+                // `NUMERIC(p, s)` 列（レーン B。production 結線済み）は列固定の
+                // `scale` のもとで `unscaled`（`i128`）の大小がそのまま値の
+                // 大小になるため、`unscaled` をそのままキーとする
+                // （`OrderedColumnIndex::I128`。`Self::candidates_for` が
+                // `TypedCompare` 述語の境界計算に使う列固定 `scale` を第 2
+                // 要素として一緒に保持する）。常に構築する。
+                ColumnType::Numeric { scale, .. } => {
+                    per_column.push(None);
+                    let entry_size = std::mem::size_of::<(i128, u32)>();
+                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                        *slot = reservation_bytes;
+                    }
+                    let mut acc: Vec<(i128, u32)> = Vec::new();
+                    acc.try_reserve_exact(row_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    per_column_typed.push(Some(OrderedColumnIndex::I128(acc, *scale)));
+                }
+                // `UUID` 列（レーン B。production 結線済み）はネットワーク
+                // バイトオーダーのバイト列を `u128`（ビッグエンディアン）として
+                // 扱う（`Uuid` の `Ord` 導出——バイト列辞書順——と同じ大小関係に
+                // なる。`OrderedColumnIndex::U128`）。常に構築する。
+                ColumnType::Uuid => {
+                    per_column.push(None);
+                    let entry_size = std::mem::size_of::<(u128, u32)>();
+                    let reservation_bytes = typed_column_reservation_bytes(row_count, entry_size);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    if let Some(slot) = typed_col_reservation_bytes.get_mut(col_index) {
+                        *slot = reservation_bytes;
+                    }
+                    let mut acc: Vec<(u128, u32)> = Vec::new();
+                    acc.try_reserve_exact(row_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    per_column_typed.push(Some(OrderedColumnIndex::U128(acc)));
+                }
+                // `BOOLEAN` 列は索引対象外（Issue #883・D-e。値域が 2 値のため
+                // 索引化コストに見合わず、対応述語 `BoolEquals` は常に
+                // plain scan——`scalar_plan.rs` 参照——のまま据え置く）。
+                // `ARRAY`（TABLE-14・Issue #888）・`BYTEA`（Issue #886）・
+                // `JSON`／`JSONB`（TABLE-14・Issue #889）列はいずれも等価・
+                // 前方一致・範囲述語を持たないため同じく非索引化（判断根拠は
+                // `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
+                // `VECTOR` 列も従来どおり索引対象外。
                 ColumnType::Vector(_)
-                | ColumnType::Integer
-                | ColumnType::BigInt
-                | ColumnType::Real
-                | ColumnType::Double
                 | ColumnType::Boolean
-                | ColumnType::Date
-                | ColumnType::Timestamp
                 | ColumnType::Array(_)
                 | ColumnType::Bytea
                 | ColumnType::Json
-                | ColumnType::Jsonb
-                | ColumnType::Numeric { .. }
-                // `UUID` 列も同じ理由で索引対象外（等価述語自体が束縛時点で
-                // UUID 列を拒否済み〔TABLE-13〔検討中〕・TASK-197、Issue #887・
-                // U9〕のため到達しない。二次索引化は #893 へ申し送り）。
-                | ColumnType::Uuid => per_column.push(None),
+                | ColumnType::Jsonb => {
+                    per_column.push(None);
+                    per_column_typed.push(None);
+                }
             }
         }
 
@@ -590,18 +937,41 @@ impl ScalarIndex {
                 scan_scalar_columns(schema, metadata).map_err(ScalarIndexBuildError::RowDecode)?;
             for (col_index, value) in scanned.into_iter().enumerate() {
                 let Some(v) = value else { continue };
-                // この列がまだ索引対象か（`TEXT` 列かつ平均値長ゲートで未除外か）
-                // を先に確認する。`Vector` 列・既に除外済みの列は静かにスキップ
-                // する（モジュールドキュメント「列単位の索引対象除外」参照）。
+                // この列がまだ `TEXT`／`ENUM` の索引対象か（平均値長ゲートで
+                // 未除外か）を先に確認する。`TEXT` でない列・既に除外済みの列は
+                // 数値・日時・`NUMERIC`・`UUID` 列（Issue #893）の候補として
+                // 別枠で扱う（モジュールドキュメント「列単位の索引対象除外」
+                // 参照）。
                 let is_indexed_column = matches!(per_column.get(col_index), Some(Some(_)));
                 if !is_indexed_column {
+                    // 数値・日時・`NUMERIC`・`UUID` 列の候補か（Issue #893）。
+                    // 該当しない・既に除外済みの列は静かにスキップする。
+                    if matches!(per_column_typed.get(col_index), Some(Some(_))) {
+                        let keep = if let Some(Some(accum)) = per_column_typed.get_mut(col_index) {
+                            push_typed_value(accum, &v, slot_u32)
+                        } else {
+                            true
+                        };
+                        if !keep {
+                            // `2^53` 超過・非有限値・型不一致のいずれか
+                            // （`push_typed_value` 参照）: 列単位で `None` へ
+                            // 縮退する（fail-closed。予算は初期一括確保分
+                            // ちょうどを差し戻す。固定長キーのため `TEXT` 列の
+                            // ような複製済み文字列本体分の追加返還は不要）。
+                            let refund = typed_col_reservation_bytes
+                                .get(col_index)
+                                .copied()
+                                .unwrap_or(0);
+                            approx_bytes = approx_bytes.saturating_sub(refund);
+                            if let Some(slot_acc) = per_column_typed.get_mut(col_index) {
+                                *slot_acc = None;
+                            }
+                        }
+                    }
                     continue;
                 }
-                // 索引対象列は常に `TEXT`／`ENUM`（上記の列単位除外により
-                // `INTEGER`／`BIGINT`／`BOOLEAN`／`VECTOR`／`REAL`／`DOUBLE`／
-                // `BYTEA` は `per_column[col_index] == None` のまま到達しない）。
-                // `as_dictionary_text` で両者を同じ辞書表現として扱う
-                // （Issue #890 D3）。
+                // 索引対象列は常に `TEXT`／`ENUM`。`as_dictionary_text` で
+                // 両者を同じ辞書表現として扱う（Issue #890 D3）。
                 let Some(v) = v.as_dictionary_text() else {
                     continue;
                 };
@@ -761,6 +1131,35 @@ impl ScalarIndex {
             }
         }
 
+        // 数値・日時・`NUMERIC`・`UUID` 列の順序索引を確定させる（Issue #893）。
+        // `TEXT` 列と異なり重複排除は行わない（キーは固定長で辞書テーブルを
+        // 持たない）ため、`(key, slot)` を昇順ソートするだけでよい。
+        let mut typed_columns: Vec<Option<OrderedColumnIndex>> = Vec::new();
+        typed_columns
+            .try_reserve_exact(column_count)
+            .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+        for entry in per_column_typed {
+            match entry {
+                None => typed_columns.push(None),
+                Some(OrderedColumnIndex::I64(mut pairs)) => {
+                    pairs.sort_unstable(); // sort-determinism: allow (i64 キー, u32 スロット) のタプル全順序でスロットが明示的タイブレーク（同一列内でスロットは重複しない）
+                    typed_columns.push(Some(OrderedColumnIndex::I64(pairs)));
+                }
+                Some(OrderedColumnIndex::F64Sortable(mut pairs)) => {
+                    pairs.sort_unstable(); // sort-determinism: allow (u64 ソート可能ビット表現, u32 スロット) のタプル全順序でスロットが明示的タイブレーク
+                    typed_columns.push(Some(OrderedColumnIndex::F64Sortable(pairs)));
+                }
+                Some(OrderedColumnIndex::I128(mut pairs, scale)) => {
+                    pairs.sort_unstable(); // sort-determinism: allow (i128 キー, u32 スロット) のタプル全順序でスロットが明示的タイブレーク
+                    typed_columns.push(Some(OrderedColumnIndex::I128(pairs, scale)));
+                }
+                Some(OrderedColumnIndex::U128(mut pairs)) => {
+                    pairs.sort_unstable(); // sort-determinism: allow (u128 キー, u32 スロット) のタプル全順序でスロットが明示的タイブレーク
+                    typed_columns.push(Some(OrderedColumnIndex::U128(pairs)));
+                }
+            }
+        }
+
         // `id` 順序索引: 1 件でも `id_as_finite_scalar` に失敗する行があれば
         // 索引全体を `None` にする（fail-closed。モジュールドキュメント参照）。
         let mut id_index: Option<Vec<(u64, u32)>> = None;
@@ -787,6 +1186,7 @@ impl ScalarIndex {
             built_table_generation: snapshot.built_table_generation_for_index(),
             row_count,
             columns,
+            typed_columns,
             id_index,
             // 直後に `compute_approx_heap_bytes` の結果で確定させるまでの
             // 仮値。この構造体は `build` の外へ `0` のまま漏れ出さない。
@@ -817,10 +1217,27 @@ impl ScalarIndex {
         matches!(self.columns.get(column_index), Some(Some(_)))
     }
 
+    /// `column_index` 列が数値・日時・`NUMERIC`・`UUID` の順序索引として
+    /// 実際に索引化されているか（`2^53` ゲート等で除外されていないか）を
+    /// 返すテスト専用アクセサ（Issue #893。[`Self::column_is_indexed`] の
+    /// typed 版）。
+    #[cfg(test)]
+    fn typed_column_is_indexed(&self, column_index: usize) -> bool {
+        matches!(self.typed_columns.get(column_index), Some(Some(_)))
+    }
+
     /// [`MetadataFilter`] を評価し、一致スロットの**昇順** `Vec<u32>` を返す。
-    /// 列が `TEXT` でない・未知の列は `None`。一致 0 件（列は索引済みだが値が
-    /// 存在しない）は `Some(vec![])` を返す（`None` と区別する）。
+    /// 列が対応する索引を持たない・未知の列は `None`。一致 0 件（列は索引済み
+    /// だが値が存在しない）は `Some(vec![])` を返す（`None` と区別する）。
     pub(crate) fn candidates_for(&self, filter: &MetadataFilter) -> Option<Vec<u32>> {
+        // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID` 列の範囲比較
+        // （`FilterOp::TypedCompare`。TABLE-13・TASK-199、Issue #891 で
+        // production 結線済み）は `self.columns`（`TEXT`／`ENUM`）ではなく
+        // `self.typed_columns` を参照するため、`TEXT` 用の共有ブロックへ入る
+        // 前に個別に処理する（Issue #893 production 接続）。
+        if let FilterOp::TypedCompare { op, value } = filter.op() {
+            return self.typed_compare_candidates(filter.column_index(), *op, value);
+        }
         let column = self.columns.get(filter.column_index())?.as_ref()?;
         let mut result = match filter.op() {
             FilterOp::Equals(value) => column
@@ -834,9 +1251,112 @@ impl ScalarIndex {
             // `?` で既にここへ到達しない）ため構造的に到達しないが、
             // 網羅性のため fail-closed に `None` を返す。
             FilterOp::BoolEquals(_) => return None,
+            // 上の早期リターンで処理済みのため構造的に到達しないが、
+            // 網羅性のため fail-closed に `None` を返す。
+            FilterOp::TypedCompare { .. } => return None,
+            // `Compare`（未束縛）は `bind` を経た `MetadataFilter` には
+            // 現れない契約だが網羅性のため同じ腕で扱う。索引で解決しない
+            // ことで `sql::exec` は候補削減を信頼せず既存の全行走査
+            // （フィルタ事前/事後適用）へフォールバックする（fail-closed。
+            // 索引未対応が誤って「一致 0 件」に化けない）。
+            FilterOp::Compare { .. } => return None,
         };
         result.sort_unstable();
         Some(result)
+    }
+
+    /// [`FilterOp::TypedCompare`] 述語（`DATE`／`TIMESTAMP`／`NUMERIC`／
+    /// `UUID`。`BYTEA` は [`OrderedColumnIndex`] に対応 variant を持たず
+    /// 未対応のまま——モジュールドキュメント「データモデル」参照）の一致
+    /// スロットを返す（Issue #893 production 接続）。`DATE`／`TIMESTAMP`／
+    /// `UUID` は列・リテラルともに同一表現の厳密な整数キーのため、境界は
+    /// 単純な `checked_add`/`checked_sub` で導出する。`NUMERIC` はリテラルが
+    /// 列と異なる `scale` を持ちうる（[`declarative_filter::TypedLiteral::
+    /// Numeric`] は `parse_literal_exact` 由来の任意 `scale`）ため
+    /// [`crate::numeric::rescale_bounds_for_column`] へ委譲する。列が typed
+    /// 索引の対象でない・未索引（`None`）・境界計算がオーバーフローする
+    /// 場合は `None`（判定不能。呼び出し元は全走査へ縮退する契機として
+    /// 扱う。fail-closed）。
+    fn typed_compare_candidates(
+        &self,
+        column_index: usize,
+        op: crate::declarative_filter::CompareOp,
+        value: &crate::declarative_filter::TypedLiteral,
+    ) -> Option<Vec<u32>> {
+        use crate::declarative_filter::{CompareOp, TypedLiteral};
+        use std::ops::Bound;
+
+        /// キー値と無関係に常に空集合になる正準表現（`start == end` が
+        /// 常に成立する。`numeric::rescale_bounds_for_column`・
+        /// `sql::scalar_plan::id_bounds` と同じ手法）。
+        fn empty<K: Copy + Default>() -> (Bound<K>, Bound<K>) {
+            (Bound::Included(K::default()), Bound::Excluded(K::default()))
+        }
+
+        /// `Date`／`Timestamp` 列（`i64` へ昇格済み）・リテラルともに小数を
+        /// 持たない厳密な整数キーのための境界導出（`sql::scalar_plan::
+        /// id_bounds` の非整数リテラル処理を要しない単純版）。
+        fn exact_i64_bounds(op: CompareOp, v: i64) -> (Bound<i64>, Bound<i64>) {
+            match op {
+                CompareOp::Eq => (Bound::Included(v), Bound::Included(v)),
+                CompareOp::Gt => v
+                    .checked_add(1)
+                    .map(|l| (Bound::Included(l), Bound::Unbounded))
+                    .unwrap_or_else(empty),
+                CompareOp::Ge => (Bound::Included(v), Bound::Unbounded),
+                CompareOp::Lt => v
+                    .checked_sub(1)
+                    .map(|u| (Bound::Unbounded, Bound::Included(u)))
+                    .unwrap_or_else(empty),
+                CompareOp::Le => (Bound::Unbounded, Bound::Included(v)),
+            }
+        }
+
+        /// `Uuid` 列（`u128` へ写像済み）向けの [`exact_i64_bounds`] の
+        /// `u128` 版。
+        fn exact_u128_bounds(op: CompareOp, v: u128) -> (Bound<u128>, Bound<u128>) {
+            match op {
+                CompareOp::Eq => (Bound::Included(v), Bound::Included(v)),
+                CompareOp::Gt => v
+                    .checked_add(1)
+                    .map(|l| (Bound::Included(l), Bound::Unbounded))
+                    .unwrap_or_else(empty),
+                CompareOp::Ge => (Bound::Included(v), Bound::Unbounded),
+                CompareOp::Lt => v
+                    .checked_sub(1)
+                    .map(|u| (Bound::Unbounded, Bound::Included(u)))
+                    .unwrap_or_else(empty),
+                CompareOp::Le => (Bound::Unbounded, Bound::Included(v)),
+            }
+        }
+
+        let column = self.typed_columns.get(column_index)?.as_ref()?;
+        // `range_slots` が返す時点でスロット昇順に整列済み
+        // （`candidates_id_range`/`candidates_typed_range` と同じ契約）
+        // のため、ここで再整列しない。
+        match (column, value) {
+            (OrderedColumnIndex::I64(pairs), TypedLiteral::Date(d)) => {
+                let (lower, upper) = exact_i64_bounds(op, i64::from(*d));
+                range_slots(pairs, lower, upper)
+            }
+            (OrderedColumnIndex::I64(pairs), TypedLiteral::Timestamp(t)) => {
+                let (lower, upper) = exact_i64_bounds(op, *t);
+                range_slots(pairs, lower, upper)
+            }
+            (OrderedColumnIndex::I128(pairs, col_scale), TypedLiteral::Numeric(d)) => {
+                let (lower, upper) = crate::numeric::rescale_bounds_for_column(d, *col_scale, op)?;
+                range_slots(pairs, lower, upper)
+            }
+            (OrderedColumnIndex::U128(pairs), TypedLiteral::Uuid(u)) => {
+                let (lower, upper) = exact_u128_bounds(op, uuid_to_sortable_u128(u.as_bytes()));
+                range_slots(pairs, lower, upper)
+            }
+            // `Bytea`（`OrderedColumnIndex` に対応 variant を持たず未対応の
+            // まま）・列型とリテラル型の不一致（構造的に到達しないはずだが
+            // untrusted 由来の対応関係への多層防御）はいずれも索引未対応
+            // として扱う。
+            _ => None,
+        }
     }
 
     /// `column_index` 列（`TEXT` 列限定）の値ごとのグループを、値のバイト列
@@ -929,8 +1449,92 @@ impl ScalarIndex {
         let mut out: Vec<u32> = Vec::new();
         out.try_reserve_exact(end - start).ok()?;
         out.extend(idx[start..end].iter().map(|(_, slot)| *slot));
-        out.sort_unstable();
+        out.sort_unstable(); // sort-determinism: allow u32 スロット番号の全順序（重複なし）による昇順整列
         Some(out)
+    }
+
+    /// 数値・日時・`NUMERIC`・`UUID` 列（Issue #893）に対する範囲述語（等価・
+    /// 単純比較）向け照会。`column_index` が `TEXT`／`ENUM`（`candidates_for`
+    /// の対象）である・未知の列である・[`OrderedColumnIndex`] の variant が
+    /// `lower`／`upper` の [`TypedKey`] 型と一致しない、のいずれかは `None`
+    /// （判定不能＝索引未対応。呼び出し元は全走査へ縮退する契機として扱う。
+    /// `id` を除く型不一致は `sql::scalar_plan` の預言的述語構築の契約により
+    /// 通常到達しないが、防御的に fail-closed とする）。一致 0 件は
+    /// `Some(vec![])` を返し `None` と区別する。戻り値は昇順 `Vec<u32>`。
+    ///
+    /// production 経路（`Self::candidates_for` の `TypedCompare` 分岐）は
+    /// `MetadataFilter::TypedCompare` を直接消費するため `TypedKey` へ正規化
+    /// せず本メソッドを経由しない。本メソッドは `OrderedColumnIndex` の
+    /// 構築・照会ロジックそのものを型ごとに検証する単体テスト専用の入口
+    /// として残す（`#[cfg_attr(not(test), allow(dead_code))]`。`TypedKey`
+    /// と同型のテスト専用到達パターン）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn candidates_typed_range(
+        &self,
+        column_index: usize,
+        lower: std::ops::Bound<TypedKey>,
+        upper: std::ops::Bound<TypedKey>,
+    ) -> Option<Vec<u32>> {
+        use std::ops::Bound;
+        let column = self.typed_columns.get(column_index)?.as_ref()?;
+        /// `Bound<TypedKey>` を `Bound<K>` へ変換する。variant が一致しない
+        /// 場合は `None`（呼び出し元は索引未対応として扱う）。
+        fn map_bound<K>(
+            bound: std::ops::Bound<TypedKey>,
+            extract: impl Fn(TypedKey) -> Option<K>,
+        ) -> Option<std::ops::Bound<K>> {
+            Some(match bound {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(k) => Bound::Included(extract(k)?),
+                Bound::Excluded(k) => Bound::Excluded(extract(k)?),
+            })
+        }
+        match column {
+            OrderedColumnIndex::I64(pairs) => {
+                let extract = |k: TypedKey| match k {
+                    TypedKey::I64(v) => Some(v),
+                    _ => None,
+                };
+                range_slots(
+                    pairs,
+                    map_bound(lower, extract)?,
+                    map_bound(upper, extract)?,
+                )
+            }
+            OrderedColumnIndex::F64Sortable(pairs) => {
+                let extract = |k: TypedKey| match k {
+                    TypedKey::F64Sortable(v) => Some(v),
+                    _ => None,
+                };
+                range_slots(
+                    pairs,
+                    map_bound(lower, extract)?,
+                    map_bound(upper, extract)?,
+                )
+            }
+            OrderedColumnIndex::I128(pairs, _scale) => {
+                let extract = |k: TypedKey| match k {
+                    TypedKey::I128(v) => Some(v),
+                    _ => None,
+                };
+                range_slots(
+                    pairs,
+                    map_bound(lower, extract)?,
+                    map_bound(upper, extract)?,
+                )
+            }
+            OrderedColumnIndex::U128(pairs) => {
+                let extract = |k: TypedKey| match k {
+                    TypedKey::U128(v) => Some(v),
+                    _ => None,
+                };
+                range_slots(
+                    pairs,
+                    map_bound(lower, extract)?,
+                    map_bound(upper, extract)?,
+                )
+            }
+        }
     }
 
     /// `metadata_filters`（`TEXT` 列の等価・前方一致）と `id_preds`（`id` の
@@ -943,6 +1547,15 @@ impl ScalarIndex {
     /// （`sql::exec`）が候補行にも引き続き `on_visible_row`（`matches_all`＋
     /// 式述語）を適用する契約と組み合わさって fail-closed が成立する（本
     /// メソッド自体が正しさの唯一の防御ではない）。
+    ///
+    /// `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID` 列の範囲述語（`FilterOp::
+    /// TypedCompare`。Issue #891・TASK-199 で production 結線済み）は
+    /// `metadata_filters` に混在したまま渡ってくる（`sql::parser::
+    /// bind_where_predicates` が `TEXT` 等価・前方一致と同じ
+    /// `Vec<MetadataFilter>` へ束縛するため）。[`Self::candidates_for`] が
+    /// 述語の種類（`Equals`／`StartsWith`／`TypedCompare`）ごとに参照する
+    /// 索引（`self.columns`／`self.typed_columns`）を内部で切り替えるため、
+    /// この関数側で型ごとに分岐する必要はない（Issue #893 production 接続）。
     pub(crate) fn resolve_candidates(
         &self,
         metadata_filters: &[MetadataFilter],
@@ -1051,7 +1664,31 @@ impl ScalarIndex {
             .as_ref()
             .map(|v| v.len().saturating_mul(std::mem::size_of::<(u64, u32)>()))
             .unwrap_or(0);
-        columns_bytes.saturating_add(id_index_bytes)
+        // 数値・日時・`NUMERIC`・`UUID` 列の順序索引（Issue #893）。固定長
+        // キーのため `capacity()`（構築時に `row_count` ちょうどへ厳密確保
+        // 済み）が実確保量とそのまま一致する。
+        let typed_columns_bytes: usize = self
+            .typed_columns
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .map(|c| match c {
+                OrderedColumnIndex::I64(v) => v
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(i64, u32)>()),
+                OrderedColumnIndex::F64Sortable(v) => v
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u64, u32)>()),
+                OrderedColumnIndex::I128(v, _scale) => v
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(i128, u32)>()),
+                OrderedColumnIndex::U128(v) => v
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u128, u32)>()),
+            })
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        columns_bytes
+            .saturating_add(id_index_bytes)
+            .saturating_add(typed_columns_bytes)
     }
 
     /// 概算ヒープバイト量（容量判定用）を返す O(1) アクセサ。
@@ -2828,6 +3465,941 @@ mod tests {
         assert!(
             !index.column_is_indexed(path_col),
             "平均値長が閾値を 1 バイトでも超える列は除外される"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #893: 数値・日時・`NUMERIC`・`UUID` 列の順序索引
+    // ------------------------------------------------------------------
+
+    /// 新スカラー型の列を一通り含むテスト用テーブル。`flag`（`BOOLEAN`）は
+    /// 索引対象外の型が引き続き `None` のままであることの対照として使う。
+    fn typed_schema() -> TableSchema {
+        TableSchema::new(
+            "typed_docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("n", ColumnType::Integer, true),
+                ColumnDef::new("big", ColumnType::BigInt, true),
+                ColumnDef::new("r", ColumnType::Real, true),
+                ColumnDef::new("d", ColumnType::Double, true),
+                ColumnDef::new("dt", ColumnType::Date, true),
+                ColumnDef::new("ts", ColumnType::Timestamp, true),
+                ColumnDef::new(
+                    "num",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("uid", ColumnType::Uuid, true),
+                ColumnDef::new("flag", ColumnType::Boolean, true),
+            ],
+        )
+    }
+
+    fn create_typed_table(storage: &Storage) {
+        storage
+            .create_table(&typed_schema())
+            .expect("create typed table");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_typed(
+        storage: &Storage,
+        c: &PolicyContext,
+        id: u64,
+        n: Option<i32>,
+        big: Option<i64>,
+        r: Option<f32>,
+        d: Option<f64>,
+        dt: Option<i32>,
+        ts: Option<i64>,
+        num: Option<i128>,
+        uid: Option<[u8; 16]>,
+        flag: Option<bool>,
+        visibility: Visibility,
+    ) {
+        crate::tenant::insert_typed_row(
+            storage,
+            "typed_docs",
+            c,
+            id,
+            visibility,
+            &[
+                Value::Vector(vec![0.0, 0.0]),
+                n.map(Value::Integer).unwrap_or(Value::Null),
+                big.map(Value::BigInt).unwrap_or(Value::Null),
+                r.map(Value::Real).unwrap_or(Value::Null),
+                d.map(Value::Double).unwrap_or(Value::Null),
+                dt.map(Value::Date).unwrap_or(Value::Null),
+                ts.map(Value::Timestamp).unwrap_or(Value::Null),
+                num.map(|unscaled| {
+                    Value::Numeric(
+                        crate::numeric::Decimal::from_parts(unscaled, 2)
+                            .expect("valid decimal for scale 2"),
+                    )
+                })
+                .unwrap_or(Value::Null),
+                uid.map(|bytes| Value::Uuid(crate::uuid::Uuid::from_bytes(bytes)))
+                    .unwrap_or(Value::Null),
+                flag.map(Value::Bool).unwrap_or(Value::Null),
+            ],
+            &op_id(&format!("typed-seed-{id}")),
+        )
+        .expect("insert typed row");
+    }
+
+    /// [`snapshot_from`] の typed テーブル版（テーブル名のみ異なる）。
+    fn typed_snapshot_from(
+        storage: &Storage,
+        c: &PolicyContext,
+    ) -> (crate::sql::arena_cache::SqlArenaSnapshot, TableSchema) {
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let schema =
+            crate::catalog::get_table_schema_in_txn(&read_txn, "typed_docs").expect("schema");
+        let expected_dim = schema.vector_dim().expect("vector dim");
+        let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
+            expected_dim,
+            crate::arena::MAX_ARENA_ROWS,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+        );
+        let hook = crate::rls::ImplicitRlsHook::new(c);
+        let mut rls_capture = |id: u64,
+                               tenant_id: &str,
+                               visibility,
+                               embedding: &[f32],
+                               metadata: &[u8],
+                               response_arena_bytes_in_use: usize|
+         -> std::result::Result<(), crate::arena::ArenaError> {
+            capture.push(
+                id,
+                tenant_id,
+                visibility,
+                embedding,
+                metadata,
+                response_arena_bytes_in_use,
+            );
+            Ok(())
+        };
+        let _built: VectorArena =
+            crate::arena::VectorArena::build_filtered_with_rows_in_txn_capturing(
+                &read_txn,
+                "typed_docs",
+                hook.predicate(),
+                |_, _, _, _| Ok(true),
+                &mut rls_capture,
+            )
+            .expect("build arena");
+        let table_generation = crate::catalog::table_generation_in_txn(&read_txn, "typed_docs")
+            .expect("table generation");
+        let (cache_arena, cache_metadata) = capture.finish("typed_docs").expect("capture snapshot");
+        (
+            crate::sql::arena_cache::SqlArenaSnapshot::new(
+                cache_arena,
+                cache_metadata,
+                c.clone(),
+                table_generation,
+            ),
+            schema,
+        )
+    }
+
+    fn typed_col(schema: &TableSchema, name: &str) -> usize {
+        schema
+            .columns
+            .iter()
+            .position(|col| col.name == name)
+            .unwrap_or_else(|| panic!("column {name} not found"))
+    }
+
+    /// 各型で「等価・範囲述語」の [`ScalarIndex::candidates_typed_range`] が
+    /// `scan_scalar_columns` を総当たりした brute-force オラクルと完全一致
+    /// することを固定する（境界値込み）。
+    #[test]
+    fn candidates_typed_range_matches_brute_force_oracle_for_each_type() {
+        let db_path = unique_db_path("scalar-index-typed-oracle");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+
+        // `n`（INTEGER）: i32::MIN/MAX を含む値域。
+        // `big`（BIGINT）: 2^53 未満の値のみ（超過は別テストで確認）。
+        // `r`（REAL）・`d`（DOUBLE）: 負・正・ゼロ・小数を混在。
+        // `dt`（DATE）・`ts`（TIMESTAMP）: 任意の i32/i64（TIMESTAMP は 2^53 未満）。
+        // `num`（NUMERIC(10,2)）: 負・正の unscaled 値。
+        // `uid`（UUID）: nil・全 1・中間値。
+        // clippy::type_complexity 対応でタプル型に別名を付ける（この単体
+        // テストのみで使う一時的な型）。
+        type TypedRow = (u64, i32, i64, f32, f64, i32, i64, i128, [u8; 16]);
+        let rows: Vec<TypedRow> = vec![
+            (
+                1,
+                i32::MIN,
+                -1_000_000,
+                -1.5,
+                -1.5,
+                -100,
+                -1_000_000,
+                -12345,
+                [0u8; 16],
+            ),
+            (2, 0, 0, 0.0, 0.0, 0, 0, 0, [0xffu8; 16]),
+            (3, i32::MAX, 1_000_000, 1.5, 1.5, 100, 1_000_000, 12345, {
+                let mut b = [0u8; 16];
+                b[15] = 1;
+                b
+            }),
+            (4, 5, 5, 2.5, 2.5, 5, 5, 500, {
+                let mut b = [0u8; 16];
+                b[0] = 0x80;
+                b
+            }),
+        ];
+        for (id, n, big, r, d, dt, ts, num, uid) in &rows {
+            insert_typed(
+                &storage,
+                &c,
+                *id,
+                Some(*n),
+                Some(*big),
+                Some(*r),
+                Some(*d),
+                Some(*dt),
+                Some(*ts),
+                Some(*num),
+                Some(*uid),
+                Some(true),
+                Visibility::Public,
+            );
+        }
+
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
+
+        // 列ごとに全行を brute force でスキャンし、`>=` 境界（各列の中央値
+        // 相当）で候補を求めるオラクルと索引の結果を突き合わせる。
+        let read_txn = storage.db().begin_read().expect("begin read");
+
+        fn oracle_slots<T: PartialOrd + Copy>(
+            arena: &VectorArena,
+            metadata: &[Vec<u8>],
+            schema: &TableSchema,
+            col: usize,
+            extract: impl Fn(ScalarRef<'_>) -> Option<T>,
+            threshold: T,
+        ) -> Vec<u32> {
+            let mut out = Vec::new();
+            for slot in 0..arena.len() {
+                let meta = metadata.get(slot).map(Vec::as_slice).unwrap_or(&[]);
+                let scanned = scan_scalar_columns(schema, meta).expect("decode row");
+                if let Some(Some(v)) = scanned.get(col) {
+                    if let Some(key) = extract(*v) {
+                        if key >= threshold {
+                            out.push(slot as u32);
+                        }
+                    }
+                }
+            }
+            out.sort_unstable();
+            out
+        }
+
+        // `snapshot_from`/`typed_snapshot_from` はテスト専用の再走査のため、
+        // `arena`/`metadata` を直接読める `SqlArenaCaptureBuilder` の結果
+        // ではなく、索引本体が構築時に読んだのと同じ `snapshot` を使う。
+        let arena_len = snapshot.arena().len();
+        let _ = read_txn; // 明示的に drop 順序を保つ（`storage` の借用と独立）。
+        assert_eq!(arena_len, rows.len());
+
+        let n_col = typed_col(&schema, "n");
+        let big_col = typed_col(&schema, "big");
+        let r_col = typed_col(&schema, "r");
+        let d_col = typed_col(&schema, "d");
+        let dt_col = typed_col(&schema, "dt");
+        let ts_col = typed_col(&schema, "ts");
+        let num_col = typed_col(&schema, "num");
+        let uid_col = typed_col(&schema, "uid");
+
+        // INTEGER: n >= 5
+        let expected = oracle_slots(
+            snapshot.arena(),
+            snapshot.metadata(),
+            &schema,
+            n_col,
+            |v| match v {
+                ScalarRef::Integer(x) => Some(x),
+                _ => None,
+            },
+            5,
+        );
+        let actual = index
+            .candidates_typed_range(n_col, Bound::Included(TypedKey::I64(5)), Bound::Unbounded)
+            .expect("indexed integer column");
+        assert_eq!(actual, expected, "INTEGER >= 5");
+
+        // BIGINT: big >= 0
+        let expected = oracle_slots(
+            snapshot.arena(),
+            snapshot.metadata(),
+            &schema,
+            big_col,
+            |v| match v {
+                ScalarRef::BigInt(x) => Some(x),
+                _ => None,
+            },
+            0i64,
+        );
+        let actual = index
+            .candidates_typed_range(big_col, Bound::Included(TypedKey::I64(0)), Bound::Unbounded)
+            .expect("indexed bigint column");
+        assert_eq!(actual, expected, "BIGINT >= 0");
+
+        // REAL: r >= 1.5（`f64_to_sortable_bits` の全順序性を確認）
+        let expected = oracle_slots(
+            snapshot.arena(),
+            snapshot.metadata(),
+            &schema,
+            r_col,
+            |v| match v {
+                ScalarRef::Real(x) => Some(f64_to_sortable_bits(f64::from(x))),
+                _ => None,
+            },
+            f64_to_sortable_bits(1.5),
+        );
+        let actual = index
+            .candidates_typed_range(
+                r_col,
+                Bound::Included(TypedKey::F64Sortable(f64_to_sortable_bits(1.5))),
+                Bound::Unbounded,
+            )
+            .expect("indexed real column");
+        assert_eq!(actual, expected, "REAL >= 1.5");
+
+        // DOUBLE: d < 0.0
+        let expected = oracle_slots(
+            snapshot.arena(),
+            snapshot.metadata(),
+            &schema,
+            d_col,
+            |v| match v {
+                ScalarRef::Double(x) => Some(f64_to_sortable_bits(x)),
+                _ => None,
+            },
+            u64::MIN,
+        )
+        .into_iter()
+        .filter(|&slot| {
+            let meta = snapshot
+                .metadata()
+                .get(slot as usize)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let scanned = scan_scalar_columns(&schema, meta).expect("decode row");
+            matches!(scanned.get(d_col), Some(Some(ScalarRef::Double(x))) if *x < 0.0)
+        })
+        .collect::<Vec<_>>();
+        let actual = index
+            .candidates_typed_range(
+                d_col,
+                Bound::Unbounded,
+                Bound::Excluded(TypedKey::F64Sortable(f64_to_sortable_bits(0.0))),
+            )
+            .expect("indexed double column");
+        assert_eq!(actual, expected, "DOUBLE < 0.0");
+
+        // DATE: dt <= 0
+        let expected = oracle_slots(
+            snapshot.arena(),
+            snapshot.metadata(),
+            &schema,
+            dt_col,
+            |v| match v {
+                ScalarRef::Date(x) => Some(-(x as i64)),
+                _ => None,
+            },
+            0i64,
+        );
+        let actual = index
+            .candidates_typed_range(dt_col, Bound::Unbounded, Bound::Included(TypedKey::I64(0)))
+            .expect("indexed date column");
+        assert_eq!(actual, expected, "DATE <= 0");
+
+        // TIMESTAMP: ts = 0
+        let expected = oracle_slots(
+            snapshot.arena(),
+            snapshot.metadata(),
+            &schema,
+            ts_col,
+            |v| match v {
+                ScalarRef::Timestamp(0) => Some(0i64),
+                _ => None,
+            },
+            0i64,
+        );
+        let actual = index
+            .candidates_typed_range(
+                ts_col,
+                Bound::Included(TypedKey::I64(0)),
+                Bound::Included(TypedKey::I64(0)),
+            )
+            .expect("indexed timestamp column");
+        assert_eq!(actual, expected, "TIMESTAMP = 0");
+
+        // NUMERIC(10,2): num > 0
+        let expected = oracle_slots(
+            snapshot.arena(),
+            snapshot.metadata(),
+            &schema,
+            num_col,
+            |v| match v {
+                ScalarRef::Numeric(dec) => Some(dec.unscaled()),
+                _ => None,
+            },
+            1i128,
+        );
+        let actual = index
+            .candidates_typed_range(
+                num_col,
+                Bound::Excluded(TypedKey::I128(0)),
+                Bound::Unbounded,
+            )
+            .expect("indexed numeric column");
+        assert_eq!(actual, expected, "NUMERIC > 0");
+
+        // UUID: uid >= nil（全行を含む）
+        let expected = oracle_slots(
+            snapshot.arena(),
+            snapshot.metadata(),
+            &schema,
+            uid_col,
+            |v| match v {
+                ScalarRef::Uuid(u) => Some(uuid_to_sortable_u128(u.as_bytes())),
+                _ => None,
+            },
+            u128::MIN,
+        );
+        let actual = index
+            .candidates_typed_range(
+                uid_col,
+                Bound::Included(TypedKey::U128(0)),
+                Bound::Unbounded,
+            )
+            .expect("indexed uuid column");
+        assert_eq!(actual, expected, "UUID >= nil");
+    }
+
+    /// production 経路が実際に呼ぶ [`ScalarIndex::build`] は、レーン B
+    /// （`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`。`FilterOp::TypedCompare` で
+    /// production 結線済み——Issue #891・TASK-199）の順序索引を構築する
+    /// 一方、レーン A（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`。まだ `WHERE`
+    /// 述語表現を持たず一度も照会されない）は `BOOLEAN` 等と同じ非索引化の
+    /// ままであることを固定する。未接続のレーン A 列構築が既存の索引の
+    /// 予算・可用性を巻き添えにしない（codex-review P2 指摘・PR #1032）
+    /// という不変条件が、レーン B 接続後も維持されていることを示す。
+    #[test]
+    fn build_indexes_lane_b_but_defers_unwired_lane_a_typed_range_columns() {
+        let db_path = unique_db_path("scalar-index-typed-lane-split");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        insert_typed(
+            &storage,
+            &c,
+            1,
+            Some(1),
+            Some(1),
+            Some(1.0),
+            Some(1.0),
+            Some(1),
+            Some(1),
+            Some(100),
+            Some([0u8; 16]),
+            Some(true),
+            Visibility::Public,
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        // production 経路と同じ既定入口。
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        for name in ["n", "big", "r", "d"] {
+            let col = typed_col(&schema, name);
+            assert!(
+                !index.typed_column_is_indexed(col),
+                "column {name} (lane A) must stay unindexed via the default build() \
+                 entry until a WHERE predicate representation exists for it"
+            );
+        }
+        for name in ["dt", "ts", "num", "uid"] {
+            let col = typed_col(&schema, name);
+            assert!(
+                index.typed_column_is_indexed(col),
+                "column {name} (lane B) must be indexed via the default build() \
+                 entry now that TypedCompare is wired to production (Issue #891)"
+            );
+        }
+    }
+
+    /// `NULL` はいずれの typed 列索引にもエントリを作らない
+    /// （`TextColumnIndex` と同じ契約。モジュールドキュメント参照）。
+    #[test]
+    fn typed_columns_exclude_null_rows() {
+        let db_path = unique_db_path("scalar-index-typed-null");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        insert_typed(
+            &storage,
+            &c,
+            1,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Visibility::Public,
+        );
+        insert_typed(
+            &storage,
+            &c,
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Visibility::Public,
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
+        let n_col = typed_col(&schema, "n");
+        let all = index
+            .candidates_typed_range(n_col, Bound::Unbounded, Bound::Unbounded)
+            .expect("indexed integer column");
+        assert_eq!(all, vec![0u32], "NULL 行（id=2）は候補に現れない");
+    }
+
+    /// RLS 部分可視: 他テナントの `Private` 行は snapshot に含まれず、当然
+    /// typed 索引の候補にも現れない（`(table, ctx)` 可視スナップショットから
+    /// のみ構築するという索引全体の契約——モジュールドキュメント「fail-closed
+    /// の適用範囲」——が typed 列でも成立することを固定する）。
+    #[test]
+    fn typed_columns_respect_rls_visibility() {
+        let db_path = unique_db_path("scalar-index-typed-rls");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let tenant_a = ctx("tenant-a");
+        let tenant_b = ctx("tenant-b");
+        insert_typed(
+            &storage,
+            &tenant_a,
+            1,
+            Some(10),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Visibility::Public,
+        );
+        insert_typed(
+            &storage,
+            &tenant_b,
+            2,
+            Some(20),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Visibility::Private,
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &tenant_a);
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
+        let n_col = typed_col(&schema, "n");
+        let all = index
+            .candidates_typed_range(n_col, Bound::Unbounded, Bound::Unbounded)
+            .expect("indexed integer column");
+        assert_eq!(
+            all,
+            vec![0u32],
+            "tenant-b の Private 行は tenant-a の索引に現れない"
+        );
+    }
+
+    /// `BOOLEAN`／`BYTEA`／`JSON`／`JSONB`／`ARRAY`／`VECTOR` 列は typed 索引の
+    /// 対象外のまま（`candidates_typed_range` は常に `None`）。
+    #[test]
+    fn typed_columns_exclude_non_indexable_types() {
+        let db_path = unique_db_path("scalar-index-typed-excluded-types");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        insert_typed(
+            &storage,
+            &c,
+            1,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Visibility::Public,
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
+        let flag_col = typed_col(&schema, "flag");
+        let embedding_col = typed_col(&schema, "embedding");
+        assert!(!index.typed_column_is_indexed(flag_col));
+        assert!(!index.typed_column_is_indexed(embedding_col));
+        assert_eq!(
+            index.candidates_typed_range(flag_col, Bound::Unbounded, Bound::Unbounded),
+            None
+        );
+        assert_eq!(
+            index.candidates_typed_range(embedding_col, Bound::Unbounded, Bound::Unbounded),
+            None
+        );
+    }
+
+    /// `BIGINT`／`TIMESTAMP` の絶対値が `2^53` を 1 件でも超えると、列単位で
+    /// 索引対象外（`None`）へ縮退する（モジュールドキュメント
+    /// 「`MAX_EXACT_TYPED_I64_ABS`」参照）。他の typed 列（`n`）は影響を
+    /// 受けない。
+    #[test]
+    fn typed_columns_drop_bigint_and_timestamp_beyond_2_53() {
+        let db_path = unique_db_path("scalar-index-typed-2-53");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        let over = (1i64 << 53) + 1;
+        insert_typed(
+            &storage,
+            &c,
+            1,
+            Some(1),
+            Some(over),
+            None,
+            None,
+            None,
+            Some(over),
+            None,
+            None,
+            None,
+            Visibility::Public,
+        );
+        insert_typed(
+            &storage,
+            &c,
+            2,
+            Some(2),
+            Some(-over),
+            None,
+            None,
+            None,
+            Some(-over),
+            None,
+            None,
+            None,
+            Visibility::Public,
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
+        let n_col = typed_col(&schema, "n");
+        let big_col = typed_col(&schema, "big");
+        let ts_col = typed_col(&schema, "ts");
+        assert!(
+            index.typed_column_is_indexed(n_col),
+            "2^53 超過と無関係な列は影響を受けない"
+        );
+        assert!(
+            !index.typed_column_is_indexed(big_col),
+            "2^53 を超える BIGINT を含む列は索引対象外へ縮退する"
+        );
+        assert!(
+            !index.typed_column_is_indexed(ts_col),
+            "2^53 を超える TIMESTAMP を含む列は索引対象外へ縮退する"
+        );
+    }
+
+    /// `2^53` ちょうど・その 1 手前は境界として索引に残る（`MAX_EXACT_TYPED_I64_ABS`
+    /// は「超える」場合のみ除外する契約——`i64_within_exact_f64_range` の
+    /// `<=` 判定——を固定する）。
+    #[test]
+    fn typed_columns_keep_bigint_at_exact_2_53_boundary() {
+        let db_path = unique_db_path("scalar-index-typed-2-53-boundary");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        let at_boundary = 1i64 << 53;
+        insert_typed(
+            &storage,
+            &c,
+            1,
+            None,
+            Some(at_boundary),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Visibility::Public,
+        );
+        insert_typed(
+            &storage,
+            &c,
+            2,
+            None,
+            Some(-at_boundary),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Visibility::Public,
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build_including_unwired_typed_range_columns(&schema, &snapshot)
+            .expect("build index");
+        let big_col = typed_col(&schema, "big");
+        assert!(
+            index.typed_column_is_indexed(big_col),
+            "ちょうど 2^53（絶対値）は境界として索引に残る"
+        );
+        let all = index
+            .candidates_typed_range(big_col, Bound::Unbounded, Bound::Unbounded)
+            .expect("indexed bigint column");
+        assert_eq!(all, vec![0u32, 1u32]);
+    }
+
+    /// `resolve_candidates` が `metadata_filters` に混在する `TEXT` 等価
+    /// フィルタと `FilterOp::TypedCompare`（`DATE` 列。Issue #891・TASK-199
+    /// で production 結線済み。Issue #893 production 接続）を、`id_preds` と
+    /// 同じ交差契約で絞ることを固定する。`Self::candidates_for` が
+    /// `TypedCompare` を内部で `self.typed_columns` へ振り向けることの
+    /// 統合的な検証（`build()` 経由——`build_including_unwired_typed_range_
+    /// columns` は使わない——production 経路と同一の入口）。
+    #[test]
+    fn resolve_candidates_intersects_typed_compare_with_metadata_filter() {
+        let db_path = unique_db_path("scalar-index-typed-resolve-candidates");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        // `TEXT` 列を持つ既存の `docs` テーブルに `dt`（DATE）を混ぜたいが
+        // 本ファイルの `schema()` は `docs` 名を占有しているため、TEXT 列を
+        // 1 本持つ専用スキーマを使う。
+        let mixed_schema = TableSchema::new(
+            "mixed_docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("kind", ColumnType::Text, true),
+                ColumnDef::new("dt", ColumnType::Date, true),
+            ],
+        );
+        storage.create_table(&mixed_schema).expect("create table");
+        let c = ctx("tenant-a");
+        let rows: [(u64, &str, i32); 4] = [
+            (1, "alpha", 1),
+            (2, "alpha", 5),
+            (3, "beta", 5),
+            (4, "alpha", 5),
+        ];
+        for (id, kind, dt) in rows {
+            crate::tenant::insert_typed_row(
+                &storage,
+                "mixed_docs",
+                &c,
+                id,
+                Visibility::Public,
+                &[
+                    Value::Vector(vec![0.0, 0.0]),
+                    Value::Text(kind.to_string()),
+                    Value::Date(dt),
+                ],
+                &op_id(&format!("mixed-seed-{id}")),
+            )
+            .expect("insert row");
+        }
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let schema =
+            crate::catalog::get_table_schema_in_txn(&read_txn, "mixed_docs").expect("schema");
+        let expected_dim = schema.vector_dim().expect("vector dim");
+        let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
+            expected_dim,
+            crate::arena::MAX_ARENA_ROWS,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+        );
+        let hook = crate::rls::ImplicitRlsHook::new(&c);
+        let mut rls_capture = |id: u64,
+                               tenant_id: &str,
+                               visibility,
+                               embedding: &[f32],
+                               metadata: &[u8],
+                               response_arena_bytes_in_use: usize|
+         -> std::result::Result<(), crate::arena::ArenaError> {
+            capture.push(
+                id,
+                tenant_id,
+                visibility,
+                embedding,
+                metadata,
+                response_arena_bytes_in_use,
+            );
+            Ok(())
+        };
+        let _built: VectorArena =
+            crate::arena::VectorArena::build_filtered_with_rows_in_txn_capturing(
+                &read_txn,
+                "mixed_docs",
+                hook.predicate(),
+                |_, _, _, _| Ok(true),
+                &mut rls_capture,
+            )
+            .expect("build arena");
+        let table_generation = crate::catalog::table_generation_in_txn(&read_txn, "mixed_docs")
+            .expect("table generation");
+        let (cache_arena, cache_metadata) = capture.finish("mixed_docs").expect("capture snapshot");
+        let snapshot = crate::sql::arena_cache::SqlArenaSnapshot::new(
+            cache_arena,
+            cache_metadata,
+            c.clone(),
+            table_generation,
+        );
+        // production 経路と同一の既定入口（`build_including_unwired_typed_
+        // range_columns` ではない）。
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+
+        let kind_filter = MetadataFilter_equals(&schema, "kind", "alpha");
+        let dt_filter = crate::declarative_filter::DeclarativeFilter::compare(
+            "dt",
+            crate::declarative_filter::CompareOp::Ge,
+            "1970-01-06", // エポック（1970-01-01）+5 日 = dt >= 5
+        )
+        .bind(&schema)
+        .expect("bind compare filter");
+        let resolution = index.resolve_candidates(&[kind_filter, dt_filter], &[]);
+        let CandidateResolution::Use(slots) = resolution else {
+            panic!("expected CandidateResolution::Use, got a fallback");
+        };
+        // id=1: kind=alpha, dt=1（dt 条件で除外）。id=2: kind=alpha, dt=5（一致）。
+        // id=3: kind=beta（kind 条件で除外）。id=4: kind=alpha, dt=5（一致）。
+        assert_eq!(slots, vec![1u32, 3u32], "kind='alpha' AND dt >= 5 の交差");
+    }
+
+    /// `NUMERIC` 列の `TypedCompare` は、リテラルが列より細かい `scale` を
+    /// 持つ（列の格子に乗らない）場合でも [`crate::numeric::cmp_exact`] と
+    /// 一致する候補を返すことを、`resolve_candidates`（production 経路と
+    /// 同一の `ScalarIndex::build` 入口）経由で固定する
+    /// （`numeric::tests::rescale_bounds_for_column_matches_cmp_exact_oracle`
+    /// の単体レベル検証を索引照会レベルで裏付ける）。
+    #[test]
+    fn resolve_candidates_numeric_typed_compare_respects_finer_literal_scale() {
+        let db_path = unique_db_path("scalar-index-numeric-fine-literal");
+        let _guard = CleanupGuard(db_path.clone());
+        let storage = Storage::open(&db_path).expect("open storage");
+        create_typed_table(&storage);
+        let c = ctx("tenant-a");
+        // `num` は `NUMERIC(10,2)`。1.50・1.51 を列の格子（0.01 単位）で表現する。
+        insert_typed(
+            &storage,
+            &c,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(150),
+            None,
+            None,
+            Visibility::Public,
+        );
+        insert_typed(
+            &storage,
+            &c,
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(151),
+            None,
+            None,
+            Visibility::Public,
+        );
+        let (snapshot, schema) = typed_snapshot_from(&storage, &c);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+
+        // リテラル `1.505`（scale=3）は列の格子（scale=2）に乗らない。
+        // `num > 1.505` は 1.51（id=2）のみに一致し、1.50（id=1）は除外される。
+        let gt_filter = crate::declarative_filter::DeclarativeFilter::compare_numeric_literal(
+            "num",
+            crate::declarative_filter::CompareOp::Gt,
+            "1.505",
+        )
+        .bind(&schema)
+        .expect("bind compare filter");
+        let resolution = index.resolve_candidates(&[gt_filter], &[]);
+        let CandidateResolution::Use(slots) = resolution else {
+            panic!("expected CandidateResolution::Use, got a fallback");
+        };
+        assert_eq!(slots, vec![1u32], "num > 1.505 は 1.51（slot 1）のみに一致");
+
+        // `num <= 1.505` は 1.50（id=1）のみに一致する。
+        let le_filter = crate::declarative_filter::DeclarativeFilter::compare_numeric_literal(
+            "num",
+            crate::declarative_filter::CompareOp::Le,
+            "1.505",
+        )
+        .bind(&schema)
+        .expect("bind compare filter");
+        let resolution = index.resolve_candidates(&[le_filter], &[]);
+        let CandidateResolution::Use(slots) = resolution else {
+            panic!("expected CandidateResolution::Use, got a fallback");
+        };
+        assert_eq!(
+            slots,
+            vec![0u32],
+            "num <= 1.505 は 1.50（slot 0）のみに一致"
         );
     }
 }

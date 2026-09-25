@@ -90,6 +90,19 @@ fn is_where_predicate_boundary_token(token: Option<&Token>) -> bool {
     }
 }
 
+/// `token` が `WHERE` 述語の範囲比較演算子（`< > <= >=`）トークンであれば
+/// 対応する [`CompareOp`] を返す（TABLE-13・TASK-199、Issue #891）。`=` は
+/// 既存の [`WherePredicate::Equality`] 判定が別腕で扱うためここには含めない。
+fn where_compare_op_token(token: &Token) -> Option<CompareOp> {
+    match token {
+        Token::Punct('<') => Some(CompareOp::Lt),
+        Token::Punct('>') => Some(CompareOp::Gt),
+        Token::Le => Some(CompareOp::Le),
+        Token::Ge => Some(CompareOp::Ge),
+        _ => None,
+    }
+}
+
 /// 集計関数（TASK-166・SQL-13）で許可する関数名を照合する（大文字小文字を区別
 /// しない）。未知の名前は fail-closed に拒否する（[`is_allowed_where_predicate_name`]
 /// と同方針）。`sql::udf_call::is_reserved_function_name` から名前空間一本化の
@@ -574,6 +587,27 @@ pub enum WherePredicate {
     BoolEquality { column: String, value: bool },
     /// BOOLEAN 列の裸参照（`WHERE flag`。`value = true` と同義。同 Issue）。
     BoolColumn { column: String },
+    /// 列と文字列リテラルの範囲比較条件（`< > <= >=`。TABLE-13・TASK-199、
+    /// Issue #891）。`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列向けの
+    /// 宣言的経路（レーン B）で束縛する。`=` は既存の [`WherePredicate::Equality`]
+    /// のまま据え置き、逆向き（`'2024-01-01' < d`）は受理しない（構文段で
+    /// 式フォールバックへ回り `42601` になる。既知の制約）。
+    Compare {
+        column: String,
+        op: CompareOp,
+        value: String,
+    },
+}
+
+/// [`WherePredicate::Compare`] の比較演算子（TABLE-13・TASK-199、Issue #891）。
+/// `crate::declarative_filter::CompareOp` と 1 対 1 に対応する（字句表現から
+/// 意味表現への写像を分離するための構文層専用の複製）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// SELECT リストの 1 項目（TASK-79・SQL-9 で式項目を追加する際の共通表現）。
@@ -1579,7 +1613,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let value = self.expect_string_literal()?;
                     predicates.push(WherePredicate::Equality {
-                        column: name,
+                        column: name.clone(),
                         value,
                     });
                     matched_legacy = true;
@@ -1590,7 +1624,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let pattern = self.expect_string_literal()?;
                     predicates.push(WherePredicate::Prefix {
-                        column: name,
+                        column: name.clone(),
                         pattern,
                     });
                     matched_legacy = true;
@@ -1601,7 +1635,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     self.advance();
                     self.advance();
-                    predicates.push(WherePredicate::PredicateCall { name });
+                    predicates.push(WherePredicate::PredicateCall { name: name.clone() });
                     matched_legacy = true;
                 } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
                     && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false"))
@@ -1621,11 +1655,34 @@ impl<'a> Parser<'a> {
                         }
                     };
                     predicates.push(WherePredicate::BoolEquality {
-                        column: name,
+                        column: name.clone(),
                         value,
                     });
                     matched_legacy = true;
-                } else if is_where_predicate_boundary_token(self.tokens.get(self.pos + 1)) {
+                } else if let Some(op) = self
+                    .tokens
+                    .get(self.pos + 1)
+                    .and_then(where_compare_op_token)
+                {
+                    if matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_))) {
+                        // `<col> (< | > | <= | >=) '<literal>'`（TABLE-13・
+                        // TASK-199、Issue #891・レーン B）。逆向き
+                        // （`'x' < col`）は本腕では扱わず式フォールバックへ回す
+                        // （既知の制約。詳細は `docs/design/scalar-types-predicates.md`）。
+                        self.advance();
+                        self.advance();
+                        let value = self.expect_string_literal()?;
+                        predicates.push(WherePredicate::Compare {
+                            column: name.clone(),
+                            op,
+                            value,
+                        });
+                        matched_legacy = true;
+                    }
+                }
+                if !matched_legacy
+                    && is_where_predicate_boundary_token(self.tokens.get(self.pos + 1))
+                {
                     // BOOLEAN 列の裸参照（`WHERE flag`）。直後のトークンが
                     // WHERE 句の終端（`AND`・`ORDER`・`LIMIT`・`;`・EOF・後続構文
                     // キーワード）である場合に限り受理する。受理範囲の拡大を
