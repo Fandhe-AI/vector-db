@@ -381,11 +381,13 @@ fn non_integer_literal_forms_are_rejected_with_22000() {
     assert_eq!(count_rows(&core, &ctx), 0);
 }
 
-/// 整数列を `WHERE`・`SUM`・`GROUP BY`・式で参照した場合は後続 Issue（#891・#892）
+/// 整数列を `WHERE`・`GROUP BY`・式で参照した場合は後続 Issue（#891・#893）
 /// までの fail-closed 拒否として `22000` になる（本 Issue のスコープ外機能の
-/// 挙動を固定する）。
+/// 挙動を固定する）。集計（`SUM` 等）の直接参照は Issue #892 で受理された
+/// ため、この契約からは除外する
+/// （[`sum_of_integer_column_succeeds_after_issue_892`] 参照）。
 #[test]
-fn integer_column_reference_in_where_sum_group_by_and_expr_is_rejected_with_22000() {
+fn integer_column_reference_in_where_group_by_and_expr_is_rejected_with_22000() {
     let path = unique_db_path("column-type-integer-unsupported-refs");
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -400,11 +402,6 @@ fn integer_column_reference_in_where_sum_group_by_and_expr_is_rejected_with_2200
         )
         .unwrap_err();
     assert_eq!(where_err.wire_code(), "22000");
-
-    let sum_err = core
-        .execute_sql(&ctx, &format!("SELECT SUM(n) FROM {TABLE}"))
-        .unwrap_err();
-    assert_eq!(sum_err.wire_code(), "22000");
 
     let group_by_err = core
         .execute_sql(&ctx, &format!("SELECT n, COUNT(*) FROM {TABLE} GROUP BY n"))
@@ -424,6 +421,63 @@ fn integer_column_reference_in_where_sum_group_by_and_expr_is_rejected_with_2200
         )
         .unwrap_err();
     assert_eq!(expr_err.wire_code(), "22000");
+}
+
+/// `SUM`/`AVG`/`MIN`/`MAX(<INTEGER>/<BIGINT>)` は Issue #892 で受理された
+/// （TABLE-13・SQL-13）。`SUM` は `BIGINT` 相当（`Cell::SignedInteger`）・
+/// `AVG` は `DOUBLE PRECISION` 相当（`Cell::Float`）で返る。
+#[test]
+fn sum_of_integer_column_succeeds_after_issue_892() {
+    let path = unique_db_path("column-type-integer-sum-after-892");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, n, b) VALUES \
+             (1, '[0.1,0.2]', 3, 30) USING OPERATION_ID 'op-1'"
+        ),
+    )
+    .expect("insert row 1 should succeed");
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, n, b) VALUES \
+             (2, '[0.1,0.2]', 5, 50) USING OPERATION_ID 'op-2'"
+        ),
+    )
+    .expect("insert row 2 should succeed");
+
+    let sum = core
+        .execute_sql(&ctx, &format!("SELECT SUM(n) FROM {TABLE}"))
+        .expect("SUM(INTEGER) must succeed after Issue #892");
+    assert_eq!(sum.rows[0].cells, vec![Cell::SignedInteger(8)]);
+
+    let avg = core
+        .execute_sql(&ctx, &format!("SELECT AVG(b) FROM {TABLE}"))
+        .expect("AVG(BIGINT) must succeed after Issue #892");
+    assert_eq!(avg.rows[0].cells, vec![Cell::Float(40.0)]);
+
+    let min_max = core
+        .execute_sql(&ctx, &format!("SELECT MIN(n), MAX(n) FROM {TABLE}"))
+        .expect("MIN/MAX(INTEGER) must succeed after Issue #892");
+    assert_eq!(
+        min_max.rows[0].cells,
+        vec![Cell::SignedInteger(3), Cell::SignedInteger(5)]
+    );
+
+    // 空集合（`WHERE` で全行除外）は NULL。
+    let empty = core
+        .execute_sql(&ctx, &format!("SELECT SUM(n) FROM {TABLE} WHERE id = 999"))
+        .expect("SUM over an empty result set must still succeed");
+    assert_eq!(empty.rows[0].cells, vec![Cell::Null]);
 }
 
 // --- 負数リテラルの既存挙動からの変化（42601 → 22000） ----------------------
