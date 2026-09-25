@@ -98,7 +98,7 @@ PostgreSQL の Bind 規則に従う。
 
 PostgreSQL の send 関数と同じレイアウトで 8 型のバイナリ表現を組み立てる
 純関数を用意した（`int4`／`int8`／`float4`／`float8`／`bool_`／`bytea`／
-`uuid`／`text`）。本 Issue時点で `WireType` 側に実際に結線されるのは `text`
+`uuid`／`text`）。本 Issue 時点で `WireType` 側に実際に結線されるのは `text`
 のみで、他の型は Issue #895 で `WireType` へ OID 公告が追加された後も
 バイナリ表現へは未結線のまま（`column_binary_support`／`supports_binary`
 がいずれも `false` を返す。対応拡大は本 doc「申し送り」節）。golden バイト列
