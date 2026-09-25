@@ -13,6 +13,7 @@ pub mod hmac_sha256;
 pub mod scram;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -103,6 +104,13 @@ pub struct UserStore {
     /// `None`（このフィールドを参照する `authenticate_scram` は
     /// `ScramSha256` のときにしか呼ばれない）。
     scram_mock_key: Option<[u8; scram::KEY_LEN]>,
+    /// DDL 実行権限を持つ username 集合（Issue #902・SQL-23・TASK-203。
+    /// `--ddl-allowed-users` からのみ設定する）。`users` に実在しない
+    /// username は [`UserStore::with_ddl_allowed_users`] が起動時エラーとして
+    /// 拒否するため、本フィールドの要素は必ず `users` のキーの部分集合になる。
+    /// 既定は空集合（全 DDL 文が `42501` で拒否される。`sql::ddl::
+    /// require_ddl_permission` ドキュメント参照）。
+    ddl_allowed: HashSet<String>,
 }
 
 /// [`UserStore::load_from_file`] のロード時検証エラー（fail-closed。起動を中断する）。
@@ -318,6 +326,7 @@ impl UserStore {
             users,
             auth_method: AuthMethod::default(),
             scram_mock_key: None,
+            ddl_allowed: HashSet::new(),
         })
     }
 
@@ -387,6 +396,35 @@ impl UserStore {
         self.users.is_empty()
     }
 
+    /// DDL 実行権限を持つ username 集合を設定する opt-in（`--ddl-allowed-users`
+    /// からのみ呼ばれる。Issue #902・SQL-23・TASK-203）。`--search-engine` 等の
+    /// 他の起動時 opt-in と同じく、起動後に変更できない構成値として一度だけ
+    /// 適用する想定（`main.rs` が重複指定自体は CLI 引数側で拒否する）。
+    ///
+    /// `usernames` に `self.users`（`--users` で読み込んだユーザーストア）へ
+    /// 実在しない username が含まれる場合は起動失敗として扱う（fail-closed。
+    /// typo で意図した username への権限付与が黙って無効になる事故を防ぐ。
+    /// `require_scram` の「欠落レコードは起動失敗」と同じ設計判断）。
+    pub fn with_ddl_allowed_users(mut self, usernames: &[String]) -> Result<Self, String> {
+        for username in usernames {
+            if !self.users.contains_key(username) {
+                return Err(format!(
+                    "{FLAG} lists unknown username {username:?} (not present in --users)",
+                    FLAG = crate::ddl_permission_opt::FLAG
+                ));
+            }
+        }
+        self.ddl_allowed = usernames.iter().cloned().collect();
+        Ok(self)
+    }
+
+    /// `username` が DDL 実行権限を持つか（Issue #902）。`handshake.rs` が
+    /// 認証成功直後に 1 回だけ参照し、真の場合に限り
+    /// `engine::sql::mode::SessionState::allow_ddl` を呼ぶ。
+    pub fn is_ddl_allowed(&self, username: &str) -> bool {
+        self.ddl_allowed.contains(username)
+    }
+
     #[cfg(test)]
     fn from_records(records: Vec<(&str, &str, &str)>) -> Self {
         let mut users = HashMap::new();
@@ -404,6 +442,7 @@ impl UserStore {
             users,
             auth_method: AuthMethod::default(),
             scram_mock_key: None,
+            ddl_allowed: HashSet::new(),
         }
     }
 }

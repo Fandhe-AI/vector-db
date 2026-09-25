@@ -196,6 +196,17 @@ pub struct SessionState {
     /// UDF 定義が他接続・他テナントへ漏れる経路は構造上存在しない。永続化しない
     /// （`crate::sql::udf_call` モジュールドキュメント参照）。
     udfs: crate::sql::udf_call::UdfRegistry,
+    /// DDL 実行権限（SQL-23、TASK-203、Issue #902）。既定 `false`（fail-closed。
+    /// `#[derive(Default)]` により未設定接続は必ず拒否側になる）。
+    ///
+    /// [`crate::policy::PolicyContext`] はテナント ID と可視性のみを運び認証主体を
+    /// 持たないため、DDL 権限はテナント境界とは別軸の権限として本フィールドが
+    /// 担う（テーブル・カタログは全テナント共有であり、`DROP TABLE` はテナント
+    /// スコープの操作ではない）。付与は認証層（wire-server の handshake）が
+    /// 認証成功後に 1 回だけ行う契約——SQL 文経由で自身の権限を昇格する経路は
+    /// 構造的に存在しない（[`Self::allow_ddl`] 以外に本フィールドを変更する
+    /// 公開手段を持たない）。
+    ddl_allowed: bool,
 }
 
 impl SessionState {
@@ -213,6 +224,20 @@ impl SessionState {
     /// セッションが保持する `&mut UdfRegistry` を貸し出すだけの薄いアクセサ。
     pub fn udfs_mut(&mut self) -> &mut crate::sql::udf_call::UdfRegistry {
         &mut self.udfs
+    }
+
+    /// このセッションが DDL 実行権限（SQL-23、TASK-203、Issue #902）を持つか。
+    /// [`crate::sql::ddl::require_ddl_permission`] が唯一の判定点として参照する。
+    pub fn ddl_allowed(&self) -> bool {
+        self.ddl_allowed
+    }
+
+    /// このセッションへ DDL 実行権限を付与する。wire-server の handshake が
+    /// 認証成功直後（`UserStore::is_ddl_allowed` が真の場合）に 1 回だけ呼ぶ
+    /// 契約とし、SQL 文経由で呼ばれる経路は持たない（`Self::ddl_allowed`
+    /// ドキュメント参照）。
+    pub fn allow_ddl(&mut self) {
+        self.ddl_allowed = true;
     }
 
     /// TASK-149（対象ビヘイビア: EXT-5, EXT-6）: 検証済みの `Arc<dyn WasmUdfBackend>`
