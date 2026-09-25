@@ -75,9 +75,10 @@ fn respond_error_and_ready(
     stream: &mut TcpStream,
     class: ErrorClass,
     message: &str,
+    txn_status: engine::sql::transaction::TransactionStatus,
 ) -> io::Result<()> {
     crate::handshake::write_error_response_io(stream, class, message)?;
-    crate::handshake::write_ready_for_query_io(stream)
+    crate::handshake::write_ready_for_query_io(stream, txn_status)
 }
 
 /// [`execute_and_respond`]・[`run_statement`] が使う「この応答の後に
@@ -143,7 +144,7 @@ pub(crate) fn execute_and_respond<'e>(
 
     if sql.trim().is_empty() {
         write_all(stream, &result_encoder::encode_empty_query_response())?;
-        return crate::handshake::write_ready_for_query_io(stream);
+        return crate::handshake::write_ready_for_query_io(stream, txn.status());
     }
 
     match engine::sql::statement_splitter::split_statements(sql) {
@@ -165,7 +166,7 @@ pub(crate) fn execute_and_respond<'e>(
         .map(|_| ()),
         Ok(engine::sql::statement_splitter::SplitOutcome::Empty) => {
             write_all(stream, &result_encoder::encode_empty_query_response())?;
-            crate::handshake::write_ready_for_query_io(stream)
+            crate::handshake::write_ready_for_query_io(stream, txn.status())
         }
         Ok(engine::sql::statement_splitter::SplitOutcome::Statements(stmts)) => {
             // 書き込み系文（`INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`）は、本メッセージ
@@ -220,10 +221,15 @@ fn respond_splitter_error(
 ) -> io::Result<()> {
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed {
         let failed = txn.take_failed_error();
-        return respond_error_and_ready(stream, failed.error_class(), &failed.client_message());
+        return respond_error_and_ready(
+            stream,
+            failed.error_class(),
+            &failed.client_message(),
+            txn.status(),
+        );
     }
     txn.fail();
-    respond_error_and_ready(stream, e.error_class(), &e.client_message())
+    respond_error_and_ready(stream, e.error_class(), &e.client_message(), txn.status())
 }
 
 /// 複数文実行の 1 文を実行し、応答（`finish` に応じた `ReadyForQuery` の有無）を
@@ -275,12 +281,19 @@ fn run_statement<'e>(
             OutcomeResponse::Rows { result, shape } => {
                 let sent = result.rows.len();
                 let tag = shape.render(sent);
-                respond_rows_with_tag(stream, &result, &tag, finish)
+                respond_rows_with_tag(stream, &result, &tag, finish, txn.status())
             }
-            OutcomeResponse::Command { tag } => respond_command_complete(stream, &tag, finish),
+            OutcomeResponse::Command { tag } => {
+                respond_command_complete(stream, &tag, finish, txn.status())
+            }
         },
         Err(e) => {
-            respond_error_and_ready(stream, e.error_class(), &e.client_message())?;
+            // `engine::core::EngineCore::execute_sql_in_txn`／
+            // `execute_parsed_in_txn` はエラー時に必ず `txn` の状態を確定させて
+            // から返す（`Active` 中は `fail()` 済み・`Failed` 中の再エラーは
+            // 据え置き）ため、ここで読む `txn.status()` は直前のエラーを反映
+            // 済み（WIRE-19・SQL-31・TASK-221・PR #1041 レビュー指摘 P1）。
+            respond_error_and_ready(stream, e.error_class(), &e.client_message(), txn.status())?;
             Ok(StatementStatus::Failed)
         }
     }
@@ -467,12 +480,13 @@ fn respond_command_complete(
     stream: &mut TcpStream,
     tag: &str,
     finish: Finish,
+    txn_status: engine::sql::transaction::TransactionStatus,
 ) -> io::Result<StatementStatus> {
     match result_encoder::encode_command_complete(tag) {
         Ok(msg) => {
             write_all(stream, &msg)?;
             if finish == Finish::ReadyForQuery {
-                crate::handshake::write_ready_for_query_io(stream)?;
+                crate::handshake::write_ready_for_query_io(stream, txn_status)?;
             }
             Ok(StatementStatus::Completed)
         }
@@ -481,6 +495,7 @@ fn respond_command_complete(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
+                txn_status,
             )?;
             Ok(StatementStatus::Failed)
         }
@@ -620,7 +635,13 @@ fn respond_query_result(
     } else {
         format!("{command_tag} {}", result.rows.len())
     };
-    respond_rows_with_tag(stream, result, &tag, finish)
+    respond_rows_with_tag(
+        stream,
+        result,
+        &tag,
+        finish,
+        engine::sql::transaction::TransactionStatus::Idle,
+    )
 }
 
 /// `RowDescription`／`DataRow`* の組み立てとフレーム送出を担う共通本体
@@ -636,6 +657,7 @@ fn respond_rows_with_tag(
     result: &engine::sql::exec::QueryResult,
     tag: &str,
     finish: Finish,
+    txn_status: engine::sql::transaction::TransactionStatus,
 ) -> io::Result<StatementStatus> {
     let row_desc = match result_encoder::encode_row_description(&result.columns) {
         Ok(msg) => msg,
@@ -644,6 +666,7 @@ fn respond_rows_with_tag(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode row description",
+                txn_status,
             )?;
             return Ok(StatementStatus::Failed);
         }
@@ -679,6 +702,7 @@ fn respond_rows_with_tag(
                     stream,
                     ErrorClass::InternalError,
                     "failed to encode data row",
+                    txn_status,
                 )?;
                 return Ok(StatementStatus::Failed);
             }
@@ -692,7 +716,7 @@ fn respond_rows_with_tag(
         Ok(msg) => {
             buffer.push_frame(stream, &msg)?;
             if finish == Finish::ReadyForQuery {
-                buffer.push_frame(stream, &result_encoder::encode_ready_for_query())?;
+                buffer.push_frame(stream, &result_encoder::encode_ready_for_query(txn_status))?;
             }
             buffer.flush(stream)?;
             Ok(StatementStatus::Completed)
@@ -703,6 +727,7 @@ fn respond_rows_with_tag(
                 stream,
                 ErrorClass::InternalError,
                 "failed to encode command complete response",
+                txn_status,
             )?;
             Ok(StatementStatus::Failed)
         }
@@ -768,7 +793,9 @@ mod tests {
             &result_encoder::encode_command_complete(&format!("SELECT {}", rows.len()))
                 .expect("command complete"),
         );
-        expected.extend_from_slice(&result_encoder::encode_ready_for_query());
+        expected.extend_from_slice(&result_encoder::encode_ready_for_query(
+            engine::sql::transaction::TransactionStatus::Idle,
+        ));
 
         let (mut server, mut client) = loopback_pair();
         let expected_len = expected.len();

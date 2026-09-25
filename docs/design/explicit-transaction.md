@@ -7,7 +7,8 @@
   `docs/spec/04-behavior/error-format.md` ERR-6
 - 関連ポインタ: RECOVER-5・RECOVER-6・RECOVER-8・TASK-96・TASK-97・TASK-99・
   TABLE-3・SQL-18（0 行 DELETE は台帳非記録）・WIRE-16（複数文実行。
-  `wire-multi-statement.md`）・WIRE-19（`ReadyForQuery` 状態バイト。#943 が担当）
+  `wire-multi-statement.md`）・WIRE-19（`ReadyForQuery` 状態バイト。PR #1041
+  レビュー指摘対応で #943 の担当分を本 PR へ吸収し実装済み）
 
 ## 背景・目的
 
@@ -171,10 +172,12 @@ Failed { session_at_begin: SessionState, expired: bool } }`）。`ActiveTxn` は
 
 ## `#943` との分担
 
-`ReadyForQuery` の状態バイト（`'I'`／`'T'`／`'E'`。WIRE-19）は `#943` が担当
-する。本 Issue では engine 側で `SessionTransaction::status() ->
-TransactionStatus` の照会 API を公開するまでとし、wire-server の `'I'` 固定の
-送出は変更しない。
+`ReadyForQuery` の状態バイト（`'I'`／`'T'`／`'E'`。WIRE-19）は当初 `#943` が
+担当する計画だったが、PR #1041 レビュー指摘（codex P1: 簡易・拡張クエリ両
+プロトコルとも `SessionTransaction` 導入後も常に `'I'` を送出しており、
+`BEGIN` 後もクライアントからトランザクションが終了したように見える不整合）
+への対応として本 PR へ吸収し実装済み（`wire-server::result_encoder::
+encode_ready_for_query`／`simple_query.rs`／`extended_query::handle_sync`）。
 
 ## wire-server への結線
 
@@ -234,7 +237,6 @@ TransactionStatus` の照会 API を公開するまでとし、wire-server の `
 
 ## 対象外・申し送り
 
-- `ReadyForQuery` の状態バイト `I`／`T`／`E`（WIRE-19）→ `#943`。
 - トランザクション内での自トランザクションの未 commit 変更の可視化
   （上記「既知の逸脱」）。
 - 複数行 INSERT・ファイル形 INSERT・UPSERT・`UPDATE`・`DELETE`・COPY の

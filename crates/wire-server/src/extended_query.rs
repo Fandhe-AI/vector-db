@@ -1803,6 +1803,7 @@ fn execute_portal<'e>(
 pub(crate) fn handle_sync(
     stream: &mut TcpStream,
     state: &mut ExtendedQueryState,
+    txn_status: engine::sql::transaction::TransactionStatus,
 ) -> io::Result<LoopSignal> {
     let _body = match framing::read_length_prefixed_body(stream, 4, 4) {
         Ok(b) => b,
@@ -1816,7 +1817,12 @@ pub(crate) fn handle_sync(
 
     state.ignore_till_sync = false;
     state.portals.clear_all();
-    stream.write_all(&result_encoder::encode_ready_for_query())?;
+    // `txn_status` は `handshake::post_auth_loop` が接続単位で保持する
+    // `SessionTransaction::status()` をそのまま渡す（WIRE-19・SQL-31・
+    // TASK-221・PR #1041 レビュー指摘 P1: 以前は明示トランザクションの状態を
+    // 無視して常に `Idle`（'I'）を送出しており、`BEGIN` 後もクライアントから
+    // トランザクションが終了したように見えていた）。
+    stream.write_all(&result_encoder::encode_ready_for_query(txn_status))?;
     stream.flush()?;
     Ok(LoopSignal::Continue)
 }

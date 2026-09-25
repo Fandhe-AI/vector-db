@@ -92,9 +92,10 @@ pub fn is_rollback_statement(sql: &str) -> bool {
     )
 }
 
-/// [`SessionTransaction`] の対外的な状態（#943・`WIRE-19` が `ReadyForQuery` の
-/// 状態バイトへ写像する予定の入口。本 Issue では照会 API の公開までとし、
-/// `'I'` 固定の送出は変更しない）。
+/// [`SessionTransaction`] の対外的な状態（WIRE-19。`wire-server::result_encoder::
+/// encode_ready_for_query` が `ReadyForQuery` の状態バイト `'I'`／`'T'`／`'E'`へ
+/// 写像する入口。PR #1041 レビュー指摘対応で `#943` の担当分を本 PR へ吸収し、
+/// 簡易・拡張クエリ両プロトコルへ結線済み）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
     Idle,

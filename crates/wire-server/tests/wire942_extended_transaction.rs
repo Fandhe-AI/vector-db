@@ -101,6 +101,19 @@ fn assert_ready_for_query(stream: &mut std::net::TcpStream) {
     assert_eq!(kind, b'Z', "expected ReadyForQuery");
 }
 
+/// `ReadyForQuery` を読み、トランザクション状態バイト（`'I'`／`'T'`／`'E'`）が
+/// `expected` と一致することを検証する（WIRE-19・PR #1041 レビュー指摘 P1の
+/// 回帰: 以前は明示トランザクションの状態に関わらず常に `'I'` を送出していた）。
+fn assert_ready_for_query_status(stream: &mut std::net::TcpStream, expected: u8) {
+    let (kind, body) = read_message(stream);
+    assert_eq!(kind, b'Z', "expected ReadyForQuery");
+    assert_eq!(
+        body.last().copied(),
+        Some(expected),
+        "ReadyForQuery status byte mismatch"
+    );
+}
+
 fn parse_and_bind(stream: &mut std::net::TcpStream, statement: &str, portal: &str, sql: &str) {
     send_length_prefixed_message(stream, b'P', &parse_body(statement, sql, 0));
     let (kind, _) = read_message(stream);
@@ -597,4 +610,84 @@ fn split_error_while_failed_is_rejected_with_in_failed_sql_transaction() {
     assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
     read_ready_for_query(&mut stream);
     assert_eq!(visible_rows_with_id(&core, 45), 0);
+}
+
+/// PR #1041 レビュー指摘（P1）の回帰: 簡易クエリプロトコル経由の
+/// `ReadyForQuery` 状態バイトが、明示トランザクションの状態
+/// （`Idle`/`Active`/`Failed`）に応じて `'I'`/`'T'`/`'E'` へ正しく写像される
+/// こと（WIRE-19）。以前は `SessionTransaction` 導入後も常に `'I'` を固定
+/// 送出しており、`BEGIN` 後もクライアントからトランザクションが終了した
+/// ように見えていた。
+#[test]
+fn simple_query_ready_for_query_status_reflects_transaction_state() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    // Idle: 通常の autocommit 文の後は 'I'。
+    send_simple_query(&mut stream, "SELECT id FROM documents LIMIT 1");
+    let _ = read_message(&mut stream); // RowDescription
+    let _ = read_message(&mut stream); // CommandComplete
+    assert_ready_for_query_status(&mut stream, b'I');
+
+    // Active: BEGIN 直後・トランザクション内の文の後は 'T'。
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    assert_ready_for_query_status(&mut stream, b'T');
+
+    send_simple_query(&mut stream, &insert_sql(46, "op-942-46"));
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    assert_ready_for_query_status(&mut stream, b'T');
+
+    // Failed: トランザクション内でエラーになった文の後は 'E'。
+    send_simple_query(&mut stream, "SELEC id FROM documents");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // ROLLBACK で Idle へ戻り、以降は 'I'。
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    assert_ready_for_query_status(&mut stream, b'I');
+    assert_eq!(visible_rows_with_id(&core, 46), 0);
+}
+
+/// 上と同じ契約（WIRE-19）を拡張クエリプロトコルの Sync（'S'）経由で固定する
+/// （PR #1041 レビュー指摘 P1。`extended_query::handle_sync` は以前
+/// `SessionTransaction` の状態を一切参照せず常に `'I'` を送出していた）。
+#[test]
+fn extended_query_sync_ready_for_query_status_reflects_transaction_state() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    // Active: BEGIN の Parse/Bind/Execute の後、Sync 時点でも 'T'。
+    parse_and_bind(&mut stream, "begin47", "pbegin47", "BEGIN");
+    assert_eq!(
+        execute_and_read_command_complete(&mut stream, "pbegin47"),
+        "BEGIN"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'T');
+
+    // Failed: Bind エラーの後、Sync 時点で 'E'。
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("bad47", "SELEC id FROM documents", 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'E', "expected ErrorResponse for malformed SQL");
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // ROLLBACK で Idle へ戻り、Sync 時点で 'I'。
+    parse_and_bind(&mut stream, "rb47", "prb47", "ROLLBACK");
+    assert_eq!(
+        execute_and_read_command_complete(&mut stream, "prb47"),
+        "ROLLBACK"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'I');
 }

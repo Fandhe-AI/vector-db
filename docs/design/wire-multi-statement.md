@@ -148,7 +148,6 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
 
 ## スコープ外
 
-- `ReadyForQuery` の状態バイト（WIRE-19。`I` 固定のまま。#943 が担当）。
 - 拡張クエリプロトコル（WIRE-11）。
 - `EngineCore::execute_sql`（非セッション API）・`execute_sql_in_session` の
   engine 側単一文契約。複数文対応は wire の `'Q'` 経路のみに実装し、

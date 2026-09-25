@@ -273,9 +273,18 @@ fn write_parameter_status(stream: &mut TcpStream, name: &str, value: &str) -> Re
 /// バッファ組み立てを経由しない経路向け）。バイトレイアウトの実体は
 /// `crate::result_encoder::encode_ready_for_query`（Issue #481）に一元化した
 /// ―― 以前は本関数がレイアウトを個別に持っており、`crate::response_buffer::
-/// ResponseBuffer` へ他フレームと同じ形で積める関数が無かった。
-fn write_ready_for_query(stream: &mut TcpStream) -> Result<()> {
-    write_all(stream, &crate::result_encoder::encode_ready_for_query())
+/// ResponseBuffer` へ他フレームと同じ形で積める関数が無かった。`status` は
+/// 明示トランザクション（SQL-31・TASK-221・WIRE-19）の状態バイトへそのまま
+/// 写像する。呼び出し元に `SessionTransaction` が無い箇所（ハンドシェイク
+/// 直後）は `TransactionStatus::Idle` を渡す。
+fn write_ready_for_query(
+    stream: &mut TcpStream,
+    status: engine::sql::transaction::TransactionStatus,
+) -> Result<()> {
+    write_all(
+        stream,
+        &crate::result_encoder::encode_ready_for_query(status),
+    )
 }
 
 /// ErrorResponse（'E'）。SQLSTATE と英語メッセージのみを含む最小フィールド構成
@@ -295,8 +304,11 @@ pub(crate) fn write_error_response_io(
 /// `write_ready_for_query` の `io::Result` 版ラッパー。[`crate::simple_query`] は
 /// 本モジュール限定の `handshake::Result` を扱えないため、`ReadyForQuery` を
 /// 送出する唯一の経路としてこの関数を `pub(crate)` にする。
-pub(crate) fn write_ready_for_query_io(stream: &mut TcpStream) -> io::Result<()> {
-    write_ready_for_query(stream).map_err(io::Error::from)
+pub(crate) fn write_ready_for_query_io(
+    stream: &mut TcpStream,
+    status: engine::sql::transaction::TransactionStatus,
+) -> io::Result<()> {
+    write_ready_for_query(stream, status).map_err(io::Error::from)
 }
 
 /// バイト列組み立ては [`crate::error_response::encode`] に委譲する（`ErrorClass`
@@ -602,7 +614,7 @@ fn post_auth_loop<'e>(
                                         ErrorClass::FeatureNotSupported,
                                         "COPY is not supported inside an explicit transaction",
                                     )?;
-                                    write_ready_for_query_io(stream)?;
+                                    write_ready_for_query_io(stream, txn.status())?;
                                     continue;
                                 }
                                 engine::sql::transaction::TransactionStatus::Failed => {
@@ -612,7 +624,7 @@ fn post_auth_loop<'e>(
                                         err.error_class(),
                                         &err.client_message(),
                                     )?;
-                                    write_ready_for_query_io(stream)?;
+                                    write_ready_for_query_io(stream, txn.status())?;
                                     continue;
                                 }
                             }
@@ -640,7 +652,10 @@ fn post_auth_loop<'e>(
                             ErrorClass::FeatureNotSupported,
                             "simple query execution is not yet implemented",
                         )?;
-                        write_ready_for_query(stream)?;
+                        write_ready_for_query(
+                            stream,
+                            engine::sql::transaction::TransactionStatus::Idle,
+                        )?;
                     }
                 }
             }
@@ -764,10 +779,20 @@ fn post_auth_loop<'e>(
                 }
             },
             b'S' => match engine {
-                Some(_engine) => match crate::extended_query::handle_sync(stream, extended)? {
-                    crate::extended_query::LoopSignal::Continue => {}
-                    crate::extended_query::LoopSignal::Closed => return Ok(()),
-                },
+                Some(_engine) => {
+                    // `engine` が `Some` の間は `txn` も `Some`（他の拡張クエリ
+                    // 分岐と同じ不変条件）。万一片方だけの場合は fail-closed に
+                    // `Idle` を送出する（`TransactionStatus::Idle` は既存の
+                    // 固定 `'I'` 送出と同じ安全側の既定値）。
+                    let txn_status = txn
+                        .as_ref()
+                        .map(|t| t.status())
+                        .unwrap_or(engine::sql::transaction::TransactionStatus::Idle);
+                    match crate::extended_query::handle_sync(stream, extended, txn_status)? {
+                        crate::extended_query::LoopSignal::Continue => {}
+                        crate::extended_query::LoopSignal::Closed => return Ok(()),
+                    }
+                }
                 None => {
                     framing::validate_typed_message_length_prefix(
                         stream,
@@ -1132,7 +1157,10 @@ fn handle_connection_inner(
     write_backend_key_data(&mut stream, pid, secret)?;
     write_parameter_status(&mut stream, "server_version", "14.0")?;
     write_parameter_status(&mut stream, "client_encoding", "UTF8")?;
-    write_ready_for_query(&mut stream)?;
+    write_ready_for_query(
+        &mut stream,
+        engine::sql::transaction::TransactionStatus::Idle,
+    )?;
 
     // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
     // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
