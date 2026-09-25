@@ -654,6 +654,85 @@ submodule 追随は PR #951。
 節に記載する。`docs/design/nosql-insert-mapping.md:70`（書き込みは
 `Private` 固定）は現在も正しい記述のため無変更。
 
+## トランザクション状態遷移（Issue #943・WIRE-19）
+
+`ReadyForQuery`（'Z'）の状態バイト（`'I'`／`'T'`／`'E'`。SQL-31・TASK-221・
+WIRE-19。production の中核は Issue #942（PR #1041）で実装済み——
+`docs/design/explicit-transaction.md`「`#943` との分担」節参照）が、
+無改造の実クライアント 3 種から観測できることを
+`three_client_e2e.rs::three_clients_observe_transaction_status_transitions`
+（`#[ignore]`）として検証する。層 A（`wire19_ready_for_query_status.rs`・
+`wire942_extended_transaction.rs`）が生バイトの wire クライアントで固定
+する契約と同じものを、各ドライバ自身の API を通じて追加確認する。
+
+**観測経路（実装前にツールのソースを確認して選定。推測で書かない）**:
+
+- **psycopg**（`three_client/psycopg_txn_status.py`）: `psycopg.pq.
+  TransactionStatus`（`IDLE`/`INTRANS`/`INERROR`）と `conn.info.
+  transaction_status` が公開 API として存在する。`autocommit=False`
+  （既定）で接続すると、psycopg 自身が（受信した `ReadyForQuery` の状態
+  バイトから）この状態を追跡し、`IDLE` のときだけ次の文の前に暗黙の
+  `BEGIN` を送る（libpq に autocommit の概念はなく、この判断・送出は
+  psycopg 自身が行う）。本番の
+  `ReadyForQuery` が常に `'I'` のまま（不具合を仮定した）だと、2 文目の
+  前にも `BEGIN` が再送されて「入れ子の `BEGIN`」（`25001`）が観測される
+  はずであり、これが本スクリプトの検出対象。
+- **node pg**（`three_client/pg_txn_status.js`）: `pg` は psycopg のような
+  公開の transaction status API を持たない。`pg.Client` が内部で保持する
+  `Connection`（`pg-protocol` の `ReadyForQueryMessage` を emit する
+  `EventEmitter`）の `readyForQuery` イベントを購読し、受信した状態バイト
+  （`msg.status`。1 文字の文字列 `'I'`/`'T'`/`'E'`）をそのまま記録する。
+  `pg`／`pg-protocol` のソース自体は変更しない（既存の public プロパティを
+  読むだけ）。トランザクション制御自体は `BEGIN`/`COMMIT`/`ROLLBACK` を
+  明示的に送る（psycopg と異なり pg は autocommit の自動切替を持たない）。
+- **psql**: プロンプト文字列（`%x` → `=`/`*`/`!`）は対話端末専用の
+  エスケープであり、非対話実行（`-c` の並び）では表示されないため
+  観測できない。pty ラッパー（`script` コマンド）での対話プロンプト検証は
+  flaky になりやすいため採らない。代わりに `\set AUTOCOMMIT off` の
+  **挙動**で間接的に確認する: この設定下では psql が libpq の
+  `PQtransactionStatus()`（`ReadyForQuery` の状態バイトから libpq が
+  導出する）を見て、`IDLE` のときだけ暗黙の `BEGIN` を送る。
+  `ReadyForQuery` が常に `'I'`
+  のまま返る不具合があれば、`INSERT` の後の `SELECT` の前にも `BEGIN` が
+  再送されて「入れ子の `BEGIN`」（`25001`）に倒れ、続く `COMMIT` も
+  `25P02` で拒否されて非 0 終了する。正しく `'T'` を反映していれば
+  `BEGIN` は 1 回だけ送られ、全体が正常終了する
+  （`assert_psql_autocommit_off_reflects_transaction_status`）。
+
+**engine 側の制約への対応**: 明示トランザクション内では「直前に同じ
+トランザクションで書き込んだテーブル自身を読めない」制約
+（`docs/design/explicit-transaction.md` 参照）があるため、seed
+（`seed_txn_status_db`）は書き込み対象の `documents` と、
+トランザクション内 `SELECT` 用の未書き込みテーブル `notes` を分けて
+用意する。
+
+**非 vacuous 性の確認**: 実装時に `encode_ready_for_query` を一時的に
+常時 `'I'` を返すよう書き換え、層 A（`wire19_ready_for_query_status.rs`）
+15 件中 8 件・層 B（3 クライアントいずれも）が失敗することを確認した
+うえで元に戻した（コミットには含めない）。
+
+**子プロセス stderr の読み続け契約（ハーネス不具合の是正）**: 本テストの
+追加で `make e2e-three-client` の並列度が上がった結果、高負荷下（load
+average 約 20）で既存テスト（集計・取得モード切替）が 1〜2 件ずつ psql の
+"server closed the connection unexpectedly" で失敗する事象が出た。各テスト
+は独立したサーバープロセス・一時 DB を使っており、新テストからの状態漏れ
+ではない。原因は既存ハーネスの `spawn_wire_server`（`three_client_e2e.rs`・
+`extended_syntax_e2e.rs`）で、listen 行の取得後に受信側チャネルが破棄される
+と stderr 読み取りスレッドが終了してパイプの読み口を閉じていた点にある。
+以後サーバーが `wire-server: connection error: Connection reset by peer`
+等をログすると `EPIPE` で `eprintln!` が panic し、panic フック
+（TASK-97・RECOVER-6／TASK-99・RECOVER-8）経由で SIGABRT 終了していた
+（失敗時のサーバー終了状態 134 で確認。未読データを残した接続 close による
+RST で決定的に再現する）。是正として読み取りスレッドは子プロセスの終了
+（EOF）まで読み続け、`three_client_e2e.rs` は listen 後の行を直近 256 行まで
+保持してテストが panic した場合に限り `[e2e-diag]` 行（サーバーの終了状態・
+listen 後の stderr）を出力する。回帰テスト
+`server_guard_keeps_draining_stderr_so_logged_connection_errors_do_not_abort_server`
+（外部クライアント不要のため `#[ignore]` なし・`make ci` で常時実行）が、
+接続エラーのログ後もサーバーが生存し新規接続へ認証要求を返すことを固定する。
+production コードは変更していない（stderr の消費側が閉じた場合に
+サーバーが abort する挙動の扱いは、本 Issue のスコープ外として別途判断する）。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・

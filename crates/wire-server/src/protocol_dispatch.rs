@@ -17,9 +17,10 @@
 //! 参照）。SQLSTATE `0A000` の応答契約は `docs/spec/04-behavior/error-format.md`
 //! を参照（spec 本文は転記しない）。
 
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::io;
 use std::time::{Duration, Instant};
+
+use crate::wire_stream::WireStream;
 
 /// 型バイト 1 つから決まる分類。ネットワーク非依存の純関数（[`classify`]）に
 /// 切り出し、全 256 値を単体テストで走査できるようにする。
@@ -78,8 +79,7 @@ pub(crate) const LINGER_DRAIN_MAX_BYTES: usize = 64 * 1024;
 /// `ErrorClass` を受け取ることで、送出経路が `crate::error_response::encode` の
 /// severity/SQLSTATE 一元化・NUL 拒否を必ず経由する（codex-review P1 指摘対応・
 /// PR #258）。
-type WriteErrorResponseFn =
-    fn(&mut TcpStream, engine::error_format::ErrorClass, &str) -> io::Result<()>;
+type WriteErrorResponseFn<S> = fn(&mut S, engine::error_format::ErrorClass, &str) -> io::Result<()>;
 
 /// 未対応メッセージへの応答（SQLSTATE 0A000 + 分類ごとの固定英語メッセージ）と、
 /// 有界な lingering close を行う（WIRE-8 の本体）。ReadyForQuery は送らない。
@@ -89,10 +89,10 @@ type WriteErrorResponseFn =
 /// SQLSTATE は `ExtendedQuery` / `UnsupportedFeature` / `Unknown` のいずれも
 /// `0A000` で統一する（ポインタ: TASK-71・WIRE-8、`docs/spec/04-behavior/error-format.md`）。
 /// 一方でメッセージ文言は分類ごとに事実に即した表現へ分ける（[`response_message`]）。
-pub(crate) fn reject_and_close(
-    stream: &mut TcpStream,
+pub(crate) fn reject_and_close<S: WireStream>(
+    stream: &mut S,
     kind: FrontendMessageKind,
-    write_error_response: WriteErrorResponseFn,
+    write_error_response: WriteErrorResponseFn<S>,
 ) -> io::Result<()> {
     // 受信ペイロード・ユーザー名は出さず、分類名と型バイト（固定集合の1文字）のみ
     // ログに残す（P0: テナント情報・存在情報を漏らさない）。
@@ -172,10 +172,10 @@ fn describe_kind(kind: FrontendMessageKind) -> String {
 /// （[`crate::http::conn`]。Issue #747）が同じ有界読み捨て契約（PoC-15 の実装
 /// ガイドライン）を共有するために `pub(crate)` へ昇格した（旧名
 /// `reject_and_close_with`。private のため互換義務を負わない改名）。
-pub(crate) fn drain_and_close(stream: &mut TcpStream, timeout: Duration, max_bytes: usize) {
+pub(crate) fn drain_and_close<S: WireStream>(stream: &mut S, timeout: Duration, max_bytes: usize) {
     // 書き込み方向を閉じてクライアントへ FIN を送る。失敗しても drain は続行する
     // （読み取り自体は shutdown 非依存で機能するため）。
-    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.shutdown_write();
 
     let deadline = Instant::now() + timeout;
     let mut drained: usize = 0;
@@ -214,7 +214,8 @@ pub(crate) fn drain_and_close(stream: &mut TcpStream, timeout: Duration, max_byt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
 
     #[test]
     fn response_message_differs_by_classification() {

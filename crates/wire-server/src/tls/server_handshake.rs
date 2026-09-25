@@ -19,8 +19,6 @@
 //!
 //! # 対象外
 //!
-//! - `SSLRequest` への `'S'` 応答・`server.rs`／pg 側 `handshake.rs` への
-//!   接続結線（#966）
 //! - CLI からの証明書・鍵読み込み（#967）・HTTPS 表層（#968）
 //! - 3 クライアント接続テスト（#969）・channel binding（#970）
 //! - KeyUpdate・NewSessionTicket・0-RTT・クライアント証明書（親 #941 の方針）
@@ -879,6 +877,7 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
                 sent_close_notify: false,
                 received_close_notify: false,
                 received_user_canceled: false,
+                fatal_alert_sent: false,
             }),
         ))
     }
@@ -942,6 +941,11 @@ pub struct TlsSession {
     /// [`AppEvent::Ignored`] として内容を返さずに読み捨てる。後続の
     /// `close_notify` は通常どおり [`AppEvent::CloseNotify`] になる。
     received_user_canceled: bool,
+    /// [`Self::seal_fatal_alert`] を呼び済み（Issue #966）。多重呼び出しでも
+    /// 実際の alert 送出は高々 1 回に抑える（呼び出し元が誤って 2 回
+    /// 呼んでも、2 回目以降は `Err(Poisoned)` になり追加の暗号操作を
+    /// 行わない）。
+    fatal_alert_sent: bool,
 }
 
 /// [`TlsSession::open_record`] の戻り値。
@@ -985,6 +989,24 @@ impl std::fmt::Display for TlsSessionError {
 }
 
 impl std::error::Error for TlsSessionError {}
+
+#[cfg(test)]
+impl TlsSession {
+    /// テスト専用: 実ハンドシェイクを経由せず、鍵スケジュールから直接得た
+    /// `Sealer`/`Opener` から組み立てる（[`super::stream`] の単体テストが
+    /// レコード保護層以上の挙動だけを検証するために使う）。
+    pub(crate) fn new_for_tests(sealer: Sealer, opener: Opener) -> Self {
+        Self {
+            sealer,
+            opener,
+            poisoned: false,
+            sent_close_notify: false,
+            received_close_notify: false,
+            received_user_canceled: false,
+            fatal_alert_sent: false,
+        }
+    }
+}
 
 impl TlsSession {
     /// アプリケーションデータを 1 個以上のレコードへ seal する。
@@ -1082,6 +1104,42 @@ impl TlsSession {
     /// poison）。
     pub fn mark_poisoned(&mut self) {
         self.poisoned = true;
+    }
+
+    /// ハンドシェイク完了後（接続の実運用中）に fatal alert を 1 個 seal する
+    /// （Issue #966。[`TlsStream`](super::stream::TlsStream) が復号失敗・
+    /// 不正な受信データを検出した際に呼ぶ）。RFC 8446 §5.2 は復号失敗を
+    /// `bad_record_mac` で終了することを求めており、ハンドシェイク中の
+    /// [`ServerHandshake::fail_on_record_error`] と対称な役割を持つ。
+    ///
+    /// 既に poison 済みでも fatal alert 自体は 1 回だけ送出を許す（呼び出し元
+    /// が「失敗を検出した直後の 1 回」だけ呼ぶ契約のため、`open_record` が
+    /// 既に poison 済みにしている経路でも送出できる）。送出に成功した場合は
+    /// [`Self::mark_poisoned`] と同じ状態へ遷移し、以後の呼び出しはすべて
+    /// `Err(Poisoned)` になる。鍵を使い切っている場合
+    /// （[`super::record_protection::ProtectionError::SequenceExhausted`]）は
+    /// 安全に送れないため呼び出し元が `alert_description() == None` で
+    /// 判定し、本メソッド自体を呼ばない契約とする（[`TlsStream`]
+    /// (super::stream::TlsStream) 参照）。
+    pub fn seal_fatal_alert(
+        &mut self,
+        desc: AlertDescription,
+    ) -> Result<Vec<Record>, TlsSessionError> {
+        // RFC 8446 §6.1: `close_notify` を送出した後はこの接続でこれ以上
+        // データを送ってはならない（`seal_application_data`／`close_notify`
+        // と同じ送信方向の終了契約。#966 レビュー指摘: `shutdown_write` で
+        // `close_notify` を送った直後に受信側の復号失敗が起きた場合でも
+        // fatal alert を送ってしまう経路があった）。
+        if self.fatal_alert_sent || self.sent_close_notify {
+            return Err(TlsSessionError::Poisoned);
+        }
+        let records = self
+            .sealer
+            .seal_fragmented(ContentType::Alert, &Alert::encode_fatal(desc))
+            .map_err(TlsSessionError::Protection)?;
+        self.poisoned = true;
+        self.fatal_alert_sent = true;
+        Ok(records)
     }
 }
 
