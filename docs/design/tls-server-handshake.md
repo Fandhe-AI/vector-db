@@ -219,6 +219,12 @@ Issue #965 の PR（#1046）に対する codex・Bugbot の指摘（いずれも
      解釈せずに読み捨て（ServerHello は送らない）、`close_notify` を
      受けて `ClosedByPeer` で正常終了する。復号・alert の構造検証と
      それ以外の alert の fatal 扱いは通常時と同じ fail-closed のまま。
+     ダミー CCS も通常時と同じく、`user_canceled` 受信時点で受理窓内
+     だった場合に値がちょうど `[0x01]` のものだけを読み捨て、時期外・
+     値/長さ違反は `unexpected_message` で拒否する（codex P1 の追加
+     指摘。当初は取り消し後の CCS を内容に関係なく読み捨てており、
+     wire 入力の検証を弱めていた。受理窓の判定は通常時と
+     `ServerHandshake::in_ccs_window` を共有する）。
      `close_notify` 待ちは driver の絶対期限（上記 1 の
      `DeadlineReader`）とレコード長上限で打ち切られ、読み捨てた
      内容は保持しないため無期限待機・メモリ増加は起きない。期限切れは
@@ -230,8 +236,9 @@ Issue #965 の PR（#1046）に対する codex・Bugbot の指摘（いずれも
    結合テスト `user_canceled_waits_for_close_notify_and_ignores_later_
    records`・`driver_closes_on_close_notify_following_user_canceled`・
    `driver_wait_for_close_notify_after_user_canceled_is_bounded`・
-   `user_canceled_after_handshake_ignores_data_until_close_notify` を
-   追加した。
+   `user_canceled_after_handshake_ignores_data_until_close_notify`・
+   `dummy_ccs_after_user_canceled_is_still_validated`・
+   `dummy_ccs_after_user_canceled_outside_window_is_rejected` を追加した。
 
 ## 対象外（後続 sub-issue の担当）
 

@@ -267,7 +267,13 @@ enum HandshakeState {
     /// 読み捨てる（[`ServerHandshake::step_after_user_canceled`]）。
     /// 待機の有界性は driver の絶対期限（[`DeadlineReader`]）と
     /// レコード長上限（[`record::read_record`]）が保証する。
-    Canceled,
+    Canceled {
+        /// `user_canceled` 受信時点でダミー CCS の受理窓（ClientHello 受信後
+        /// から client Finished 受信前まで）内にいたか。取り消し後もダミー
+        /// CCS の時期・値（ちょうど `[0x01]`）の検証は通常時と同じに保つ
+        /// （PR #1046 レビュー指摘）。
+        ccs_window: bool,
+    },
 }
 
 /// [`ServerHandshake::handle_record`] の戻り値。
@@ -421,8 +427,8 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
     }
 
     fn step_inner(&mut self, record: &Record) -> Result<Step, ServerHandshakeError> {
-        if matches!(self.state, HandshakeState::Canceled) {
-            return self.step_after_user_canceled(record);
+        if let HandshakeState::Canceled { ccs_window } = self.state {
+            return self.step_after_user_canceled(record, ccs_window);
         }
         // ダミー CCS（middlebox 互換。RFC 8446 §5・付録 D.4）は Opener を
         // 経由せず、ClientHello 受信後から client Finished 受信前までに
@@ -436,12 +442,7 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
         // ハンドシェイクを中断させてしまう）。時期外・値違反（0x01 以外の
         // fragment）は引き続き `unexpected_message` として拒否する。
         if record.content_type == ContentType::ChangeCipherSpec {
-            let in_ccs_window = matches!(
-                self.state,
-                HandshakeState::ExpectClientHello { after_hrr: true }
-                    | HandshakeState::ExpectClientFinished
-            );
-            if !in_ccs_window || record.fragment != [0x01] {
+            if !self.in_ccs_window() || record.fragment != [0x01] {
                 return Err(ServerHandshakeError::UnexpectedMessage);
             }
             return Ok(Step::Continue(Vec::new()));
@@ -468,6 +469,18 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
         }
     }
 
+    /// ダミー CCS の受理窓（RFC 8446 §5: 最初の ClientHello 受信後から
+    /// client Finished 受信前まで）内にいるか。通常時と `user_canceled`
+    /// 受信後（[`HandshakeState::Canceled`]）の双方の CCS 検証が共有する
+    /// 単一の判定。
+    fn in_ccs_window(&self) -> bool {
+        matches!(
+            self.state,
+            HandshakeState::ExpectClientHello { after_hrr: true }
+                | HandshakeState::ExpectClientFinished
+        )
+    }
+
     fn handle_alert(&mut self, content: &[u8]) -> Result<Step, ServerHandshakeError> {
         let alert = Alert::parse(content).map_err(ServerHandshakeError::AlertDecode)?;
         match alert::classify_received(alert) {
@@ -481,7 +494,9 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
             // 読まずに切断していた）。ハンドシェイクは中断して `Canceled`
             // へ移り、`close_notify` を待つ。
             ReceivedAlert::UserCanceled => {
-                self.state = HandshakeState::Canceled;
+                self.state = HandshakeState::Canceled {
+                    ccs_window: self.in_ccs_window(),
+                };
                 Ok(Step::Continue(Vec::new()))
             }
             ReceivedAlert::Fatal(code) => Err(ServerHandshakeError::ReceivedFatalAlert(code)),
@@ -490,14 +505,23 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
 
     /// `user_canceled` 受信後（[`HandshakeState::Canceled`]）の 1 レコード
     /// 処理。RFC 8446 §6.1 は closure alert 受信後に届いたデータを無視する
-    /// ことを要求するため、ハンドシェイクメッセージ・ダミー CCS・再度の
+    /// ことを要求するため、ハンドシェイクメッセージ・再度の
     /// `user_canceled` は解釈せずに読み捨て、`close_notify` で正常終了、
     /// それ以外の alert は従来どおり fatal として扱う。レコード保護
-    /// （復号）と alert の構造検証は通常時と同じく fail-closed で行う。
-    /// 読み捨ては内容を保持しないためメモリは増えず、待機時間は driver の
-    /// 絶対期限（[`DeadlineReader`]）で打ち切られる。
-    fn step_after_user_canceled(&mut self, record: &Record) -> Result<Step, ServerHandshakeError> {
+    /// （復号）・alert の構造検証・ダミー CCS の時期と値の検証
+    /// （`ccs_window` 内かつちょうど `[0x01]` のみ読み捨て、違反は
+    /// `unexpected_message`。PR #1046 レビュー指摘）は通常時と同じく
+    /// fail-closed で行う。読み捨ては内容を保持しないためメモリは増えず、
+    /// 待機時間は driver の絶対期限（[`DeadlineReader`]）で打ち切られる。
+    fn step_after_user_canceled(
+        &mut self,
+        record: &Record,
+        ccs_window: bool,
+    ) -> Result<Step, ServerHandshakeError> {
         if record.content_type == ContentType::ChangeCipherSpec {
+            if !ccs_window || record.fragment != [0x01] {
+                return Err(ServerHandshakeError::UnexpectedMessage);
+            }
             return Ok(Step::Continue(Vec::new()));
         }
         let inner = self
@@ -539,7 +563,7 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
             HandshakeState::Complete
             | HandshakeState::Failed(_)
             | HandshakeState::Closed
-            | HandshakeState::Canceled => Err(ServerHandshakeError::AlreadyFailed),
+            | HandshakeState::Canceled { .. } => Err(ServerHandshakeError::AlreadyFailed),
         }
     }
 

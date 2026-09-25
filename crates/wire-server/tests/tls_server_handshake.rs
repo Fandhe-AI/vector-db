@@ -586,6 +586,72 @@ fn user_canceled_waits_for_close_notify_and_ignores_later_records() {
     }
 }
 
+/// HelloRetryRequest を送出させて（`key_share` 無し CH1）ダミー CCS の
+/// 受理窓内・平文 epoch のまま `user_canceled` を受けた状態の
+/// `ServerHandshake` を返す。
+fn server_canceled_inside_ccs_window() -> ServerHandshake {
+    let mut hs = ServerHandshake::new(test_config());
+    let (ch1, _) = build_client_hello_ex(None, [0x42u8; 32]);
+    match hs
+        .handle_record(&ch1)
+        .expect("CH1 without key_share triggers HRR")
+    {
+        Step::Continue(output) => assert!(!output.is_empty(), "HRR must be sent"),
+        other => panic!("expected HRR, got {other:?}"),
+    }
+    match hs
+        .handle_record(&plaintext_alert_record(AlertDescription::UserCanceled))
+        .expect("user_canceled must not be an error")
+    {
+        Step::Continue(output) => assert!(output.is_empty()),
+        other => panic!("expected Continue after user_canceled, got {other:?}"),
+    }
+    hs
+}
+
+/// PR #1046 レビュー指摘の回帰: `user_canceled` 受信後もダミー CCS の
+/// 検証は通常時と同じ。受理窓内の値 `[0x01]` は読み捨て、値・長さの違反は
+/// `unexpected_message` で拒否する。
+#[test]
+fn dummy_ccs_after_user_canceled_is_still_validated() {
+    let mut hs = server_canceled_inside_ccs_window();
+    match hs
+        .handle_record(&dummy_ccs_record())
+        .expect("a valid dummy CCS inside the window is discarded")
+    {
+        Step::Continue(output) => assert!(output.is_empty()),
+        other => panic!("expected the dummy CCS to be discarded, got {other:?}"),
+    }
+
+    for bad_fragment in [vec![0x02], Vec::new(), vec![0x01, 0x01]] {
+        let mut hs = server_canceled_inside_ccs_window();
+        let mut bad_ccs = dummy_ccs_record();
+        bad_ccs.fragment = bad_fragment.clone();
+        let err = hs
+            .handle_record(&bad_ccs)
+            .expect_err("a malformed CCS must be rejected even after user_canceled");
+        assert_eq!(
+            err,
+            ServerHandshakeError::UnexpectedMessage,
+            "fragment {bad_fragment:?}"
+        );
+    }
+}
+
+/// PR #1046 レビュー指摘の回帰: 受理窓外（ClientHello 受信前）で
+/// `user_canceled` を受けた後のダミー CCS は、通常時と同じく時期外として
+/// `unexpected_message` で拒否する。
+#[test]
+fn dummy_ccs_after_user_canceled_outside_window_is_rejected() {
+    let mut hs = ServerHandshake::new(test_config());
+    hs.handle_record(&plaintext_alert_record(AlertDescription::UserCanceled))
+        .expect("user_canceled must not be an error");
+    let err = hs
+        .handle_record(&dummy_ccs_record())
+        .expect_err("CCS outside the window must be rejected after user_canceled");
+    assert_eq!(err, ServerHandshakeError::UnexpectedMessage);
+}
+
 /// PR #1046 レビュー指摘の回帰（driver 経由）: `user_canceled` の後に
 /// `close_notify` が届けば `ClosedByPeer` で正常終了する。
 #[test]
