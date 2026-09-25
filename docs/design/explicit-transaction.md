@@ -62,9 +62,10 @@
 ### 3. `tenant.rs` の書き込み本体を `WriteTarget` で共有する
 
 `pub(crate) enum WriteTarget<'a> { Autocommit(&'a Storage), InTxn(&'a redb::WriteTransaction) }`
-と `WriteTarget::with_txn`（`f: impl FnOnce(&WriteTransaction) -> Result<T, E>`
-を受け取り、`Autocommit` は `begin_write_txn` → `f` → `commit`、`InTxn` は
-`f` の結果をそのまま返す）を導入した。対象は次の 4 関数のみ:
+と `WriteTarget::with_txn`（`f: impl FnOnce(&WriteTransaction) -> Result<(T, TxnEffect), E>`
+を受け取り、`Autocommit` は `begin_write_txn` → `f` → `commit`（`f` が
+`TxnEffect::NoOp` を返したときは commit せず abort）、`InTxn` は `f` の結果を
+そのまま返す）を導入した。対象は次の 4 関数のみ:
 
 - `insert_row_unchecked`（Rust API の行形 INSERT）
 - `insert_rows_unchecked`（同・バッチ）
@@ -82,11 +83,12 @@
 対応へ分割していない。理由は実装コストと検証範囲を Issue #942 の予算内に
 収めるためであり、対応拡大は別 Issue の対象とする。
 
-**空バッチの挙動差**: `insert_rows_unchecked` の空バッチ（`rows.is_empty()`）は
-旧実装では `write_txn` を drop（abort）していたが、`WriteTarget::with_txn`
-経由では `Ok(())` を返した後にラッパーが `commit` を呼ぶ（autocommit 経路）。
-行を 1 件も書かず世代も進めないため観測可能な挙動は変わらないが、実際の
-redb commit 呼び出しが 1 回増える（cosmetic な差異として記録する）。
+**空バッチ**: `insert_rows_unchecked` の空バッチ（`rows.is_empty()`）は、main と
+同じく commit せずに `write_txn` を abort する（`TxnEffect::NoOp`）。当初の実装は
+空の `write_txn` を `commit_boundary::commit` で commit していたため、グローバル
+世代が進み、世代で失効するキャッシュを無駄に捨てていた（PR #1041 レビュー指摘）。
+他の 3 関数は常に書き込む（`truncate_table_unchecked` は 0 行でも台帳記録と
+テーブル世代の進行を行う既存契約）ため `TxnEffect::Wrote` を返す。
 
 ### 4. 状態機械（`crates/engine/src/sql/transaction.rs`）
 
@@ -190,6 +192,29 @@ TransactionStatus` の照会 API を公開するまでとし、wire-server の `
   `Failed` へ遷移させる（`crate::copy::run` へは委譲しない）。`Failed` 中の
   `COPY` も autocommit として実行せず `25P02` で拒否する（`Idle` のときだけ
   `crate::copy::run` へ委譲する。PR #1041 レビュー指摘）。
+
+## エラー時の遷移と `Failed` 中の拒否（入口別の網羅表）
+
+`Active` 中のエラーは種類を問わず `Failed` へ遷移させ、`Failed` 中は `ROLLBACK`
+以外を `25P02` で拒否する（持続時間の上限で解放した直後の最初の 1 回だけは
+`54000`。`SessionTransaction::take_failed_error`）。PR #1041 のレビューを受けて、
+入口ごとに次のとおり確認した。
+
+| 入口 | `Active` 中のエラー → `Failed` | `Failed` 中の拒否 |
+| ---- | ---- | ---- |
+| 簡易クエリ: 複数文の分割・位置検証（`simple_query::respond_splitter_error`） | `txn.fail()` | `25P02` |
+| 簡易クエリ: 各文（`EngineCore::execute_sql_in_txn`） | 字句・構文・許可リスト検証のエラーは `fail()`、上限超過・`operation_id` 再利用・実行エラーは `execute_parsed_in_txn` が `fail()` | parse より前に先頭トークンで判定し、`ROLLBACK` 以外は `25P02` |
+| 簡易クエリ: `BEGIN` | 入れ子は `25001` で `fail()` | `25P02` |
+| 簡易クエリ: `COMMIT` | 期限切れは abort して `Failed`・`54000`。commit 失敗はロールバック扱いで `Idle` | `25P02` |
+| 簡易クエリ: `COPY`（`handshake::post_auth_loop`） | `0A000` で `fail()` | `25P02`（`crate::copy::run` へ委譲しない） |
+| 簡易クエリ: 空文字列 | 対象外（エラーにならない） | EmptyQueryResponse（副作用なし） |
+| 拡張: Parse | エラー応答は `respond_error_and_await_sync` を通り、`post_auth_loop` が `ignore_till_sync` を見て `fail()` | `ROLLBACK`・空文字列以外は parse より前に `25P02` |
+| 拡張: Bind | 同上 | `ROLLBACK`・空文字列以外のステートメントは `25P02`（`Failed` 前に Parse 済みのものを含む） |
+| 拡張: Describe | 同上 | 受理（副作用なし。実行は Execute で拒否される） |
+| 拡張: Execute | 実行エラーは `execute_parsed_in_txn` が `fail()`。後処理のエラー応答は `ignore_till_sync` 経由で `fail()` | `execute_parsed_in_txn` が `25P02`（`ROLLBACK` のみ受理） |
+| 拡張: Close・Sync・Flush | 対象外（エラー応答は `ignore_till_sync` 経由で `fail()`） | 受理（副作用なし） |
+| フレーミング・プロトコル違反 | 接続を切断し、`SessionTransaction` の drop で abort | 同左 |
+| 全メッセージ共通（受信直後） | 期限切れなら `release_if_expired` で `Failed` にしてライタを解放 | — |
 
 ## 検証
 
