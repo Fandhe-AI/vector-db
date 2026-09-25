@@ -247,21 +247,22 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
   生成し直す・ユーザーストアと同じ内容から導出する、といった運用は
   未知ユーザーの存在を推測させる情報漏えいに繋がるため避けてください）。
 
-`--ddl-allowed-users`（SQL-23・TASK-202・TASK-203、Issue #899・#902・#909）は
-`CREATE TABLE`・`DROP TABLE`・`CREATE VIEW`／`DROP VIEW`（TABLE-18・TASK-205）
-の DDL 実行権限を持つ username をカンマ区切りで列挙する opt-in CLI 引数です。
+`--ddl-allowed-users`（SQL-23・TASK-202・TASK-203、Issue #899・#902・#909・#908）は
+`CREATE TABLE`・`DROP TABLE`・`CREATE VIEW`／`DROP VIEW`（TABLE-18・TASK-205）・
+`CREATE INDEX`／`DROP INDEX`（INDEX-7・TASK-206）の DDL 実行権限を持つ
+username をカンマ区切りで列挙する opt-in CLI 引数です。
 `--search-engine`／`--durability` と同型の「プロセス起動時にのみ明示指定する
 注入点」で、未指定は DDL 実行権限を持つユーザーが 0 人のまま（**全ユーザーの
-`CREATE TABLE`／`DROP TABLE`／`CREATE VIEW`／`DROP VIEW` が
-`42501`（permission denied）で拒否されます**。fail-closed。DDL は全テナント
-共有のカタログを変更するため既定で無効化されています）。列挙した username は
+`CREATE TABLE`／`DROP TABLE`／`CREATE VIEW`／`DROP VIEW`／`CREATE INDEX`／
+`DROP INDEX` が `42501`（permission denied）で拒否されます**。fail-closed。
+DDL は全テナント共有のカタログを変更するため既定で無効化されています）。列挙した username は
 `--users` で読み込んだユーザーストアへ実在する必要があり、未知の
 username・空要素・重複要素・フラグの重複指定はいずれも fail-closed で
 起動エラーになります。認証成功後の接続に対してのみ、対応する username が
 一覧に含まれる場合に限り DDL 実行権限が付与されます（テナント境界とは別軸の
 権限で、`RLS` の判定は変更しません。詳細な構文・権限判定順序は
 `docs/design/sql-create-table.md`・`docs/design/drop-table.md`・
-`docs/design/create-view.md` 参照）。
+`docs/design/create-view.md`・`docs/design/index-ddl-declaration.md` 参照）。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 
