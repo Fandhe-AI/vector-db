@@ -189,15 +189,20 @@ impl Transcript {
         }
     }
 
-    /// 生バイト列（ヘッダ＋本文）をそのままハッシュへ投入する。
-    /// `RawHandshake::encode_into` は宣言長・本文長の整合を保って
-    /// 復元するため、受信した生バイト列を欠落なく反映できる
-    /// （`handshake.rs` の [`RawHandshake`] ドキュメンテーションコメント参照）。
+    /// 生バイト列（ヘッダ＋本文）をハッシュへ投入する。
+    /// [`RawHandshake::header`] で 4 バイトヘッダだけを組み立て、ヘッダ・本文
+    /// の順に [`Sha256::update`] へ直接渡す（本文をヘッダ込みの別バッファへ
+    /// コピーしない。モジュール doc の O(1) メモリ契約。PR #1033 レビュー
+    /// 指摘）。ヘッダは `(msg_type, body.len())` から一意に決まるため、
+    /// 受信した生バイト列を欠落なく反映できる（`handshake.rs` の
+    /// [`RawHandshake`] ドキュメンテーションコメント参照）。本文長が 24 ビット
+    /// に収まらない場合は `Malformed` で poison する。
     fn absorb(&mut self, raw: &RawHandshake) -> Result<(), TranscriptError> {
-        let mut buf = Vec::new();
-        raw.encode_into(&mut buf)
+        let header = raw
+            .header()
             .map_err(|_| self.fail(TranscriptError::Malformed))?;
-        self.hasher.update(&buf);
+        self.hasher.update(&header);
+        self.hasher.update(&raw.body);
         Ok(())
     }
 
@@ -398,7 +403,7 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::handshake::HandshakeType;
+    use crate::tls::handshake::{HandshakeType, MAX_HANDSHAKE_WIRE_BODY_LEN};
 
     fn hex_decode(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
@@ -543,6 +548,43 @@ mod tests {
         assert_eq!(
             t.hash_through_server_hello().unwrap_err(),
             TranscriptError::OutOfOrder
+        );
+        assert_eq!(t.expected_next(), Err(TranscriptError::OutOfOrder));
+    }
+
+    // PR #1033 review（P2）: `absorb` はヘッダ込みの一時バッファを作らず
+    // ヘッダ・本文を別々に SHA-256 へ投入する。メモリ使用量そのものは
+    // アロケータ計測なしには実行時に検証できないため、分割投入が従来の
+    // 全量バッファ経由（`RawHandshake::to_bytes` の連結）とバイト等価で
+    // あることを固定する。
+    #[test]
+    fn split_header_body_absorb_matches_whole_message_hash() {
+        let ch = raw(HandshakeType::ClientHello, CLIENT_HELLO_1RTT);
+        let sh = raw(HandshakeType::ServerHello, SERVER_HELLO_1RTT);
+        let mut t = Transcript::new();
+        t.append_client_hello(&ch).expect("valid ClientHello");
+        t.append_server_hello(&sh).expect("valid ServerHello");
+        let got = t.hash_through_server_hello().expect("checkpoint reached");
+
+        let mut whole = Sha256::new();
+        whole.update(&ch.to_bytes().expect("encodable ClientHello"));
+        whole.update(&sh.to_bytes().expect("encodable ServerHello"));
+        assert_eq!(got, whole.finalize());
+    }
+
+    // PR #1033 review（P2）: ヘッダ構成を `RawHandshake::header` へ切り出した
+    // 後も、24 ビット長に収まらない本文は `Malformed` で拒否し poison する
+    // （全量コピーを経由しなくなっても長さ検証が失われないことを固定する）。
+    #[test]
+    fn absorb_rejects_body_exceeding_u24_and_poisons() {
+        let mut t = Transcript::new();
+        let oversized = RawHandshake {
+            msg_type: HandshakeType::ClientHello,
+            body: vec![0u8; MAX_HANDSHAKE_WIRE_BODY_LEN as usize + 1],
+        };
+        assert_eq!(
+            t.append_client_hello(&oversized).unwrap_err(),
+            TranscriptError::Malformed
         );
         assert_eq!(t.expected_next(), Err(TranscriptError::OutOfOrder));
     }
