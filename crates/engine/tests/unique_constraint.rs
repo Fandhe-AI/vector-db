@@ -370,6 +370,41 @@ fn upsert_do_update_rejects_conflicting_value() {
     assert_eq!(err.wire_code(), "23505");
 }
 
+/// 複数行 UPSERT のバッチ内で、いずれも既存行と衝突しない「新規挿入」同士
+/// （`DO UPDATE` 分岐を経由しない）が UNIQUE 列で衝突するケース（codex-review
+/// 指摘・Issue #905 PR レビュー: 単一行版・`DO UPDATE` 版・INSERT バッチ内衝突版の
+/// 結合テストは既存だったが、この組み合わせが欠けていた）。
+/// `tenant::upsert_typed_rows_unchecked` の第 1 パス（read-merge・plan 決定）→
+/// 第 2 パス（候補全体への 1 回の UNIQUE 制約検査）という構成では、新規挿入行
+/// 同士のバッチ内重複も候補集合の `HashSet` 経由で検出される
+/// （`tenant/unique_check.rs::check_against_table` のバッチ内重複検出）。
+#[test]
+fn multi_row_upsert_rejects_internal_duplicate_among_new_insert_branches() {
+    let (core, path) = new_core("uniq-upsert-batch-new-insert");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a TEXT UNIQUE)")
+        .expect("create table");
+    // id=1・id=2 はいずれもテーブルに存在しない（新規挿入分岐）。同じ値 'z' を
+    // 持つため、既存行との比較では衝突しないがバッチ内候補同士では衝突する。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a) VALUES (1, 'z'), (2, 'z') \
+             ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a USING OPERATION_ID 'op-upsert-batch-1'",
+        )
+        .expect_err("new-insert branches colliding with each other must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+
+    // 副作用ゼロ: どちらの行も反映されていない。
+    let rows = core
+        .execute_sql(&alice, "SELECT id FROM docs LIMIT 10")
+        .expect("scan should succeed")
+        .rows;
+    assert!(rows.is_empty(), "no row must have been written");
+}
+
 // --- ALTER TABLE ADD UNIQUE（Rust API）・DROP COLUMN 依存検査 ----------
 
 #[test]

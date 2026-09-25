@@ -42,6 +42,23 @@ unique_constraints().is_empty()`）は走査自体を一切行わない（既存
 制約付きテーブルが書き込み不能になるため）。永続一意索引（redb 二次テーブルに
 よる O(log n) 判定）は不採用のまま、将来検討事項として記録する。
 
+**バッチ入口の走査回数**: 上記「1 文あたり O(自テナント行数)」は、1 文が
+複数行に影響する場合でも**テナント範囲走査は文あたり 1 回**に保つ設計判断を
+含む。`insert_typed_rows_unchecked`（型付きバッチ INSERT）は元から候補を
+まとめて 1 回スキャンする構成だったが、`update_rows_where_unchecked`（述語
+UPDATE）・`upsert_typed_rows_unchecked`（複数行 UPSERT）は当初、影響行ごとに
+個別へ `check_against_table` を呼んでおり実質 O(影響行数 × テナント行数) に
+なっていた（codex-review 指摘・Issue #905 PR レビュー）。両関数とも
+「read-merge して適用内容を全候補ぶん確定させる → 候補全体で 1 回だけ検査する
+→ 書き込みを適用する」の 3 パス構成へ改め、`check_against_table` の
+`candidates`／`replaced_ids` 引数（元々バッチ用に設計済み）へ候補全体を渡す
+ことで O(自テナント行数) を回復した（`DO NOTHING` 行は候補にも除外対象にも
+含めない——既存値のまま走査対象として残る必要があるため）。redb は単一ライター
+制約を持つため、この書き込み中は他テナントの書き込みも待たされる。走査回数を
+文あたり 1 回に保つことは、大規模テナントの制約付きテーブルへの述語
+UPDATE／複数行 UPSERT が他テナントの書き込みを不必要に長く占有しないための
+直接的な緩和策になる。
+
 ### D2. 単一の検査点
 
 `unique_check::check_in_txn`（テーブルを自前で開く版）・`check_against_table`

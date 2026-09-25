@@ -719,7 +719,7 @@ pub(crate) fn insert_row_unchecked(
         // UNIQUE 制約検査（TABLE-16・TASK-204、Issue #905）。台帳照合の直後・
         // 行書き込みの直前（`unique_check` モジュールドキュメント参照）。
         unique_check::check_in_txn(
-            &write_txn,
+            write_txn,
             table,
             &schema,
             ctx,
@@ -907,7 +907,7 @@ pub(crate) fn insert_rows_unchecked(
                 metadata: row.metadata,
             })
             .collect();
-        unique_check::check_in_txn(&write_txn, table, &schema, ctx, &unique_candidates, &[])?;
+        unique_check::check_in_txn(write_txn, table, &schema, ctx, &unique_candidates, &[])?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -1076,7 +1076,7 @@ pub(crate) fn insert_typed_row_unchecked(
         // UNIQUE 制約検査（TABLE-16・TASK-204、Issue #905）。台帳照合の直後・
         // 行書き込みの直前。
         unique_check::check_in_txn(
-            &write_txn,
+            write_txn,
             table,
             &schema,
             ctx,
@@ -1509,6 +1509,27 @@ pub(crate) fn upsert_typed_rows_unchecked(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
 
+        // 第 1 パス: 各候補行の適用内容（新規挿入・既存行の read-merge・
+        // DoNothing）だけを決定し、行の書き込み（`insert`）は一切行わない
+        // （UNIQUE 制約検査を候補全体へ 1 回だけ適用するための準備。下記
+        // 第 2 パス参照）。
+        enum UpsertRowPlan {
+            /// `DO NOTHING` で衝突した既存行（変更なし）。
+            Skip,
+            /// 新規挿入行。
+            Insert {
+                embedding: Vec<f32>,
+                metadata: Vec<u8>,
+            },
+            /// `DO UPDATE` で衝突した既存行（read-merge 済み）。
+            Update {
+                visibility: crate::storage::Visibility,
+                embedding: Vec<f32>,
+                metadata: Vec<u8>,
+            },
+        }
+
+        let mut plans: Vec<(u64, UpsertRowPlan)> = Vec::with_capacity(rows.len());
         for (id, values) in rows {
             let key = (ctx.tenant_id(), *id);
             // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用
@@ -1546,7 +1567,10 @@ pub(crate) fn upsert_typed_rows_unchecked(
                 };
                 match action {
                     UpsertAction::DoNothing => {
-                        // 変更なし（新規挿入もしない）。
+                        // 変更なし（新規挿入もしない）。UNIQUE 制約検査の候補にも
+                        // 除外対象にも含めない（既存値がそのまま残り、走査対象で
+                        // あり続ける必要があるため）。
+                        plans.push((*id, UpsertRowPlan::Skip));
                     }
                     UpsertAction::DoUpdate(assignments) => {
                         // read-merge-write: 既存行のスカラー列を復元し、SET 対象
@@ -1609,79 +1633,121 @@ pub(crate) fn upsert_typed_rows_unchecked(
                         let metadata =
                             crate::row_codec::encode_scalar_columns(&schema, &merged_values)
                                 .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-                        // UNIQUE 制約検査（TABLE-16・TASK-204、Issue #905）。
-                        // `replaced_ids = &[*id]` で自分自身の既存値との比較を
-                        // 除外する（同じ値へ再度 SET する操作を違反にしない）。
-                        unique_check::check_against_table(
-                            &row_table,
-                            &schema,
-                            ctx,
-                            &[unique_check::UniqueCandidate {
-                                id: *id,
-                                metadata: &metadata,
-                            }],
-                            &[*id],
-                        )?;
-                        let row = RowInput {
-                            tenant_id: ctx.tenant_id(),
-                            // 既存行の可視性を保持する（SET で触れない列と同じ
-                            // 扱い。新規挿入行のみ `insert_visibility` を使う）。
-                            visibility: existing.visibility,
-                            embedding: &embedding_value,
-                            metadata: &metadata,
-                        };
-                        let encoded = encode_row(&row)?;
-                        row_table
-                            .insert(key, encoded.as_slice())
-                            .map_err(CatalogError::from)?;
-                        updated = updated.checked_add(1).ok_or_else(|| {
-                            TenantWriteError::Storage(StorageError::Codec(
-                                "upsert updated row counter overflow".to_string(),
-                            ))
-                        })?;
+                        plans.push((
+                            *id,
+                            UpsertRowPlan::Update {
+                                visibility: existing.visibility,
+                                embedding: embedding_value,
+                                metadata,
+                            },
+                        ));
                     }
                 }
             } else {
                 // 非衝突（新規挿入）。既存 `insert_typed_rows_unchecked` と同じ
                 // 組み立て（Issue #995: `VECTOR` 列なしスキーマは embedding 空）。
-                let embedding: &[f32] = match vector_idx {
+                let embedding: Vec<f32> = match vector_idx {
                     Some(idx) => match values.get(idx) {
-                        Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                        Some(crate::row_codec::Value::Vector(v)) => v.clone(),
                         _ => {
                             return Err(TenantWriteError::Catalog(CatalogError::Invalid(
                                 "VECTOR column value missing or not a Vector".to_string(),
                             )))
                         }
                     },
-                    None => &[],
+                    None => Vec::new(),
                 };
                 let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
                     .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-                // UNIQUE 制約検査（TABLE-16・TASK-204、Issue #905）。新規挿入
-                // 分岐のため `replaced_ids` は空（対象 `id` はまだ存在しない）。
-                unique_check::check_against_table(
-                    &row_table,
-                    &schema,
-                    ctx,
-                    &[unique_check::UniqueCandidate {
-                        id: *id,
-                        metadata: &metadata,
-                    }],
-                    &[],
-                )?;
-                let row = RowInput {
-                    tenant_id: ctx.tenant_id(),
-                    visibility: insert_visibility,
+                plans.push((
+                    *id,
+                    UpsertRowPlan::Insert {
+                        embedding,
+                        metadata,
+                    },
+                ));
+            }
+        }
+
+        // 第 2 パス: UNIQUE 制約検査（TABLE-16・TASK-204、Issue #905）を候補
+        // 全体へ 1 回だけ適用する（codex-review 指摘・Issue #905 PR レビュー:
+        // 候補ごとに `check_against_table`（テナント全行走査）を個別に呼ぶと
+        // O(影響行数 × テナント行数) になり、`docs/design/unique-constraint.md`
+        // D1 が明記する O(自テナント行数) から乖離する。INSERT 系バッチ入口
+        // （`insert_typed_rows_unchecked` 等）と同じ「候補をまとめて 1 回
+        // スキャン」方式へ揃える）。`DO NOTHING`（[`UpsertRowPlan::Skip`]）は
+        // 候補にも除外対象にも含めない——既存行の値は変わらないため、走査対象
+        // として残り続ける必要がある。
+        let unique_candidates: Vec<unique_check::UniqueCandidate<'_>> = plans
+            .iter()
+            .filter_map(|(id, plan)| match plan {
+                UpsertRowPlan::Skip => None,
+                UpsertRowPlan::Insert { metadata, .. } | UpsertRowPlan::Update { metadata, .. } => {
+                    Some(unique_check::UniqueCandidate { id: *id, metadata })
+                }
+            })
+            .collect();
+        let replaced_ids: Vec<u64> = plans
+            .iter()
+            .filter_map(|(id, plan)| match plan {
+                UpsertRowPlan::Update { .. } => Some(*id),
+                UpsertRowPlan::Skip | UpsertRowPlan::Insert { .. } => None,
+            })
+            .collect();
+        unique_check::check_against_table(
+            &row_table,
+            &schema,
+            ctx,
+            &unique_candidates,
+            &replaced_ids,
+        )?;
+
+        // 第 3 パス: 検査を通過した内容を実際に書き込む。
+        for (id, plan) in plans {
+            let key = (ctx.tenant_id(), id);
+            match plan {
+                UpsertRowPlan::Skip => {}
+                UpsertRowPlan::Insert {
                     embedding,
-                    metadata: &metadata,
-                };
-                let encoded = encode_row(&row)?;
-                insert_unique_row(&mut row_table, key, encoded.as_slice())?;
-                inserted = inserted.checked_add(1).ok_or_else(|| {
-                    TenantWriteError::Storage(StorageError::Codec(
-                        "upsert inserted row counter overflow".to_string(),
-                    ))
-                })?;
+                    metadata,
+                } => {
+                    let row = RowInput {
+                        tenant_id: ctx.tenant_id(),
+                        visibility: insert_visibility,
+                        embedding: &embedding,
+                        metadata: &metadata,
+                    };
+                    let encoded = encode_row(&row)?;
+                    insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+                    inserted = inserted.checked_add(1).ok_or_else(|| {
+                        TenantWriteError::Storage(StorageError::Codec(
+                            "upsert inserted row counter overflow".to_string(),
+                        ))
+                    })?;
+                }
+                UpsertRowPlan::Update {
+                    visibility,
+                    embedding,
+                    metadata,
+                } => {
+                    let row = RowInput {
+                        tenant_id: ctx.tenant_id(),
+                        // 既存行の可視性を保持する（SET で触れない列と同じ
+                        // 扱い。新規挿入行のみ `insert_visibility` を使う）。
+                        visibility,
+                        embedding: &embedding,
+                        metadata: &metadata,
+                    };
+                    let encoded = encode_row(&row)?;
+                    row_table
+                        .insert(key, encoded.as_slice())
+                        .map_err(CatalogError::from)?;
+                    updated = updated.checked_add(1).ok_or_else(|| {
+                        TenantWriteError::Storage(StorageError::Codec(
+                            "upsert updated row counter overflow".to_string(),
+                        ))
+                    })?;
+                }
             }
         }
     }
@@ -3309,6 +3375,20 @@ pub(crate) fn update_rows_where_unchecked<E>(
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+
+        // read-merge を先にすべての候補行についてまとめて行い、UNIQUE 制約検査
+        // （TABLE-16・TASK-204、Issue #905）を候補全体に対して 1 回だけ実行する
+        // （codex-review 指摘・Issue #905 PR レビュー: 候補ごとに
+        // `check_against_table`（テナント全行走査）を個別に呼ぶと
+        // O(影響行数 × テナント行数) になり、`docs/design/unique-constraint.md`
+        // D1 が明記する O(自テナント行数) から乖離する。INSERT 系バッチ入口
+        // （`insert_rows_unchecked` 等）と同じ「候補をまとめて 1 回スキャン」
+        // 方式へ揃える）。副次的に、個々の候補を順番に検査する版が持っていた
+        // 走査順依存（例: 行 A が値 X を持ち A→Y・B→X と更新する場合、逐次検査
+        // だと候補の適用順序によって成功/失敗が変わり得た）も解消し、候補集合
+        // 全体に対する 1 回の判定という決定的な意味論になる。
+        let mut merged: Vec<(u64, crate::storage::Visibility, Vec<f32>, Vec<u8>)> =
+            Vec::with_capacity(candidate_ids.len());
         for id in &candidate_ids {
             let key = (ctx.tenant_id(), *id);
             let existing = match row_table
@@ -3338,25 +3418,39 @@ pub(crate) fn update_rows_where_unchecked<E>(
             // （先勝ち）などの設計判断は同関数のドキュメント参照）。
             let (embedding_value, metadata) =
                 merge_row_for_update(&schema, existing, assignments).map_err(dml_write_err)?;
-            // UNIQUE 制約検査（TABLE-16・TASK-204、Issue #905）。
-            // `replaced_ids = &[*id]` で自分自身の既存値との比較を除外する。
-            unique_check::check_against_table(
-                &row_table,
-                &schema,
-                ctx,
-                &[unique_check::UniqueCandidate {
+            merged.push((*id, visibility, embedding_value, metadata));
+        }
+
+        // UNIQUE 制約検査（TABLE-16・TASK-204、Issue #905）を候補全体へ 1 回で
+        // 適用する。`replaced_ids = candidate_ids` で、今回更新される既存行
+        // すべてを自己比較対象から除外する（自分自身の現在値と同じ値へ更新する
+        // 操作を違反として誤検出しない）。
+        let unique_candidates: Vec<unique_check::UniqueCandidate<'_>> = merged
+            .iter()
+            .map(
+                |(id, _visibility, _embedding, metadata)| unique_check::UniqueCandidate {
                     id: *id,
-                    metadata: &metadata,
-                }],
-                &[*id],
+                    metadata,
+                },
             )
-            .map_err(dml_write_err)?;
+            .collect();
+        unique_check::check_against_table(
+            &row_table,
+            &schema,
+            ctx,
+            &unique_candidates,
+            &candidate_ids,
+        )
+        .map_err(dml_write_err)?;
+
+        for (id, visibility, embedding_value, metadata) in &merged {
+            let key = (ctx.tenant_id(), *id);
             let row = RowInput {
                 tenant_id: ctx.tenant_id(),
                 // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
-                visibility,
-                embedding: &embedding_value,
-                metadata: &metadata,
+                visibility: *visibility,
+                embedding: embedding_value,
+                metadata,
             };
             let encoded = encode_row(&row).map_err(dml_write_err)?;
             row_table
