@@ -15,7 +15,7 @@
 
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use engine::error_format::{ClassifiedError, ErrorClass};
 
@@ -476,18 +476,24 @@ fn post_auth_loop<'e>(
     txn: &mut Option<engine::sql::transaction::SessionTransaction<'e>>,
     extended: &mut crate::extended_query::ExtendedQueryState,
 ) -> Result<()> {
+    // 接続全体に設定済みの読み取りタイムアウト（WIRE-5。`server::accept_loop_*`
+    // が受理直後に設定する）。明示トランザクション中に一時的に切り詰めた後は
+    // 必ずこの値へ戻す（[`read_next_frame_header`] 参照）。
+    let base_timeout = stream.read_timeout()?;
+    let mut applied_timeout = base_timeout;
     loop {
-        let type_byte = match framing::read_typed_frame_header(stream)? {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+        let type_byte =
+            match read_next_frame_header(stream, txn, base_timeout, &mut applied_timeout)? {
+                Some(b) => b,
+                None => return Ok(()),
+            };
 
         // SQL-31・TASK-221（PR #1041 レビュー指摘）: 明示トランザクションの持続時間
         // 上限を、要求の種類（Sync・Flush 等 SQL を伴わない要求を含む）を問わず
         // 受信のたびに検査する。期限を過ぎていれば共有書き込みトランザクションを
         // abort してライタを解放し `Failed` へ遷移させる（最初の文／`COMMIT` には
-        // `54000` が返る）。無通信の間は `limits::READ_TIMEOUT` による切断で
-        // `SessionTransaction` が drop されライタが解放される。
+        // `54000` が返る）。無通信の間の期限到達は [`read_next_frame_header`] が
+        // 受信待ちを期限で打ち切って同じ遷移を行う。
         if let Some(txn) = txn.as_mut() {
             txn.release_if_expired();
             // 拡張クエリプロトコルのエラー後（`ignore_till_sync`）は、ループ末尾の
@@ -884,6 +890,91 @@ fn post_auth_loop<'e>(
     }
 }
 
+/// 読み取りタイムアウトの切り詰め後に設定する最小値（`set_read_timeout` は
+/// `Duration::ZERO` を受け付けないため、残り時間が 0 でもこの値で待つ）。
+const MIN_BOUNDED_READ_WAIT: Duration = Duration::from_millis(1);
+
+/// [`post_auth_loop`] が次の要求の型バイトを待つ（SQL-31・TASK-221。PR #1041
+/// レビュー指摘）。
+///
+/// 明示トランザクションが `Active`（共有書き込みトランザクション＝単一ライタを
+/// 保持中）の間は、受信待ちの読み取りタイムアウトを「持続時間上限までの残り
+/// 時間」と接続の読み取りタイムアウト（`base_timeout`。WIRE-5）の小さい方へ
+/// 切り詰める。期限到達でタイムアウトした場合は
+/// `engine::sql::transaction::SessionTransaction::release_if_expired` で abort
+/// してライタを解放し（応答は送らない。受信のたびの検査と同じく、次の文／
+/// `COMMIT` に `54000` が返る）、接続は維持したまま受信待ちを続ける。これにより
+/// 無通信のクライアントが上限を超えてライタを占有し続けることはない。
+///
+/// - `Failed` は既にライタを解放済みのため切り詰めの対象外（`Idle` と同じく
+///   `base_timeout` のまま待つ。この経路はシステムコールを追加しない）。
+/// - WIRE-5 の無通信上限は不変: 期限到達後の再待機は、この関数へ入った時点から
+///   の経過時間を差し引いた `base_timeout` の残りで待ち、尽きたら通常の読み取り
+///   タイムアウトと同じ I/O エラー（応答なしで切断）を返す。
+/// - 切り詰めるのは型バイト（1 バイト）の受信待ちだけで、受信できたら長さ・本文の
+///   読み取り前に `base_timeout` へ戻す（フレームの途中で打ち切ると以降の
+///   フレーミングが崩れるため）。`applied` は現在ソケットに設定中の値で、変更が
+///   必要なときだけ `set_read_timeout` を呼ぶ。
+fn read_next_frame_header(
+    stream: &mut TcpStream,
+    txn: &mut Option<engine::sql::transaction::SessionTransaction<'_>>,
+    base_timeout: Option<Duration>,
+    applied: &mut Option<Duration>,
+) -> Result<Option<u8>> {
+    let waiting_since = Instant::now();
+    let mut deadline_reached = false;
+    loop {
+        if let Some(t) = txn.as_mut() {
+            t.release_if_expired();
+        }
+        let txn_remaining = txn.as_ref().and_then(|t| t.remaining_duration());
+        let base_part = if deadline_reached {
+            match base_timeout {
+                Some(t) => {
+                    let rest = t.saturating_sub(waiting_since.elapsed());
+                    if rest.is_zero() {
+                        return Err(HandshakeError::Io(io::Error::from(io::ErrorKind::TimedOut)));
+                    }
+                    Some(rest)
+                }
+                None => None,
+            }
+        } else {
+            base_timeout
+        };
+        let (desired, bounded_by_txn) = match (base_part, txn_remaining) {
+            (Some(b), Some(r)) if r < b => (Some(r.max(MIN_BOUNDED_READ_WAIT)), true),
+            (None, Some(r)) => (Some(r.max(MIN_BOUNDED_READ_WAIT)), true),
+            (b, _) => (b, false),
+        };
+        if *applied != desired {
+            stream.set_read_timeout(desired)?;
+            *applied = desired;
+        }
+        match framing::read_typed_frame_header(stream) {
+            Ok(header) => {
+                if *applied != base_timeout {
+                    stream.set_read_timeout(base_timeout)?;
+                    *applied = base_timeout;
+                }
+                return Ok(header);
+            }
+            Err(FrameError::Io(e))
+                if bounded_by_txn
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                // 期限到達（またはタイマ粒度による直前の早期起床）。次の反復の
+                // 先頭で `release_if_expired` が abort・ライタ解放を行う。
+                deadline_reached = true;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// `negotiate_startup`・`read_password_message`・`post_auth_loop` いずれのエラーも
 /// ここへ集約して応答を分岐する（WIRE-4/WIRE-10）。
 ///
@@ -927,7 +1018,9 @@ fn respond_and_close(
 /// 読み取りタイムアウト（`limits::READ_TIMEOUT`）は呼び出し元の
 /// `server::accept_loop_with_limiter` が受理直後に一度だけソケットへ設定済み
 /// であり、本関数はそれを認証前後で変更しない（WIRE-5: 接続全体に同一の期限を
-/// 適用する）。タイムアウト由来の `io::Error`（`TimedOut` / `WouldBlock`）は
+/// 適用する）。例外は明示トランザクションが `Active` の間の要求待ちで、持続時間
+/// 上限の残り時間へ一時的に切り詰める（無通信の上限そのものは不変。
+/// [`read_next_frame_header`] 参照。SQL-31・TASK-221）。タイムアウト由来の `io::Error`（`TimedOut` / `WouldBlock`）は
 /// ここで捕捉して ErrorResponse を書くことはせず、そのまま `Err` として
 /// 呼び出し元へ返す（応答なしでクローズすることが WIRE-5 の契約）。
 ///

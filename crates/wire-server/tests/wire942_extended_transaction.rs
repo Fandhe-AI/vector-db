@@ -446,6 +446,68 @@ fn expired_transaction_releases_writer_on_next_protocol_message() {
     read_ready_for_query(&mut other);
 }
 
+/// BEGIN 後にクライアントが一切送信しない（無通信）場合も、持続時間の上限に
+/// 達した時点で書き込みトランザクションが abort されライタが解放されること
+/// （PR #1041 レビュー指摘: 以前は次の要求を受信するまで期限を検査しなかった
+/// ため、接続の読み取りタイムアウト〔既定 30 秒〕までライタを占有し続けた）。
+/// 解放されていなければ別接続の autocommit `INSERT` は書き込みゲートの待機上限
+/// （ここでは上限の数倍）で `55P03` になる。接続は切断されず、元の接続の
+/// `COMMIT` には上限超過の `54000` が返り、`ROLLBACK` で `Idle` へ戻れる。
+#[test]
+fn expired_transaction_releases_writer_while_client_is_silent() {
+    let path = temp_db::unique_db_path("wire942-expired-silent-transaction");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let max_duration = std::time::Duration::from_millis(200);
+    let storage = Storage::open(&path)
+        .expect("open storage")
+        .with_write_lock_wait(max_duration * 10);
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_transaction_limits(
+            engine::sql::transaction::TransactionLimits {
+                max_duration,
+                max_statements: 1_000,
+            },
+        ),
+    );
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 39, "op-942-39");
+
+    // 元の接続からは何も送らないまま、別接続の autocommit INSERT がライタを
+    // 取得できる（上限経過後・接続の読み取りタイムアウトより十分前）。
+    let started = std::time::Instant::now();
+    let mut other = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    send_simple_query(&mut other, &insert_sql(40, "op-942-40"));
+    assert_eq!(read_command_complete(&mut other), "INSERT 0 1");
+    read_ready_for_query(&mut other);
+    assert!(
+        started.elapsed() < wire_server::limits::READ_TIMEOUT,
+        "the writer must be released at the transaction deadline, not at the read timeout"
+    );
+
+    // 元の接続は維持されており、期限切れを COMMIT で観測できる。
+    send_simple_query(&mut stream, "COMMIT");
+    expect_error_response_with_sqlstate(&mut stream, "54000");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+
+    assert_eq!(visible_rows_with_id(&core, 39), 0);
+    assert_eq!(visible_rows_with_id(&core, 40), 1);
+}
+
 /// 拡張クエリの 1 メッセージを送り、ErrorResponse が返ったあと Sync で
 /// ReadyForQuery まで進める。
 fn send_expect_error_then_sync(stream: &mut std::net::TcpStream, type_byte: u8, body: &[u8]) {
