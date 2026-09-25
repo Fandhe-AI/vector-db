@@ -1008,18 +1008,20 @@ fn handle_parse_body(
     store: &mut PreparedStatementStore,
     body: &[u8],
 ) -> Result<(), HandlerError> {
+    // フレーム本体の構造検証（`08P01`）だけを先に行う。
     let msg = parse_parse_body(body)?;
-    if msg.num_param_types > 0 {
-        return Err(HandlerError::ParamTypesUnsupported);
-    }
-    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外を parse
-    // より前に `25P02` で拒否する（SQL-31・TASK-221。簡易クエリの
+    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外を、
+    // パラメータ型 OID 指定の未対応（`0A000`）等の機能検証や parse より前に
+    // `25P02` で拒否する（SQL-31・TASK-221。簡易クエリの
     // `EngineCore::execute_sql_in_txn` と同じ判定順序。PR #1041 レビュー指摘）。
     if txn.status() == engine::sql::transaction::TransactionStatus::Failed
         && !msg.query.trim().is_empty()
         && !engine::sql::transaction::is_rollback_statement(&msg.query)
     {
         return Err(HandlerError::Sql(txn.take_failed_error()));
+    }
+    if msg.num_param_types > 0 {
+        return Err(HandlerError::ParamTypesUnsupported);
     }
 
     let statement = if msg.query.trim().is_empty() {
@@ -1250,7 +1252,28 @@ fn handle_bind_body(
     state: &mut ExtendedQueryState,
     body: &[u8],
 ) -> Result<(), HandlerError> {
+    // フレーム本体の構造検証（`08P01`）だけを先に行う。
     let msg = parse_bind_body(body)?;
+
+    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外の
+    // ステートメントの Bind を `25P02` で拒否する（`Failed` になる前に Parse 済みの
+    // ステートメントを含む。SQL-31・TASK-221）。format code の検証や未登録
+    // ステートメントの判定より先に行う（PR #1041 レビュー指摘:
+    // 機能・対象の検証が先行すると `Failed` 中でも `25P02` 以外が返る）。
+    if txn.status() == engine::sql::transaction::TransactionStatus::Failed {
+        let is_exit_or_empty = matches!(
+            state.statements.get(&msg.statement_name),
+            Some(
+                PreparedStatement::Empty
+                    | PreparedStatement::Parsed(ParsedSql::Transaction(
+                        engine::sql::transaction::TxnControl::Rollback
+                    ))
+            )
+        );
+        if !is_exit_or_empty {
+            return Err(HandlerError::Sql(txn.take_failed_error()));
+        }
+    }
 
     validate_format_codes(&msg.param_format_codes, msg.num_params)?;
 
@@ -1258,20 +1281,6 @@ fn handle_bind_body(
         .statements
         .get(&msg.statement_name)
         .ok_or(HandlerError::UnknownStatement)?;
-
-    // 明示トランザクションが `Failed` の間は、`ROLLBACK` と空文字列以外の
-    // ステートメントの Bind を `25P02` で拒否する（`Failed` になる前に Parse 済みの
-    // ステートメントを含む。SQL-31・TASK-221。PR #1041 レビュー指摘）。
-    let is_exit_or_empty = matches!(
-        statement,
-        PreparedStatement::Empty
-            | PreparedStatement::Parsed(ParsedSql::Transaction(
-                engine::sql::transaction::TxnControl::Rollback
-            ))
-    );
-    if txn.status() == engine::sql::transaction::TransactionStatus::Failed && !is_exit_or_empty {
-        return Err(HandlerError::Sql(txn.take_failed_error()));
-    }
 
     // `$n` 束縛は #935（WIRE-12）の担当。現状ステートメントが要求する
     // パラメータ数は常に 0（`parse_parse_body` が `num_param_types > 0` を
@@ -1401,6 +1410,22 @@ fn write_command_complete(stream: &mut TcpStream, tag: &str) -> Result<(), Handl
     stream.flush().map_err(io_to_handler)
 }
 
+/// 明示トランザクションが `Failed` の間も Execute を受理する portal か
+/// （SQL-31・TASK-221）。空文字列の portal（副作用なし）と、未実行（`Ready`）の
+/// `ROLLBACK` の portal だけが対象で、未登録の portal は含まない。
+fn portal_is_exempt_while_failed(state: &ExtendedQueryState, portal_name: &str) -> bool {
+    match state.portals.get(portal_name) {
+        Some(portal) => match &portal.body {
+            PortalBody::Empty => true,
+            PortalBody::Parsed(ParsedSql::Transaction(
+                engine::sql::transaction::TxnControl::Rollback,
+            )) => matches!(portal.state, PortalState::Ready),
+            PortalBody::Parsed(_) => false,
+        },
+        None => false,
+    }
+}
+
 /// Execute 本体（`crate::simple_query::execute_with_emergency_registration` と
 /// `map_outcome`/`TagShape` を再利用し、簡易クエリの `run_statement` と同じ
 /// 緊急応答登録位置・タグ組み立て規則を共有する。WIRE-11: 第 2 の実行器を
@@ -1421,6 +1446,24 @@ fn execute_portal<'e>(
     portal_name: &str,
     max_rows: i32,
 ) -> Result<(), HandlerError> {
+    // 明示トランザクションが `Failed`（エラーによる abort・持続時間上限による
+    // 解放後）の間は、`ROLLBACK`（未実行の `Ready`）と空文字列の portal 以外への
+    // Execute を、portal の存在確認や実行状態に依らず最初に `25P02`（期限切れの
+    // 未報告分があれば 1 回だけ `54000`）で拒否する（SQL-31・TASK-221。PR #1041
+    // レビュー指摘: 未登録 portal の判定や、実行を開始済みの portal
+    // 〔`Suspended`・`Done`〕の残り行送出・タグ再送が状態検査より先に行われると、
+    // abort 後の要求が成功に見え期限切れも報告されない）。PostgreSQL が
+    // トランザクション終了時に portal を破棄するのに合わせ、拒否した portal は
+    // 終端状態 `Failed` へ倒し、`ROLLBACK` 後も再開させない。
+    if txn.status() == engine::sql::transaction::TransactionStatus::Failed
+        && !portal_is_exempt_while_failed(state, portal_name)
+    {
+        if let Some(portal) = state.portals.get_mut(portal_name) {
+            portal.state = PortalState::Failed;
+        }
+        return Err(HandlerError::Sql(txn.take_failed_error()));
+    }
+
     // Empty body（空文字列に対する Bind から作られた portal）は状態遷移を
     // 持たず、常に `EmptyQueryResponse` を返す（副作用が無いため何度
     // Execute しても安全に冪等。PostgreSQL と同じ扱い）。
@@ -1448,22 +1491,6 @@ fn execute_portal<'e>(
             .state,
         PortalState::Ready
     );
-
-    // 明示トランザクションが `Failed`（エラーによる abort・持続時間上限による
-    // 解放後）の間は、実行を開始済みの portal（`Suspended`・`Done`・`Failed`）の
-    // 残り行の送出・`CommandComplete` の再送も行わず、`25P02`（期限切れの未報告分が
-    // あれば 1 回だけ `54000`）で拒否する（SQL-31・TASK-221。PR #1041 レビュー
-    // 指摘: `Ready` の portal だけが `execute_parsed_in_txn` を通るため、ここで
-    // 判定しないと abort 後の最初の要求が成功に見え、期限切れも報告されない）。
-    // PostgreSQL がトランザクション終了時に portal を破棄するのに合わせ、拒否した
-    // portal は終端状態 `Failed` へ倒し、`ROLLBACK` 後も再開させない。`Ready` の
-    // portal は `execute_parsed_in_txn` が同じ判定（`ROLLBACK` のみ受理）を行う。
-    if !needs_execution && txn.status() == engine::sql::transaction::TransactionStatus::Failed {
-        if let Some(portal) = state.portals.get_mut(portal_name) {
-            portal.state = PortalState::Failed;
-        }
-        return Err(HandlerError::Sql(txn.take_failed_error()));
-    }
 
     if needs_execution {
         let (parsed, expected_columns, result_formats) = {

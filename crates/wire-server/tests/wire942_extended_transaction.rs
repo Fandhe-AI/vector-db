@@ -737,6 +737,81 @@ fn extended_parse_and_bind_while_failed_are_rejected_except_rollback() {
     assert_eq!(visible_rows_with_id(&core, 44), 0);
 }
 
+/// `Failed` 中は、フレーム本体の構造検証の後、機能・対象の検証より先に状態を
+/// 判定し `25P02` を返すこと（PR #1041 レビュー指摘: 以前は Parse のパラメータ
+/// 型 OID 指定が `0A000`、Bind の不正な format code・未登録ステートメント、
+/// Execute の未登録 portal がそれぞれ別のエラーを先に返していた）。
+#[test]
+fn extended_functional_errors_while_failed_are_reported_as_in_failed_sql_transaction() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 45, "op-942-45");
+    // Failed になる前に INSERT を Parse しておく（format code 検証の対象）。
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("ins-before", &insert_sql(46, "op-942-46"), 0),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'1', "expected ParseComplete");
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    // 入れ子の BEGIN で Failed へ遷移させる。
+    send_simple_query(&mut stream, "BEGIN");
+    expect_error_response_with_sqlstate(&mut stream, "25001");
+    read_ready_for_query(&mut stream);
+
+    // Parse: パラメータ型 OID を 1 件指定（未対応機能の 0A000 より先に 25P02）。
+    let mut typed_parse = parse_body("typed", "SELECT id FROM documents LIMIT 1", 1);
+    typed_parse.extend_from_slice(&25i32.to_be_bytes());
+    send_length_prefixed_message(&mut stream, b'P', &typed_parse);
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // Bind: 未登録ステートメント。
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("p-unknown", "no-such"));
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // Bind: 不正なパラメータ format code（binary 指定）。
+    let mut bad_format = Vec::new();
+    bad_format.extend_from_slice(b"p-bad\0ins-before\0");
+    bad_format.extend_from_slice(&1i16.to_be_bytes()); // param format code count
+    bad_format.extend_from_slice(&1i16.to_be_bytes()); // binary
+    bad_format.extend_from_slice(&0i16.to_be_bytes()); // param count
+    bad_format.extend_from_slice(&0i16.to_be_bytes()); // result format code count
+    send_length_prefixed_message(&mut stream, b'B', &bad_format);
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // Execute: 未登録 portal。
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("no-such-portal", 0));
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    // ROLLBACK は引き続き受理される。
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+
+    // 対照: トランザクション外では従来どおり機能検証のエラーが返る。
+    send_length_prefixed_message(&mut stream, b'P', &typed_parse);
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'I');
+
+    assert_eq!(visible_rows_with_id(&core, 45), 0);
+    assert_eq!(visible_rows_with_id(&core, 46), 0);
+}
+
 /// `Failed` 中は複数文メッセージの分割エラーも `25P02` で拒否すること
 /// （個々の文と同じ扱い。PR #1041 レビュー指摘）。
 #[test]
