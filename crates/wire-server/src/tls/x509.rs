@@ -262,15 +262,39 @@ fn validate_algorithm_identifier_structure(tlv_value: &[u8]) -> Result<(), X509E
     let oid = reader
         .read_expected(TAG_OID)
         .map_err(|_| X509Error::Malformed)?;
-    if oid.is_empty() {
-        return Err(X509Error::Malformed);
-    }
+    validate_oid_content(oid)?;
     if !reader.is_empty() {
         // parameters ANY: 中身の意味は解釈しないが、1 個の TLV として
         // 整形式であることだけは要求する。
         reader.read_any().map_err(|_| X509Error::Malformed)?;
     }
     reader.expect_end().map_err(|_| X509Error::Malformed)
+}
+
+/// OBJECT IDENTIFIER の値部分（BER/DER の base-128 可変長サブ識別子列）が
+/// 最小限整形式であることを検査する（`validate_structure` はタグ・長さ・
+/// 入れ子だけを見て primitive の中身には潜らないため、OID として無意味な
+/// バイト列——空・サブ識別子が継続ビット付きのまま終端・先頭バイトが
+/// 非最小符号化の `0x80`——を通してしまう）。DER の値そのものの解釈
+/// （既知 OID との比較）は呼び出し元の責務のまま変えない。
+fn validate_oid_content(oid: &[u8]) -> Result<(), X509Error> {
+    if oid.is_empty() {
+        return Err(X509Error::Malformed);
+    }
+    let mut at_subidentifier_start = true;
+    for byte in oid {
+        if at_subidentifier_start && *byte == 0x80 {
+            // サブ識別子の先頭バイトが 0x80 は非最小符号化（先行ゼロ）。
+            return Err(X509Error::Malformed);
+        }
+        at_subidentifier_start = byte & 0x80 == 0;
+    }
+    if !at_subidentifier_start {
+        // 最後のサブ識別子が継続ビット付きのまま終端している
+        // （切り詰められた OID）。
+        return Err(X509Error::Malformed);
+    }
+    Ok(())
 }
 
 /// パース手順（モジュール doc 参照）に従い 1 個の証明書 DER を検査する。
