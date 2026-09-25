@@ -234,16 +234,22 @@ fn copy_from_stdin_csv_format_distinguishes_null_and_empty_and_quoted_comma() {
 }
 
 /// CopyDone が「CRLF ではなく単独の `\r`」の直後に到達した場合（末尾行が
-/// `\n` を伴わずにストリームが終わる）、その `\r` を行終端の一部として
-/// 除去し格納値へ含めないことを固定する（Cursor Bugbot 指摘: 除去しないと
-/// `value\r\n` と `value\r` とで格納値が異なってしまう）。text 形式は
+/// `\n` を伴わずにストリームが終わる）、その `\r` を除去も保持もせず
+/// `22000` で fail-closed に拒否することを固定する（PostgreSQL の `COPY`
+/// が text 形式の裸 CR を `literal carriage return found in data`、CSV
+/// 形式の引用符なしフィールド中の裸 CR を `unquoted carriage return found
+/// in data` として拒否する契約に合わせる。codex-review 指摘
+/// PRRT_kwDOUAKASM6l0EjU: 「LF の無い CR は行終端と確定できず、無条件の
+/// 除去は入力の無言改変になる」との指摘を受け、以前の Cursor Bugbot 対応
+/// （`value\r\n` と `value\r` の格納値不一致を解消するための無条件除去）を
+/// 撤回し、両レビューを満たす fail-closed 拒否へ置き換えた）。text 形式は
 /// `RecordSplitter::finish`、CSV 形式（引用符なしフィールド）は
 /// `CsvRecordScanner::finish` の対応する分岐を検証する。引用符付き
 /// フィールド中の未終端 CRLF（`AfterQuoteCr` 状態のまま CopyDone）は
 /// 既存の `copy_from_stdin_rejects_...` 系テストが fail-closed 拒否を
 /// 固定済みで、本テストの対象ではない。
 #[test]
-fn copy_from_stdin_strips_lone_trailing_cr_on_final_unterminated_line() {
+fn copy_from_stdin_rejects_lone_trailing_cr_on_final_unterminated_line() {
     let (core, path) = open_engine("copy-from-text-lone-cr-finish");
     let _guard = CleanupGuard(path);
 
@@ -251,28 +257,21 @@ fn copy_from_stdin_strips_lone_trailing_cr_on_final_unterminated_line() {
     let sql = format!(
         "COPY {TABLE} (id, embedding, lang, note) FROM STDIN USING OPERATION_ID 'copy-op-cr-text'"
     );
-    let outcome = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tja\thello\r"])
-        .expect("COPY FROM STDIN succeeds");
-    assert_eq!(outcome.rows_affected, 1);
-    assert_eq!(
-        select_cells(&core, "acme", TABLE, 1, "note"),
-        vec![Cell::Text("hello".to_string())]
-    );
+    let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tja\thello\r"])
+        .expect_err("lone trailing CR in text data must be rejected");
+    assert_eq!(err.wire_code(), "22000");
 
     // CSV 形式（引用符なしフィールド）: 同じく末尾行が単独の `\r` で終わる。
     let sql = format!(
         "COPY {TABLE} (id, embedding, lang, note) FROM STDIN WITH (FORMAT csv) USING OPERATION_ID 'copy-op-cr-csv'"
     );
-    let outcome = run_copy_from(&core, "acme", &sql, &[b"2,\"[0.0,1.0]\",ja,hello\r"])
-        .expect("COPY FROM STDIN succeeds");
-    assert_eq!(outcome.rows_affected, 1);
-    assert_eq!(
-        select_cells(&core, "acme", TABLE, 2, "note"),
-        vec![Cell::Text("hello".to_string())]
-    );
+    let err = run_copy_from(&core, "acme", &sql, &[b"2,\"[0.0,1.0]\",ja,hello\r"])
+        .expect_err("lone trailing CR in unquoted CSV data must be rejected");
+    assert_eq!(err.wire_code(), "22000");
 
-    // 対照: 正規の CRLF 終端（`\n` を伴う）でも同じ値に正規化されることを
-    // 併せて確認し、`value\r\n` と `value\r` の格納値が揃うことを固定する。
+    // 対照: 正規の CRLF 終端（`\n` を伴う）は引き続き受理され、CR を含まない
+    // 値として格納されることを確認する（fail-closed 化が CRLF 対応を
+    // 巻き込んでいないことの確認）。
     let sql = format!(
         "COPY {TABLE} (id, embedding, lang, note) FROM STDIN USING OPERATION_ID 'copy-op-crlf-text'"
     );
@@ -283,6 +282,45 @@ fn copy_from_stdin_strips_lone_trailing_cr_on_final_unterminated_line() {
         select_cells(&core, "acme", TABLE, 3, "note"),
         vec![Cell::Text("hello".to_string())]
     );
+
+    let sql = format!(
+        "COPY {TABLE} (id, embedding, lang, note) FROM STDIN WITH (FORMAT csv) USING OPERATION_ID 'copy-op-crlf-csv'"
+    );
+    let outcome = run_copy_from(&core, "acme", &sql, &[b"4,\"[0.0,1.0]\",ja,hello\r\n"])
+        .expect("COPY FROM STDIN succeeds");
+    assert_eq!(outcome.rows_affected, 1);
+    assert_eq!(
+        select_cells(&core, "acme", TABLE, 4, "note"),
+        vec![Cell::Text("hello".to_string())]
+    );
+}
+
+/// mid-stream（レコード終端の直前ではない位置）に裸の `\r` が現れ、直後に
+/// `\n` が続かない場合も同じ `22000` で拒否し、レコード末尾での挙動と
+/// 一貫させることを固定する（codex-review 指摘 PRRT_kwDOUAKASM6l0EjU
+/// が求めた一貫性確認）。text 形式はフィールド途中の裸 CR、CSV 形式は
+/// カンマ直前・引用符なしフィールド途中の裸 CR をそれぞれ検証する。
+#[test]
+fn copy_from_stdin_rejects_bare_carriage_return_mid_field() {
+    let (core, path) = open_engine("copy-from-bare-cr-mid-field");
+    let _guard = CleanupGuard(path);
+
+    // text 形式: フィールド途中に裸の CR（直後は通常の文字）。
+    let sql = format!(
+        "COPY {TABLE} (id, embedding, lang, note) FROM STDIN USING OPERATION_ID 'copy-op-cr-mid-text'"
+    );
+    let err = run_copy_from(&core, "acme", &sql, &[b"1\t[1.0,0.0]\tja\thel\rlo\n"])
+        .expect_err("bare CR not followed by LF in text data must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+
+    // CSV 形式: 引用符なしフィールド中の裸 CR の直後がカンマ（フィールド
+    // 区切り）であっても、LF が続かない限り拒否する。
+    let sql = format!(
+        "COPY {TABLE} (id, embedding, lang, note) FROM STDIN WITH (FORMAT csv) USING OPERATION_ID 'copy-op-cr-mid-csv'"
+    );
+    let err = run_copy_from(&core, "acme", &sql, &[b"2,\"[0.0,1.0]\",ja,hel\r,lo\n"])
+        .expect_err("bare CR immediately followed by a field separator must be rejected");
+    assert_eq!(err.wire_code(), "22000");
 }
 
 #[test]

@@ -81,6 +81,15 @@ enum CsvFieldState {
     Unquoted,
     /// 引用符付きフィールドの内部。
     Quoted,
+    /// 引用符なしフィールド（`Start`／`Unquoted` いずれか）で裸の `\r` を
+    /// 受けた直後。CRLF レコード終端の一部としてのみ許容し、次バイトが
+    /// `\n` でなければ「引用符なしフィールド中の裸の CR」として `22000` で
+    /// 拒否する（PostgreSQL の `COPY` が生じる `unquoted carriage return
+    /// found in data` エラーに相当。codex-review 指摘 PRRT_kwDOUAKASM6l0EjU:
+    /// 直前の実装は末尾が単独 CR で終わるレコードの CR を無条件に除去して
+    /// いたが、CR の後に LF が続かない場合は「行終端の一部」と確定できず、
+    /// 除去は入力の無言改変になる。除去も保持もせず fail-closed に拒否する）。
+    UnquotedCr,
     /// 引用符付きフィールドの閉じ引用符直後。次にもう 1 個 `"` が来れば
     /// エスケープされた引用符としてフィールドへ戻り、`,`／`\n` なら
     /// フィールド／レコードの区切り、`\r` は [`Self::AfterQuoteCr`] へ移行して
@@ -141,6 +150,14 @@ impl CsvRecordScanner {
                     self.push_field()?;
                     Ok(true)
                 }
+                // 裸の `\r` はまだ「引用符なしフィールド中のデータ」か
+                // 「CRLF レコード終端の一部」かが確定できないため
+                // `UnquotedCr` へ移行し、次バイトで判定する（フィールド
+                // 先頭で受けた場合も、後続の `\n` と対にして扱う）。
+                b'\r' => {
+                    self.state = CsvFieldState::UnquotedCr;
+                    Ok(false)
+                }
                 _ => {
                     self.state = CsvFieldState::Unquoted;
                     self.field.push(b);
@@ -157,11 +174,14 @@ impl CsvRecordScanner {
                     Ok(false)
                 }
                 b'\n' => {
-                    if self.field.last() == Some(&b'\r') {
-                        self.field.pop();
-                    }
                     self.push_field()?;
                     Ok(true)
+                }
+                // `Start` と同じく、裸の `\r` は `UnquotedCr` へ移行して
+                // 次バイトで判定する（フィールドへは積まない）。
+                b'\r' => {
+                    self.state = CsvFieldState::UnquotedCr;
+                    Ok(false)
                 }
                 _ => {
                     self.field.push(b);
@@ -223,6 +243,24 @@ impl CsvRecordScanner {
                      (CRLF record terminator requires a following line feed)",
                 )),
             },
+            CsvFieldState::UnquotedCr => match b {
+                // `\r\n` が揃った。CR はフィールドへ含めず（元々積んでいない）
+                // レコード終端として確定する。
+                b'\n' => {
+                    self.push_field()?;
+                    Ok(true)
+                }
+                // CR の直後に LF が続かない不正配置（PostgreSQL の `COPY` が
+                // 出す `unquoted carriage return found in data` に相当。
+                // codex-review 指摘 PRRT_kwDOUAKASM6l0EjU: 「LF の無い CR は
+                // レコード終端と確定できない」ため、無条件の除去（旧実装の
+                // Cursor Bugbot 対応）は入力の無言改変になる。除去も保持も
+                // せず、ここで fail-closed に拒否する）。
+                _ => Err(SqlSurfaceError::invalid_input(
+                    "unquoted carriage return found in COPY CSV data \
+                     (unescaped CR must be followed by LF)",
+                )),
+            },
         }
     }
 
@@ -260,19 +298,22 @@ impl CsvRecordScanner {
         // なし」（`None`）に落ち、行が無言で消失していた（advisor 指摘。
         // 旧 `decode_csv_record(b"\"\"")` は `[Some("")]` を返していたため、
         // これは本モジュール導入時の回帰だった）。
+        // CopyDone に到達した時点で「引用符なしフィールド中の裸の CR」が
+        // 確定しないまま残っている場合（`value\r` のまま `\n` が来ずに
+        // ストリームが終わった）、`AfterQuoteCr` と同じ理由で CRLF が完成
+        // しない不正配置として拒否する（codex-review 指摘
+        // PRRT_kwDOUAKASM6l0EjU: LF の無い CR は行終端と確定できないため、
+        // 除去も保持もせず fail-closed に拒否する。除去する旧実装は Cursor
+        // Bugbot PRRT_kwDOUAKASM6lzwN7 が指摘した値不一致——`value\r\n` と
+        // `value\r` の格納値が異なる——の原因でもあった）。
+        if self.state == CsvFieldState::UnquotedCr {
+            return Err(SqlSurfaceError::invalid_input(
+                "COPY stream ended with an unquoted carriage return in CSV data \
+                 (unescaped CR must be followed by LF)",
+            ));
+        }
         if self.state == CsvFieldState::Start && self.fields.is_empty() {
             return Ok(None);
-        }
-        // 引用符なしフィールドが CRLF ではなく生の `\r` 1 文字だけで
-        // CopyDone を迎えた場合（`value\r` のまま `\n` が来ない）、
-        // `push_byte` の `Unquoted` × `\n` 分岐が行う「直前の `\r` を
-        // 行終端の一部として除去する」処理と同じ扱いをここでも行う。
-        // 除去しないと `value\r\n` と `value\r` とで格納値が異なってしまう
-        // （Cursor Bugbot 指摘）。引用符付きフィールド中の未終端 CRLF は
-        // 上の `AfterQuoteCr`／`Quoted` 検査で既に fail-closed に拒否済み
-        // のため、ここでは `Unquoted` 状態のみを対象にする。
-        if self.state == CsvFieldState::Unquoted && self.field.last() == Some(&b'\r') {
-            self.field.pop();
         }
         self.push_field()?;
         Ok(Some(self.take_record()))
@@ -288,9 +329,18 @@ impl CsvRecordScanner {
 /// 総容量は呼び出し元（[`CopyInSession::feed`]）が CopyData の生バイト量
 /// そのものを③（`max_batch_total_bytes`）で先に上限判定しているため、
 /// 本型自体は追加の容量上限を持たない（すでに有界な入力を受け取る契約）。
+///
+/// `pending_cr`: 直前バイトが裸の `\r`（`pending` へは積んでいない）で、
+/// 次バイトが `\n` かどうかで CRLF レコード終端の一部か・fail-closed に
+/// 拒否すべき不正配置かが未確定の状態を、チャンク境界をまたいで保持する
+/// （PostgreSQL の `COPY` が text 形式のデータ中の裸 CR を `literal
+/// carriage return found in data` として拒否する契約に合わせる。
+/// codex-review 指摘 PRRT_kwDOUAKASM6l0EjU: 末尾が単独 `\r` で終わる
+/// レコードの CR を無条件に除去する旧実装は、LF が続かない裸 CR を
+/// 「行終端の一部」と決め打つ入力の無言改変だった）。
 #[derive(Debug)]
 enum RecordSplitter {
-    Text { pending: Vec<u8> },
+    Text { pending: Vec<u8>, pending_cr: bool },
     Csv(CsvRecordScanner),
 }
 
@@ -299,6 +349,7 @@ impl RecordSplitter {
         match format {
             CopyFormat::Text => RecordSplitter::Text {
                 pending: Vec::new(),
+                pending_cr: false,
             },
             CopyFormat::Csv => RecordSplitter::Csv(CsvRecordScanner::new()),
         }
@@ -312,16 +363,38 @@ impl RecordSplitter {
         mut on_record: impl FnMut(Vec<Option<String>>) -> Result<(), SqlSurfaceError>,
     ) -> Result<(), SqlSurfaceError> {
         match self {
-            RecordSplitter::Text { pending } => {
+            RecordSplitter::Text {
+                pending,
+                pending_cr,
+            } => {
                 for &b in chunk {
-                    if b == b'\n' {
-                        let mut record = std::mem::take(pending);
-                        if record.last() == Some(&b'\r') {
-                            record.pop();
+                    if *pending_cr {
+                        // 直前バイトが裸の `\r`。今回のバイトが `\n` なら
+                        // CRLF が完成しレコード終端（CR はフィールドへ含め
+                        // ない。そもそも `pending` へ積んでいない）。それ
+                        // 以外は LF の続かない裸 CR として fail-closed に
+                        // 拒否する。
+                        *pending_cr = false;
+                        if b == b'\n' {
+                            let record = std::mem::take(pending);
+                            on_record(decode_text_record(&record)?)?;
+                            continue;
+                        } else {
+                            return Err(SqlSurfaceError::invalid_input(
+                                "literal carriage return found in COPY text data \
+                                 (unescaped CR must be followed by LF)",
+                            ));
                         }
-                        on_record(decode_text_record(&record)?)?;
-                    } else {
-                        pending.push(b);
+                    }
+                    match b {
+                        b'\r' => {
+                            *pending_cr = true;
+                        }
+                        b'\n' => {
+                            let record = std::mem::take(pending);
+                            on_record(decode_text_record(&record)?)?;
+                        }
+                        _ => pending.push(b),
                     }
                 }
                 Ok(())
@@ -341,17 +414,23 @@ impl RecordSplitter {
     /// 場合）のフィールド列を返す。
     fn finish(self) -> Result<Option<Vec<Option<String>>>, SqlSurfaceError> {
         match self {
-            RecordSplitter::Text { mut pending } => {
+            RecordSplitter::Text {
+                pending,
+                pending_cr,
+            } => {
+                // CopyDone に到達した時点で「LF の続かない裸の CR」が
+                // 確定しないまま残っている場合、CRLF が完成しない不正配置
+                // として拒否する（`feed` 内の対応する分岐と同じ理由。
+                // codex-review 指摘 PRRT_kwDOUAKASM6l0EjU）。
+                if pending_cr {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "COPY stream ended with a literal carriage return in text data \
+                         (unescaped CR must be followed by LF)",
+                    ));
+                }
                 if pending.is_empty() {
                     Ok(None)
                 } else {
-                    // `feed` の LF 分岐と同じく、末尾レコードが CRLF ではなく
-                    // 生の `\r` だけで CopyDone を迎えた場合も行終端の一部
-                    // として除去する（Cursor Bugbot 指摘: 除去しないと
-                    // `value\r\n` と `value\r` とで格納値が異なってしまう）。
-                    if pending.last() == Some(&b'\r') {
-                        pending.pop();
-                    }
                     Ok(Some(decode_text_record(&pending)?))
                 }
             }

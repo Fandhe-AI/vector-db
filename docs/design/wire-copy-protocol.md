@@ -52,22 +52,35 @@
 
 ### FROM STDIN の逐次取り込み（`sql::copy::CopyInSession`）
 
-- レコード分割（`RecordSplitter`）: text 形式は生の LF を行終端とする
-  （PostgreSQL の COPY テキストプロトコルは埋め込み改行を `\n`（2 文字の
-  エスケープ）としてしか表現できないため、生の LF バイトは常に行終端という
-  解釈で構造的に十分）。CSV 形式はレコード分割とフィールドデコードを
-  `CsvRecordScanner` の 1 バイト単位の状態機械（`Start`／`Unquoted`／
-  `Quoted`／`AfterQuote`／`AfterQuoteCr` の 5 状態）で同時に行う。`"` は
-  フィールド先頭（`Start`）でのみ引用符開始として受理し、`Unquoted` 中の
-  生 `"`・閉じ引用符直後（`AfterQuote`）の区切り／エスケープ／`\r`（CRLF
-  終端の一部）以外のバイトはいずれも不正な引用符配置として `22000` で
-  fail-closed に拒否する。`AfterQuote` で受けた `\r` は次バイトが `\n` の
-  ときのみ `AfterQuoteCr` からレコード終端として確定し、`\n` が続かない
-  単独の `\r` も拒否する（引用符外の生 `\r\n`／`\n` は通常の行終端として
-  そのまま受理し、この検査対象ではない）。引用符付きフィールド内の生改行は
-  区切りではなくデータとして 1 レコードへ含める。CopyData のチャンク境界を
-  またぐ場合も、text 形式は `pending`（未確定の行バイト列）、CSV 形式は
-  スキャナ自身の状態（現在の `CsvFieldState`・確定済み `fields`・構築中の
+- レコード分割（`RecordSplitter`）: text 形式は生の LF を行終端とし、
+  CRLF（`\r\n`）も行終端として受理する。ただし LF の続かない裸の `\r`
+  （text 形式のエスケープされていないデータ中の CR）は `22000` で
+  fail-closed に拒否する（PostgreSQL 本家が text 形式で出す `literal
+  carriage return found in data` に相当。`pending_cr` フラグで直前バイトが
+  裸の `\r` だった状態をチャンク境界をまたいで保持し、次バイトが `\n` なら
+  CRLF として確定、それ以外は拒否する）。CSV 形式はレコード分割と
+  フィールドデコードを `CsvRecordScanner` の 1 バイト単位の状態機械
+  （`Start`／`Unquoted`／`Quoted`／`AfterQuote`／`AfterQuoteCr`／
+  `UnquotedCr` の 6 状態）で同時に行う。`"` はフィールド先頭（`Start`）
+  でのみ引用符開始として受理し、`Unquoted` 中の生 `"`・閉じ引用符直後
+  （`AfterQuote`）の区切り／エスケープ／`\r`（CRLF 終端の一部）以外の
+  バイトはいずれも不正な引用符配置として `22000` で fail-closed に拒否
+  する。引用符なしフィールド中の裸の `\r`（`Start`／`Unquoted` から
+  `UnquotedCr` へ遷移）・閉じ引用符直後の裸の `\r`（`AfterQuote` から
+  `AfterQuoteCr` へ遷移）はいずれも、次バイトが `\n` のときのみ CRLF
+  レコード終端として確定し、それ以外（LF が続かない場合。ストリームが
+  そこで終わる場合を含む）は PostgreSQL 本家が CSV 形式で出す `unquoted
+  carriage return found in data` に相当するエラーとして `22000` で
+  fail-closed に拒否する。除去も保持もしない——「LF の無い CR は行終端の
+  一部と確定できない」ため、無条件の除去は入力の無言改変になる
+  （codex-review 指摘 PRRT_kwDOUAKASM6l0EjU。除去する旧実装は
+  Cursor Bugbot PRRT_kwDOUAKASM6lzwN7 が指摘した `value\r\n` と `value\r`
+  の格納値不一致の原因でもあった）。引用符外の生 `\r\n`／`\n` は通常の
+  行終端としてそのまま受理する。引用符付きフィールド内の生改行は区切り
+  ではなくデータとして 1 レコードへ含める（この経路は変更していない）。
+  CopyData のチャンク境界をまたぐ場合も、text 形式は `pending`（未確定の
+  行バイト列）と `pending_cr`（直前バイトが裸の `\r` だったか）、CSV 形式
+  はスキャナ自身の状態（現在の `CsvFieldState`・確定済み `fields`・構築中の
   `field` バイト列）をそのまま保持して次チャンクの継続として処理する。
 - フィールドデコード: text は PostgreSQL 互換のバックスラッシュエスケープ
   （`\\`／`\t`／`\n`／`\r`／`\b`／`\f`／`\v`。フィールド全体一致の `\N` のみ
