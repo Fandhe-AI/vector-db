@@ -111,8 +111,14 @@ fn is_where_clause_boundary(tokens: &[Token], idx: usize) -> bool {
     };
     match name.to_ascii_uppercase().as_str() {
         // `GROUP BY <column>`（`Parser::parse_group_by_clause`）。UDF 呼び出し
-        // `group(...)` は直後が `(` になり `BY` に一致しない。
-        "GROUP" => ident_eq_ignore_case(next1, "BY"),
+        // `group(...)` は直後が `(` になり `BY` に一致しない。`BY` は
+        // `sql::lexer::keyword_from_str` がキーワード化する語であり、字句解析後は
+        // `Token::Ident("BY")` ではなく `Token::Keyword(Keyword::By)` として現れる
+        // （`Parser::parse_group_by_clause` も `expect_keyword(Keyword::By)` で照合
+        // する）。`Ident` として照合すると本物の `GROUP BY` を句境界と認識できず、
+        // `WHERE` 領域が `GROUP BY` 以降まで延びて範囲外の `<col> = $n` を
+        // パターン 4 として誤受理してしまう（PR #1012 Cursor Bugbot 指摘）。
+        "GROUP" => matches!(next1, Some(Token::Keyword(crate::sql::lexer::Keyword::By))),
         // `HAVING <ident> <cmp> ...`（`Parser::parse_having`）。UDF 呼び出し
         // `having(...)` は直後が `(` になり `Ident` に一致しない。
         "HAVING" => matches!(next1, Some(Token::Ident(_))) && is_comparison_operator(next2),
@@ -774,6 +780,40 @@ mod tests {
         let sql = "SELECT COUNT(*) FROM documents WHERE lang = 'ja' GROUP BY lang HAVING $1 = 1";
         let err = positions(sql).unwrap_err();
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    // PR #1012 Cursor Bugbot 指摘の回帰: `BY` は字句解析で `Keyword::By` になる
+    // ため、`GROUP` の直後を `Ident("BY")` で照合していた旧実装では本物の
+    // `GROUP BY` が句境界と認識されず、`WHERE` 領域が `GROUP BY` 以降まで延びて
+    // `GROUP BY <col> = $n` の `$n` をパターン 4（WHERE 等価）として誤受理して
+    // いた。`HAVING` 等の他の境界に頼らず `GROUP BY` だけで領域が閉じることを
+    // 固定する（既存の範囲外パラメータと同じ `42601`）。
+    #[test]
+    fn rejects_dollar_param_in_equality_form_after_group_by_boundary() {
+        for sql in [
+            "SELECT lang, COUNT(*) AS n FROM documents WHERE lang = 'ja' GROUP BY lang = $1",
+            "SELECT lang, COUNT(*) AS n FROM documents WHERE lang = 'ja' group by lang = $1",
+            "SELECT lang, COUNT(*) AS n FROM documents WHERE lang = $1 GROUP BY lang = $2",
+        ] {
+            let err = positions(sql).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "sql = {sql}");
+        }
+    }
+
+    #[test]
+    fn where_region_closes_at_real_group_by_boundary() {
+        let tokens = tokenize_with_params(
+            "SELECT lang, COUNT(*) AS n FROM documents WHERE lang = $1 GROUP BY lang = 'x'",
+        )
+        .expect("tokenize_with_params should succeed");
+        let (start, end) = where_region(&tokens).expect("WHERE region should exist");
+        assert!(matches!(
+            tokens.get(start),
+            Some(Token::Keyword(crate::sql::lexer::Keyword::Where))
+        ));
+        assert!(matches!(tokens.get(end), Some(Token::Ident(name)) if name == "GROUP"));
+        // `GROUP BY` より後ろの等価形は WHERE 等価述語として数えない。
+        assert_eq!(where_equality_literal_is_param(&tokens), vec![true]);
     }
 
     #[test]

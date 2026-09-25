@@ -316,6 +316,23 @@ fn parse_sql_prepared_rejects_hybrid_function_argument_placeholder() {
     assert_eq!(err.wire_code(), "42601");
 }
 
+// PR #1012 Cursor Bugbot 指摘の回帰: `GROUP BY` 以降の `<col> = $n` は WHERE
+// 等価述語の許可位置（`sql::params` パターン 4）に含まれず、他の範囲外
+// パラメータと同じ `42601` で拒否されなければならない。
+#[test]
+fn parse_sql_prepared_rejects_placeholder_after_group_by() {
+    let path = unique_db_path("prepared-rejects-after-group-by");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+
+    let err = core
+        .parse_sql_prepared(
+            "SELECT lang, COUNT(*) AS n FROM documents WHERE lang = 'ja' GROUP BY lang = $1",
+        )
+        .expect_err("$n after GROUP BY must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
 // --- 字句・パラメータ番号上限 -------------------------------------------------
 
 #[test]
