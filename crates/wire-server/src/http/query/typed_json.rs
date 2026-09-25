@@ -272,6 +272,19 @@ pub fn map_json_to_literal(
             JsonValue::Number(n @ (JsonNumber::PosInt(_) | JsonNumber::NegInt(_))) => {
                 Ok(InsertLiteral::Number(number_literal_text(n)))
             }
+            // `u64`／`i64` に収まらない整数リテラル（小数点・指数部を含まない）
+            // は `engine::json::parse_number` が `JsonNumber::Float` へ
+            // フォールバックする（RFC 8259 上は依然として整数リテラルであり
+            // 小数とは区別できる。json.rs 内のコメント参照）。ここで小数・
+            // 指数部として弾くと本来 `22003`（範囲外）であるべき値まで
+            // `42601`（型不一致）にしてしまうため、`text` に `.`／`e`／`E` が
+            // 無い場合はそのまま生テキストを engine の整数束縛
+            // （`bind_integer_literal`）へ委譲し、範囲判定はそちらに任せる。
+            JsonValue::Number(n @ JsonNumber::Float { text, .. })
+                if !text.contains(['.', 'e', 'E']) =>
+            {
+                Ok(InsertLiteral::Number(number_literal_text(n)))
+            }
             JsonValue::Number(JsonNumber::Float { .. }) => Err(TypedJsonError::TypeMismatch(
                 "INTEGER/BIGINT column value must be a JSON integer number",
             )),
