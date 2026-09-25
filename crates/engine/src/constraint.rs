@@ -3,12 +3,13 @@
 //!
 //! 呼び出し元は `tenant.rs` の各書き込み関数（`insert_*_unchecked`・
 //! `upsert_typed_rows_unchecked`・`update_row_columns_unchecked`・
-//! `update_rows_where_unchecked`・`replace_typed_rows_by_text_key`）と
-//! `catalog.rs` の生書き込み API（テスト専用）で、いずれも「`operation_id`
-//! 台帳への記録 → 行の書き込み」の**後**・テーブル世代 bump・commit の**前**に
-//! 同一 write トランザクション内から呼ぶ契約とする（RECOVER-12・TABLE-16。
-//! 台帳照合を先に行うことで、`operation_id` の再送判定（`23505`／`22023`）が
-//! 本検査より優先されることを保証する）。
+//! `update_rows_where_unchecked`・`replace_typed_rows_by_text_key`）で、
+//! いずれも「`operation_id` 台帳への記録 → 行の書き込み」の**後**・テーブル
+//! 世代 bump・commit の**前**に同一 write トランザクション内から呼ぶ契約とする
+//! （RECOVER-12・TABLE-16。台帳照合を先に行うことで、`operation_id` の再送判定
+//! （`23505`／`22023`）が本検査より優先されることを保証する）。`catalog.rs` の
+//! 生書き込み API（`#[cfg(test)]` 限定・production では到達不能）はこの検査点を
+//! 経由しない（既知のギャップ。`docs/design/sql-primary-key.md` 参照）。
 //!
 //! 主キーを宣言しないテーブル（大多数）は `schema.primary_key()` が `None` を
 //! 返し、呼び出しは即座に成功する（コストゼロ）。

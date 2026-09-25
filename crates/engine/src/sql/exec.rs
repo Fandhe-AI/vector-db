@@ -3962,6 +3962,14 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::OperationIdContentMismatch) => {
             SqlSurfaceError::OperationIdContentMismatch
         }
+        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約違反
+        // （`replace_typed_rows_by_text_key` の採番 id 範囲検査。`constraint.rs`
+        // ドキュメント参照）。行形 INSERT（[`map_write_error`]）と同じ `23505` へ
+        // 写像し、`_` 節（`XX000`）へ丸めない（クライアントが一意制約違反を内部
+        // エラーと取り違えないようにする）。
+        IncrementalError::Write(TenantWriteError::UniqueViolation) => {
+            SqlSurfaceError::unique_violation()
+        }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),
         },

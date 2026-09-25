@@ -11,6 +11,7 @@
 //! 経路（SQL 表層）から検証する。
 
 use engine::core::EngineCore;
+use engine::embedding::HashingEmbedder;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::mode::SessionState;
@@ -374,4 +375,283 @@ fn different_tenants_may_share_the_same_primary_key_value() {
         "INSERT INTO docs (id, embedding, code) VALUES (1, '[0.1,0.2,0.3,0.4]', 'shared') USING OPERATION_ID 'op-b'",
     )
     .expect("tenant bob must be able to use the same primary key value as tenant alice");
+}
+
+// --- UPSERT（`tenant::upsert_typed_rows_unchecked`。`DO NOTHING` 行の
+//     `written_ids` 除外） -----------------------------------------------
+
+#[test]
+fn upsert_do_nothing_row_is_excluded_from_primary_key_check_and_does_not_block_new_insert() {
+    let (core, path) = new_core("pk-upsert-do-nothing-excluded");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
+    )
+    .expect("CREATE TABLE should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code) VALUES (1, '[0.1,0.2,0.3,0.4]', 'a') USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed insert should succeed");
+
+    // id=1 は物理キー衝突により `DO NOTHING`（`code` は書き込まれない）。
+    // 同一 UPSERT 文の id=2 は新規行で、`code` は既存行と異なる値のため、
+    // `DO NOTHING` 行が `written_ids` に誤って含まれていても含まれていなくても
+    // 直接の衝突は起きないが、`written_ids` 除外が壊れて `DO NOTHING` 行の
+    // デコードに失敗するような回帰があればここで検出できる。
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code) VALUES (1, '[0.9,0.9,0.9,0.9]', 'ignored'), \
+         (2, '[0.5,0.6,0.7,0.8]', 'b') \
+         ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-upsert-1'",
+    )
+    .expect("upsert with one DO NOTHING row and one new row should succeed");
+}
+
+#[test]
+fn upsert_do_nothing_row_value_still_participates_in_primary_key_check_via_existing_scan() {
+    let (core, path) = new_core("pk-upsert-do-nothing-still-conflicts");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
+    )
+    .expect("CREATE TABLE should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code) VALUES (1, '[0.1,0.2,0.3,0.4]', 'dup') USING OPERATION_ID 'op-seed'",
+    )
+    .expect("seed insert should succeed");
+
+    // id=1 は `DO NOTHING`（既存の code='dup' は変わらない）。id=2 は新規行で
+    // `code='dup'` を書き込もうとする。id=1 が `written_ids` から除外されて
+    // いても、テナント全行走査（`enforce_primary_key_in_txn` の第 2 パス）が
+    // 未変更の id=1 を拾い、id=2 との衝突を検出しなければならない。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, embedding, code) VALUES (1, '[0.9,0.9,0.9,0.9]', 'ignored'), \
+             (2, '[0.5,0.6,0.7,0.8]', 'dup') \
+             ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-upsert-2'",
+        )
+        .expect_err("new row duplicating an untouched DO NOTHING row's value must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+}
+
+#[test]
+fn upsert_do_update_rows_that_would_collide_are_rejected() {
+    let (core, path) = new_core("pk-upsert-do-update-collide");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY)",
+    )
+    .expect("CREATE TABLE should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code) VALUES (1, '[0.1,0.2,0.3,0.4]', 'a') USING OPERATION_ID 'op-1'",
+    )
+    .expect("insert 1 should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code) VALUES (2, '[0.5,0.6,0.7,0.8]', 'b') USING OPERATION_ID 'op-2'",
+    )
+    .expect("insert 2 should succeed");
+
+    // 両行とも `DO UPDATE` で `code='dup'` へ更新しようとする。`DO UPDATE` は
+    // `written_ids` に含まれるため、書き込んだ行同士の衝突として拒否される。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, embedding, code) VALUES (1, '[0.1,0.2,0.3,0.4]', 'dup'), \
+             (2, '[0.5,0.6,0.7,0.8]', 'dup') \
+             ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code \
+             USING OPERATION_ID 'op-upsert-collide'",
+        )
+        .expect_err("two DO UPDATE rows converging on the same primary key value must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+
+    // 副作用ゼロ: 拒否後も両行の `code` は元の値のまま。
+    assert_eq!(
+        id_code_pairs(&core, &alice, "docs"),
+        vec![(1, "a".to_string()), (2, "b".to_string())]
+    );
+}
+
+/// `id`・`code` 列を `id` 昇順で読み出す（`SELECT ... ORDER BY id` は
+/// distance/hybrid 専用の `ORDER BY` しか受理しない広域取得構文のため、
+/// `LIMIT` のみで走査してテスト側で `id` ソートする。SQL-15 参照）。
+fn id_code_pairs(core: &EngineCore, ctx: &PolicyContext, table: &str) -> Vec<(u64, String)> {
+    let result = core
+        .execute_sql(ctx, &format!("SELECT id, code FROM {table} LIMIT 100"))
+        .expect("scan should succeed");
+    let mut pairs: Vec<(u64, String)> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let code = match &row.cells[1] {
+                engine::sql::exec::Cell::Text(s) => s.clone(),
+                other => panic!("expected Cell::Text, got {other:?}"),
+            };
+            (row.id, code)
+        })
+        .collect();
+    pairs.sort_by_key(|(id, _)| *id);
+    pairs
+}
+
+// --- 述語つき UPDATE（`tenant::update_rows_where_unchecked`。複数一致行への
+//     一括適用） ------------------------------------------------------------
+
+#[test]
+fn predicate_update_matching_multiple_rows_without_touching_primary_key_succeeds() {
+    let (core, path) = new_core("pk-predicate-update-benign");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY, tag TEXT)",
+    )
+    .expect("CREATE TABLE should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code, tag) VALUES (1, '[0.1,0.2,0.3,0.4]', 'a', 'x') USING OPERATION_ID 'op-1'",
+    )
+    .expect("insert 1 should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code, tag) VALUES (2, '[0.5,0.6,0.7,0.8]', 'b', 'x') USING OPERATION_ID 'op-2'",
+    )
+    .expect("insert 2 should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code, tag) VALUES (3, '[0.9,0.9,0.9,0.9]', 'c', 'y') USING OPERATION_ID 'op-3'",
+    )
+    .expect("insert 3 should succeed");
+
+    // `tag` は主キー対象外なので、複数一致行（id=1・id=2）への一括適用は
+    // 一意性制約に触れず成功する。述語つき（`id = <n>` 以外の）`WHERE` は
+    // `execute_sql_in_session` の predicate-form 実行経路が受理する
+    // （`execute_update_sql` は単一行・`id` 等価形のみ。SQL-19 参照）。
+    let mut dml_session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &alice,
+            &mut dml_session,
+            "UPDATE docs SET tag = 'z' WHERE tag = 'x' USING OPERATION_ID 'op-update-benign'",
+        )
+        .expect("predicate update touching multiple rows without primary key change must succeed");
+    match outcome {
+        SqlOutcome::Update(o) => assert_eq!(o.rows_affected, 2),
+        other => panic!("expected SqlOutcome::Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn predicate_update_matching_multiple_rows_that_would_collide_on_primary_key_is_rejected() {
+    let (core, path) = new_core("pk-predicate-update-collide");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (embedding VECTOR(4), code TEXT PRIMARY KEY, tag TEXT)",
+    )
+    .expect("CREATE TABLE should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code, tag) VALUES (1, '[0.1,0.2,0.3,0.4]', 'a', 'x') USING OPERATION_ID 'op-1'",
+    )
+    .expect("insert 1 should succeed");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, embedding, code, tag) VALUES (2, '[0.5,0.6,0.7,0.8]', 'b', 'x') USING OPERATION_ID 'op-2'",
+    )
+    .expect("insert 2 should succeed");
+
+    // `tag = 'x'` は id=1・id=2 の 2 行に一致する。両方を `code='dup'` へ
+    // 一括更新しようとするため、更新後の行同士が一意性制約に違反する。
+    let mut dml_session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &alice,
+            &mut dml_session,
+            "UPDATE docs SET code = 'dup' WHERE tag = 'x' USING OPERATION_ID 'op-update-collide'",
+        )
+        .expect_err("predicate update converging multiple rows onto the same primary key value must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+
+    // 副作用ゼロ: 拒否後も両行の `code` は元の値のまま。
+    assert_eq!(
+        id_code_pairs(&core, &alice, "docs"),
+        vec![(1, "a".to_string()), (2, "b".to_string())]
+    );
+}
+
+// --- ファイル形 `INSERT`（`tenant::replace_typed_rows_by_text_key`。
+//     採番 id 範囲 `first_id..first_id + inserted` の再構築） ---------------
+
+fn new_core_with_embedder(label: &str, dim: u32) -> (EngineCore, std::path::PathBuf) {
+    let path = unique_db_path(label);
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(dim).expect("valid dim")));
+    (core, path)
+}
+
+#[test]
+fn file_insert_rejects_primary_key_collision_across_generated_chunk_rows() {
+    const DIM: u32 = 8;
+    let (core, path) = new_core_with_embedder("pk-file-insert-collision", DIM);
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session(
+        &alice,
+        &mut session,
+        &format!(
+            "CREATE TABLE docs (embedding VECTOR({DIM}), path TEXT, body TEXT, lang TEXT PRIMARY KEY)"
+        ),
+    )
+    .expect("CREATE TABLE should succeed");
+
+    // 1 ファイル目: 1 チャンクだけ生成される短い本文で `lang='ja'` を書き込む。
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (path, body, lang) VALUES ('docs/a.txt', 'hello world', 'ja') \
+         USING OPERATION_ID 'op-file-a'",
+    )
+    .expect("first file insert should succeed");
+
+    // 2 ファイル目: 別パスだが同じ `lang='ja'` を書き込もうとする。採番 id は
+    // `first_id..first_id + inserted` として再構築された範囲で一意性制約
+    // 検査へ渡される（`tenant::replace_typed_rows_by_text_key` ドキュメント
+    // 参照）ため、`23505` として拒否されなければならない。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (path, body, lang) VALUES ('docs/b.txt', 'goodbye world', 'ja') \
+             USING OPERATION_ID 'op-file-b'",
+        )
+        .expect_err("second file with a duplicate primary key value must be rejected");
+    assert_eq!(err.wire_code(), "23505");
+
+    // 副作用ゼロ: 拒否された 2 ファイル目のパスは検索できない。
+    let result = core
+        .execute_sql(&alice, "SELECT path FROM docs LIMIT 100")
+        .expect("select should succeed");
+    assert_eq!(result.rows.len(), 1);
 }
