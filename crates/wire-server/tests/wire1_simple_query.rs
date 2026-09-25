@@ -309,8 +309,9 @@ fn wire1_vector_and_null_cells_are_text_encoded() {
 
 /// BOOLEAN 列（TABLE-13・TASK-196、Issue #883）が簡易クエリ経由で `t`/`f`/
 /// NULL のテキスト表現へ写像されることを固定する（`result_encoder.rs` の
-/// `Cell::Bool` 分岐。RowDescription の OID 公告は Issue #895 の担当のため
-/// 対象外・列自体の値往復のみを検証する）。
+/// `Cell::Bool` 分岐。RowDescription の OID 公告（`bool`・OID 16。WIRE-13・
+/// TASK-200・Issue #895）は `result_encoder::column_wire_type_matrix` で
+/// 固定済みのためここでは対象外・列自体の値往復のみを検証する）。
 #[test]
 fn wire1_boolean_column_is_t_f_null_text_encoded() {
     let path = temp_db::unique_db_path("wire1-boolean");
@@ -675,10 +676,10 @@ fn wire1_three_tenant_visibility_public_shared_own_private_visible() {
 /// 正規テキスト表現（小文字 `8-4-4-4-12`。大文字入力の正規化・NULL 区別を含む）
 /// へ写像されることと、厳密文法違反が `22P02` の `ErrorResponse` になることを
 /// 固定する（`wire1_numeric_column_is_canonical_text_encoded_and_overflow_is_22003`
-/// と同じ流儀）。RowDescription の OID（25・text 相当。U10）公告自体は
-/// `result_encoder::column_binary_support_matrix` で固定済みのためここでは
-/// 対象外（本テストの `read_row_description` は列名のみ取得し OID を検証
-/// しない）。
+/// と同じ流儀）。RowDescription の OID（`uuid`・OID 2950。U10・WIRE-13・
+/// TASK-200・Issue #895）公告自体は `result_encoder::column_wire_type_matrix`
+/// で固定済みのためここでは対象外（本テストの `read_row_description` は
+/// 列名のみ取得し OID を検証しない）。
 #[test]
 fn wire1_uuid_column_is_canonical_text_encoded_and_malformed_literal_is_22p02() {
     let path = temp_db::unique_db_path("wire1-uuid");
