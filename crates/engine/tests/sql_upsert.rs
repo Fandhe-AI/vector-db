@@ -266,14 +266,15 @@ fn excluded_value_that_would_be_null_for_non_nullable_target_is_rejected() {
 
     // `lang` は non-nullable。新規行の列リストに `lang` を含めなければ
     // `EXCLUDED.lang` は NULL になり、対象列 `lang` も non-nullable のため
-    // `22000` で拒否される。
+    // `23502`（`NotNullViolation`。TABLE-16・TASK-204、Issue #904。旧 `22000`
+    // から契約変更）で拒否される。
     let sql = format!(
         "INSERT INTO {TABLE} (id, embedding) VALUES (1, '[0.9,0.9]') \
          ON CONFLICT (id) DO UPDATE SET lang = EXCLUDED.lang \
          USING OPERATION_ID 'op-upsert-6'"
     );
     let err = run_sql(&core, &ctx, &mut session, &sql).unwrap_err();
-    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(err.wire_code(), "23502");
     // 束縛失敗のため行・台帳とも無変更。
     assert_eq!(read_back(&core, &ctx), vec![(1, "ja".to_string(), None)]);
 }

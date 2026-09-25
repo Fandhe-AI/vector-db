@@ -279,16 +279,8 @@ mod tests {
         TableSchema::new(
             "documents",
             vec![
-                ColumnDef {
-                    name: "embedding".to_string(),
-                    ty: ColumnType::Vector(2),
-                    nullable: false,
-                },
-                ColumnDef {
-                    name: "body".to_string(),
-                    ty: ColumnType::Text,
-                    nullable: false,
-                },
+                ColumnDef::new("embedding".to_string(), ColumnType::Vector(2), false),
+                ColumnDef::new("body".to_string(), ColumnType::Text, false),
             ],
         )
     }
@@ -359,11 +351,11 @@ mod tests {
     fn bind_expansion_rejects_missing_body_column() {
         let schema = TableSchema::new(
             "documents",
-            vec![ColumnDef {
-                name: "embedding".to_string(),
-                ty: ColumnType::Vector(2),
-                nullable: false,
-            }],
+            vec![ColumnDef::new(
+                "embedding".to_string(),
+                ColumnType::Vector(2),
+                false,
+            )],
         );
         let stmt = ValidatedStatement::new(
             "documents".to_string(),

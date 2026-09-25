@@ -72,8 +72,26 @@ macro_rules! define_error_classes {
     };
 }
 
+/// `wire_code` の重複を明示的に許容する集合（ERR-6。TABLE-16・TASK-204、
+/// Issue #904）。PostgreSQL の `not_null_violation` 相当コード `23502` は
+/// 本リポでは先に `USING OPERATION_ID` 句の省略（[`ErrorClass::
+/// MissingOperationId`]）へ割り当て済みだったため、新規に追加する NOT NULL
+/// 違反（[`ErrorClass::NotNullViolation`]）も同じ `wire_code` を共有し、`code`
+/// ラベル（[`ErrorClass::label`]）でのみ区別する。本モジュール下部の
+/// `wire_codes_are_pairwise_distinct_except_shared_wire_codes`
+/// テストがこの集合に載っていない `wire_code` の重複だけを偶発的な乖離として
+/// 検出する（`23505`（`UniqueViolation`）のように単一分類が複数原因を束ねる
+/// 既存パターンとは異なり、`SHARED_WIRE_CODES` は「分類そのものが複数、
+/// `wire_code` のみ共有」のケース専用）。
+///
+/// 本体は `#[cfg(test)]` の単体テストからのみ参照される（`pub(crate)` のため
+/// integration test crate からは到達できない）。通常ビルドでは未参照のため
+/// `dead_code` を明示的に許容する。
+#[allow(dead_code)]
+pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
+
 define_error_classes! {
-    count = 26;
+    count = 27;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -193,11 +211,26 @@ define_error_classes! {
     /// 存在しない（`34000`）。WIRE-15・TASK-218 が追加。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidCursorName`] の写像。
     InvalidCursorName => ("34000", "INVALID_CURSOR_NAME"),
+    /// 列に NOT NULL 制約が宣言されているにもかかわらず、値が省略またはNULL
+    /// として書き込まれた（TABLE-16・TASK-204、Issue #904）。`wire_code`
+    /// （`23502`）は [`ErrorClass::MissingOperationId`] と共有する
+    /// （[`SHARED_WIRE_CODES`] 参照。ERR-6 が `wire_code` の共有と `code`
+    /// ラベルによる区別を認める）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::NotNullViolation`] の写像。
+    NotNullViolation => ("23502", "NOT_NULL_VIOLATION"),
 }
 
 impl ErrorClass {
     /// `wire_code` からの逆引き。未知のコードは `None`（fail-closed。呼び出し元が
     /// 未知コードを既定分類へ丸めて誤った意味論を持たせることを防ぐ）。
+    ///
+    /// [`SHARED_WIRE_CODES`] に載る `wire_code`（現状 `23502` のみ）は複数分類が
+    /// 共有するため、本関数は [`ErrorClass::ALL`] の宣言順で最初に一致した分類
+    /// （`23502` の場合は [`ErrorClass::MissingOperationId`]）を返す。この関数は
+    /// HTTP ステータス射影の往復確認（同じ `wire_code` は同じステータスへ写像
+    /// される）にのみ使われ、応答本文の `code` ラベルは各エラー型の
+    /// `error_class()` が直接返す分類から得るため、共有コードの逆引きが
+    /// `code` ラベルの取り違えを起こすことはない。
     pub fn from_wire_code(code: &str) -> Option<ErrorClass> {
         ErrorClass::ALL.into_iter().find(|c| c.wire_code() == code)
     }
@@ -344,9 +377,26 @@ mod tests {
     }
 
     #[test]
-    fn wire_codes_are_pairwise_distinct() {
-        let codes: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
-        assert_eq!(codes.len(), ErrorClass::ALL.len());
+    fn wire_codes_are_pairwise_distinct_except_shared_wire_codes() {
+        // `SHARED_WIRE_CODES`（ERR-6）に載らない `wire_code` は従来どおり全分類で
+        // 一意でなければならない。偶発的な重複はこのテストが検出する。
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for class in ErrorClass::ALL {
+            *counts.entry(class.wire_code()).or_insert(0) += 1;
+        }
+        for (code, count) in &counts {
+            if SHARED_WIRE_CODES.contains(code) {
+                assert!(
+                    *count >= 2,
+                    "SHARED_WIRE_CODES に載る {code:?} は 2 分類以上で共有される想定"
+                );
+            } else {
+                assert_eq!(
+                    *count, 1,
+                    "{code:?} は SHARED_WIRE_CODES 外なので一意のはず"
+                );
+            }
+        }
     }
 
     /// モジュール冒頭が宣言する「収録範囲は現に返している `wire_code` に限る」
