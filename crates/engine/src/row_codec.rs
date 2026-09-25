@@ -419,6 +419,33 @@ impl<'a> ScalarRef<'a> {
         }
     }
 
+    /// `BYTEA` 前提の消費側（TABLE-13・TASK-197、Issue #886。
+    /// `declarative_filter` の範囲比較〔TASK-199、Issue #891〕から呼ばれる）が
+    /// `Text`/`Integer`/`BigInt`/`Bool`/`Array`/`Json`/`Enum`/`Numeric`/`Uuid`
+    /// を取り違えないよう、`Bytes` 以外は `None` を返す（fail-closed。
+    /// [`as_numeric`]/[`as_uuid`] と同方針）。
+    ///
+    /// [`as_numeric`]: ScalarRef::as_numeric
+    /// [`as_uuid`]: ScalarRef::as_uuid
+    pub fn as_bytes(&self) -> Option<&'a [u8]> {
+        match self {
+            ScalarRef::Bytes(b) => Some(b),
+            ScalarRef::Text(_)
+            | ScalarRef::Integer(_)
+            | ScalarRef::BigInt(_)
+            | ScalarRef::Real(_)
+            | ScalarRef::Double(_)
+            | ScalarRef::Bool(_)
+            | ScalarRef::Date(_)
+            | ScalarRef::Timestamp(_)
+            | ScalarRef::Array(_)
+            | ScalarRef::Json(_)
+            | ScalarRef::Enum(_)
+            | ScalarRef::Numeric(_)
+            | ScalarRef::Uuid(_) => None,
+        }
+    }
+
     /// `Text`／`Enum` のみを許す辞書化アクセサ（Issue #890。スカラー列二次索引
     /// 〔`sql::scalar_index::ScalarIndex`〕・`declarative_filter` の等価比較が
     /// ENUM 列を TEXT 列と同じ辞書表現で扱えるようにするための限定共有。
