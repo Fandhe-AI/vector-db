@@ -2701,8 +2701,15 @@ fn bind_file_insert(
                     "column {name:?}: VECTOR column must not be provided for file-form INSERT"
                 )))
             }
+            // INTEGER／BIGINT 列も他のスカラー型（REAL／DOUBLE PRECISION 等）と同じ
+            // 理由でファイル形 INSERT の対象外とする（Issue #881 レビュー指摘。
+            // typed INSERT/UPDATE/UPSERT 向けの `bind_integer_literal` をファイル形へ
+            // 露出させない。当初この分岐だけ他の非 TEXT 型より緩く受理していたのを
+            // codex/review・Cursor 指摘で是正）。
             (ColumnType::Integer | ColumnType::BigInt, _) => {
-                bind_integer_literal(name, column.ty.clone(), literal)?
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: INTEGER/BIGINT column is not supported for file-form INSERT"
+                )))
             }
             // REAL／DOUBLE PRECISION 列も他のスカラー型（BOOLEAN 等）と同じ理由で
             // ファイル形 INSERT の対象外とする（Issue #882 レビュー指摘。typed
@@ -5175,6 +5182,36 @@ mod tests {
         )
         .expect_err("DOUBLE PRECISION column must be rejected for file-form INSERT");
         assert_eq!(err_double.wire_code(), "22000");
+    }
+
+    #[test]
+    // codex/review P1・Cursor Medium 指摘（PR #1008・Issue #881）: `bind_file_insert`
+    // が INTEGER／BIGINT だけを typed INSERT 向け `bind_integer_literal` で受理し、
+    // REAL・DOUBLE・BOOLEAN 等の他の非 TEXT スカラー型と異なる緩い扱いになっていた。
+    // 他の非 TEXT 型と同じ `not supported for file-form INSERT`（`22000`）へ是正した
+    // ことを固定する。
+    fn bind_insert_form_file_form_rejects_integer_and_bigint_columns() {
+        let mut schema = file_docs_schema();
+        schema
+            .columns
+            .push(ColumnDef::new("count", ColumnType::Integer, true));
+        schema
+            .columns
+            .push(ColumnDef::new("big_count", ColumnType::BigInt, true));
+
+        let err_integer = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, count) VALUES ('a.txt', 'hello', 1) USING OPERATION_ID 'op-file-int'",
+            &schema,
+        )
+        .expect_err("INTEGER column must be rejected for file-form INSERT");
+        assert_eq!(err_integer.wire_code(), "22000");
+
+        let err_bigint = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, big_count) VALUES ('a.txt', 'hello', 1) USING OPERATION_ID 'op-file-bigint'",
+            &schema,
+        )
+        .expect_err("BIGINT column must be rejected for file-form INSERT");
+        assert_eq!(err_bigint.wire_code(), "22000");
     }
 
     #[test]
