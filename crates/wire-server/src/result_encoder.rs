@@ -955,9 +955,14 @@ pub fn encode_command_complete(tag: &str) -> Result<Vec<u8>, EncodeError> {
 /// 状態 1）。`crate::handshake::write_ready_for_query` から使う唯一のレイアウト
 /// 実体（Issue #481。以前は同モジュール内にバイト列組み立てが個別に存在し、
 /// `crate::response_buffer::ResponseBuffer` へ他フレームと同じ形で積める
-/// フレームが無かった）。状態は常に `'I'`（idle・トランザクション外）で固定
-/// ―― 本実装は明示トランザクション（`BEGIN`/`COMMIT`）を持たないため。
-pub fn encode_ready_for_query() -> [u8; 6] {
+/// フレームが無かった）。状態バイトは `status`（[`engine::sql::transaction::
+/// SessionTransaction::status`] が返す接続単位の明示トランザクション状態。
+/// SQL-31・TASK-221・WIRE-19）をそのまま `'I'`（idle）／`'T'`（in transaction）／
+/// `'E'`（failed transaction）へ写像する。呼び出し元が明示トランザクションを
+/// 持たない箇所（ハンドシェイク直後・COPY サブプロトコル。COPY は明示
+/// トランザクション中には到達しない）は `TransactionStatus::Idle` を渡す。
+pub fn encode_ready_for_query(status: engine::sql::transaction::TransactionStatus) -> [u8; 6] {
+    use engine::sql::transaction::TransactionStatus;
     let mut msg = [0u8; 6];
     msg[0] = b'Z';
     let len_bytes = 5i32.to_be_bytes();
@@ -965,7 +970,11 @@ pub fn encode_ready_for_query() -> [u8; 6] {
     msg[2] = len_bytes[1];
     msg[3] = len_bytes[2];
     msg[4] = len_bytes[3];
-    msg[5] = b'I';
+    msg[5] = match status {
+        TransactionStatus::Idle => b'I',
+        TransactionStatus::InTransaction => b'T',
+        TransactionStatus::Failed => b'E',
+    };
     msg
 }
 
@@ -1357,8 +1366,21 @@ mod tests {
 
     #[test]
     fn ready_for_query_has_fixed_layout() {
-        let msg = encode_ready_for_query();
+        let msg = encode_ready_for_query(engine::sql::transaction::TransactionStatus::Idle);
         assert_eq!(msg, [b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    #[test]
+    fn ready_for_query_reflects_in_transaction_status() {
+        let msg =
+            encode_ready_for_query(engine::sql::transaction::TransactionStatus::InTransaction);
+        assert_eq!(msg, [b'Z', 0, 0, 0, 5, b'T']);
+    }
+
+    #[test]
+    fn ready_for_query_reflects_failed_status() {
+        let msg = encode_ready_for_query(engine::sql::transaction::TransactionStatus::Failed);
+        assert_eq!(msg, [b'Z', 0, 0, 0, 5, b'E']);
     }
 
     #[test]
