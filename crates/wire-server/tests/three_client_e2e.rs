@@ -53,6 +53,14 @@
 //! （`three_clients_receive_emergency_response_detail_after_post_commit_panic`）。
 //! `--fault-inject` は 1 プロセスにつき 1 回しか発火しない take-once 契約
 //! （Issue #705）のため、クライアントごとに独立したサーバー・DB を起動する。
+//!
+//! WIRE-19（Issue #943）: 明示トランザクションの `ReadyForQuery` 状態バイト
+//! （`'I'`/`'T'`/`'E'`。production の中核は Issue #942・PR #1041 で実装済み）
+//! が無改造クライアント自身の API から観測できることを
+//! `three_clients_observe_transaction_status_transitions` で確認する。
+//! 各ドライバの観測経路の選定理由・非 vacuous 性の検証は
+//! `docs/design/three-client-e2e-harness.md`「トランザクション状態遷移
+//! （Issue #943・WIRE-19）」節参照。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -442,8 +450,9 @@ fn insert_sql(id: u64, op: &str) -> String {
 }
 
 /// psql（無改造）でトランザクション状態の反映を**間接的に**確認する。psql
-/// は libpq と同じく `\set AUTOCOMMIT off` の下では接続の transaction
-/// status が `IDLE` のときに限り次の文の前に暗黙の `BEGIN` を送る
+/// は `\set AUTOCOMMIT off` の下では、libpq が `ReadyForQuery` の状態バイト
+/// から導出する `PQtransactionStatus()` を見て、`IDLE` のときに限り
+/// 次の文の前に暗黙の `BEGIN` を送る
 /// （`docs/design/three-client-e2e-harness.md`「トランザクション状態遷移
 /// （Issue #943・WIRE-19）」節参照。プロンプト文字列 `%x` は対話端末専用の
 /// ため非対話実行では観測できず採らない判断の記録も同節にある）。

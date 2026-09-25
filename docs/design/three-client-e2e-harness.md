@@ -670,8 +670,10 @@ WIRE-19。production の中核は Issue #942（PR #1041）で実装済み——
 - **psycopg**（`three_client/psycopg_txn_status.py`）: `psycopg.pq.
   TransactionStatus`（`IDLE`/`INTRANS`/`INERROR`）と `conn.info.
   transaction_status` が公開 API として存在する。`autocommit=False`
-  （既定）で接続すると、psycopg 自身が libpq と同じくこの状態を追跡し、
-  `IDLE` のときだけ次の文の前に暗黙の `BEGIN` を送る。本番の
+  （既定）で接続すると、psycopg 自身が（受信した `ReadyForQuery` の状態
+  バイトから）この状態を追跡し、`IDLE` のときだけ次の文の前に暗黙の
+  `BEGIN` を送る（libpq に autocommit の概念はなく、この判断・送出は
+  psycopg 自身が行う）。本番の
   `ReadyForQuery` が常に `'I'` のまま（不具合を仮定した）だと、2 文目の
   前にも `BEGIN` が再送されて「入れ子の `BEGIN`」（`25001`）が観測される
   はずであり、これが本スクリプトの検出対象。
@@ -687,8 +689,10 @@ WIRE-19。production の中核は Issue #942（PR #1041）で実装済み——
   エスケープであり、非対話実行（`-c` の並び）では表示されないため
   観測できない。pty ラッパー（`script` コマンド）での対話プロンプト検証は
   flaky になりやすいため採らない。代わりに `\set AUTOCOMMIT off` の
-  **挙動**で間接的に確認する: この設定下では libpq（psql の下位層）が
-  `IDLE` のときだけ暗黙の `BEGIN` を送る。`ReadyForQuery` が常に `'I'`
+  **挙動**で間接的に確認する: この設定下では psql が libpq の
+  `PQtransactionStatus()`（`ReadyForQuery` の状態バイトから libpq が
+  導出する）を見て、`IDLE` のときだけ暗黙の `BEGIN` を送る。
+  `ReadyForQuery` が常に `'I'`
   のまま返る不具合があれば、`INSERT` の後の `SELECT` の前にも `BEGIN` が
   再送されて「入れ子の `BEGIN`」（`25001`）に倒れ、続く `COMMIT` も
   `25P02` で拒否されて非 0 終了する。正しく `'T'` を反映していれば

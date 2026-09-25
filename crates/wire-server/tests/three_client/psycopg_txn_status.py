@@ -4,12 +4,14 @@
 
 `crates/wire-server/tests/three_client_e2e.rs`（`#[ignore]`）から子プロセスと
 して起動される。`psycopg_client.py` と異なり、本スクリプトは意図的に
-`autocommit=False` で接続する ―― psycopg 3 は libpq と同じく接続の transaction
-status が `IDLE` のときに限り、最初の文の送信前に暗黙の `BEGIN` を自動送出する
-（`docs/design/three-client-e2e-harness.md`「トランザクション状態遷移（Issue #943・
+`autocommit=False` で接続する ―― psycopg 3 自身が（受信した `ReadyForQuery`
+の状態バイトから）接続の transaction status を追跡し、`IDLE` のときに限り
+最初の文の送信前に暗黙の `BEGIN` を自動送出する（libpq に autocommit の
+概念はなく、この判断・送出は psycopg 自身が行う。
+`docs/design/three-client-e2e-harness.md`「トランザクション状態遷移（Issue #943・
 WIRE-19）」節参照）。もし wire-server が `ReadyForQuery` の状態バイトを常に
 `'I'` のまま返す不具合があれば、2 文目の前にも `BEGIN` が再送されて
-`server::sql::transaction` の「入れ子の BEGIN」（`25001`）が観測されるはずであり、
+`engine::sql::transaction` の「入れ子の BEGIN」（`25001`）が観測されるはずであり、
 これは本スクリプトが検出する不具合クラスの 1 つである。
 
 各段の後、psycopg 3 の `conn.info.transaction_status`
