@@ -248,78 +248,134 @@ f64 経由（損失あり）で行う可能性に備え、絶対値が `2^53`（
 fail-closed に縮退する（`INTEGER`・`DATE` は値域が構造的にこの上限に収まる
 ため対象外にしない）。ちょうど `2^53`（絶対値）は境界として索引に残る。
 
-### `#891` 依存によるスコープ限定
+### `#891` レーン B との production 結線（本 Issue のスコープ）
 
 本 Issue 着手時点（2026-09-25）で `#891`（新スカラー型の `WHERE` 述語・式
-評価表現）は未マージだった。新スカラー型の列は `sql::udf_call::bind_expr_in`
-がまだ列参照そのものを `22000` で拒否しており、`declarative_filter::FilterOp`
-にも数値・日時型の範囲比較 variant が存在しないため、**SQL 表層（`WHERE`
-句）から本索引の typed 経路へ到達する構文が現時点で存在しない**。
+評価対応）は未マージだった。着手当初は、`declarative_filter::FilterOp` に
+数値・日時型の範囲比較 variant が存在しないため「SQL 表層（`WHERE` 句）から
+本索引の typed 経路へ到達する構文が現時点で存在しない」という前提で、索引
+データ構造・照会 API のみを実装し production 結線を見送っていた。
 
-このため本 Issue は次のスコープに限定した:
+その後 `#891` が同一 PR 内（PR #1032）でマージされ、`declarative_filter::
+FilterOp::TypedCompare`（`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の
+等価・範囲比較。TASK-199・レーン B）が `sql::exec`・`sql::aggregate`・
+`sql::group_by` の `bound.metadata_filters` へ既に混在して渡ってくる状態と
+なった。codex-review 指摘（PR #1032）を受け、本 Issue のスコープ内で
+`TypedCompare` を実際に候補削減へ接続した。
 
-- 索引データ構造・照会 API（`OrderedColumnIndex`・`candidates_typed_range`）は
-  完全実装し、brute-force オラクル対照の単体テストで正しさを固定した。
-- `sql::scalar_plan::TypedRangePredicate`（`#891` の述語表現から
-  `candidates_typed_range` の引数形へ正規化した表現。`IdPredicate`／
-  `id_bounds` の typed 版に相当）は型定義のみ用意し、`BoundExpr` から本型への
-  変換アダプタ（`id_predicate_from_expr` の typed 版に相当）は実装していない
-  （`#891` の述語表現が確定していないため実装すると `#891` と重複・競合する）。
-- `ScalarIndex::resolve_candidates` は `typed_preds: &[TypedRangePredicate]`
-  引数を追加済みで、`sql::exec`・`sql::aggregate`・`sql::group_by` の 3 呼び
-  出し元はすべて配線済みだが、アダプタ未接続のため常に空スライス（no-op）を
-  渡す。
-- `sql::scalar_plan::ScalarPlan`（`classify_scalar_plan` の分類結果）・
-  `EXPLAIN` の `scalar_plan:` トークンはいずれも無変更——typed 述語を分類する
-  `IndexRange` 相当の variant は、それを実際に返す経路（`#891` アダプタ）が
-  無い状態で追加すると「一度も構築されない enum variant」になり、
-  `-D warnings` 下の `dead_code` 検出（`clippy --all-targets`）に抵触する
-  ため見送った。
+`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`（レーン A: 算術式・`sql::udf_call`／
+`sql::expr_program` 経由の `WHERE` 比較）は、`#891` の対象外として別 Issue
+（未着手）へ切り出されたままのため、引き続き `WHERE` 述語表現が SQL 表層に
+存在しない。この 4 型は本 Issue でも索引化しない。
 
-`#891` 接続後の残作業（別 Issue の担当）:
+### 結線方式: `MetadataFilter` を型ごとに振り分ける単一入口
 
-1. `BoundExpr`／`declarative_filter::WherePredicate` 側に新スカラー型の
-   範囲比較表現が確定した時点で、`typed_predicate_from_expr`（`id_predicate_from_expr`
-   に相当）を実装し `TypedRangePredicate` へ正規化する。
-2. `classify_scalar_plan` を `typed_preds` を受け取る形へ拡張し
-   （既存 `classify_scalar_plan` は空スライスで委譲する後方互換シグネチャを
-   維持できる）、`ScalarPlan::IndexRange`（もしくは `IndexConjunction` への
-   合流）を追加する。
-3. `EXPLAIN` の `scalar_plan:` トークンへ `index_range` を追記する。
-4. 索引で完全被覆された typed 述語の信頼マスク（Issue #844 の `mask_trusted_defer`
-   等）への昇格は、索引と評価器の同値性を性質テストで固定したうえで別途判断する
-   （本 Issue 時点では意図的に対象外のまま——`resolve_candidates` は typed
-   述語の候補も従来どおり `on_visible_row` の多層防御を経由する）。
+`TypedRangePredicate`（`BoundExpr` から `candidates_typed_range` の引数形へ
+正規化する、着手当初に用意したアダプタ型）は採用しなかった。代わりに
+`ScalarIndex::candidates_for`（`TEXT` 列の `Equals`／`StartsWith` と同じ
+`MetadataFilter` を受け取る既存の単一入口）を、`FilterOp::TypedCompare` の
+場合は `self.typed_columns` へ振り向ける形へ拡張した
+（`ScalarIndex::typed_compare_candidates`。private ヘルパー）。
+
+理由: `TypedCompare` は宣言的フィルタ API（`declarative_filter::bind_all`）
+が既に `TEXT` 等価・前方一致と同じ `Vec<MetadataFilter>` へ束縛済みであり、
+`sql::exec`・`sql::aggregate`・`sql::group_by` の 3 呼び出し元がそれぞれ型
+ごとに振り分けるアダプタ・専用の述語スライスを新設する必要がない
+（`resolve_candidates` のシグネチャは `metadata_filters`・`id_preds` の 2 引数
+のまま不変。第 3 引数 `typed_preds: &[TypedRangePredicate]` は削除した）。
+
+`DATE`／`TIMESTAMP`／`UUID` は列・リテラルともに同一表現の厳密な整数キー
+（`i64`／`u128`）のため、境界は `checked_add`/`checked_sub` による単純な
+整数境界導出（`exact_i64_bounds`／`exact_u128_bounds`）で足りる。`NUMERIC`
+はリテラル（`parse_literal_exact` 由来の任意 `scale`）が列固定の `scale` と
+異なりうるため、`numeric::rescale_bounds_for_column`（新設。`cmp_exact` と
+同じ「丸めない」比較意味論を保ったまま列 `scale` 側の整数境界へ変換する。
+リテラルが列の格子に乗らない場合は床（`div_euclid`/`rem_euclid`）で位置を
+求め、余りの有無で `Gt`/`Ge`/`Lt`/`Le`/`Eq` の境界を導出する——
+`sql::scalar_plan::id_bounds` の非整数リテラル処理と同型）へ委譲する。
+`OrderedColumnIndex::I128`（`NUMERIC` 用）は列固定の `scale` を第 2 要素と
+して一緒に保持し、境界計算に使う。
+
+`BYTEA` 列の `TypedCompare`（`TypedLiteral::Bytes`）は `OrderedColumnIndex`
+に対応 variant を持たないため引き続き未対応のまま（`candidates_for` が
+`None` を返し `sql::scalar_plan::classify_scalar_plan` が `PlainScan` へ
+縮退させる）。
+
+### `ScalarIndex::build` のレーン別構築
+
+`ScalarIndex::build`（production の既定入口）は、`DATE`／`TIMESTAMP`／
+`NUMERIC`／`UUID`（レーン B。`candidates_for` から常に照会可能）は常に構築
+する一方、`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`（レーン A。`WHERE` 述語表現が
+まだ存在せず一度も照会されない）は `BOOLEAN` 等と同じ非索引化（`None`）へ
+構築を遅延させたまま維持する（未接続の索引だけが原因で既存の `TEXT`／
+`ENUM` 索引まで `MAX_SCALAR_INDEX_BYTES` 超過に巻き添えにしない。下記
+「レビュー対応」節の判断を踏襲）。レーン A 列の構築ロジックそのもの
+（`OrderedColumnIndex::I64`／`F64Sortable` の値変換・`2^53` ゲート等）を
+検証する単体テストは、引き続きテスト専用の
+`ScalarIndex::build_including_unwired_typed_range_columns`（`#[cfg(test)]`）
+経由で行う。
+
+### `ScalarPlan::IndexTypedRange`・信頼マスクへの合流
+
+`sql::scalar_plan::ScalarPlan` へ `IndexTypedRange` variant（単独の
+`TypedCompare` 述語。2 件以上は既存の `IndexConjunction` に合流）を追加し、
+`EXPLAIN` の `scalar_plan:` トークンへ `index_typed_range` を追記した。
+`classify_scalar_plan` は `BoolEquals` と同じ理由で `BYTEA` の
+`TypedCompare` のみ先頭で `PlainScan` へ倒し、それ以外の `TypedCompare` は
+索引対応述語として扱う。
+
+`resolve_candidates` が `Use` を返した場合、`sql::exec::mask_trusted_defer`・
+`sql::aggregate::count_star_only`・`sql::group_by::observe_group_count_only`
+（Issue #844 の限定緩和）は述語の型を区別せず `classify_scalar_plan !=
+PlainScan` を単一の判定条件として使うため、`IndexTypedRange` もこれらの
+信頼マスクへ自然に合流する（追加のゲーティングは設けていない。索引の候補
+削減が `numeric::cmp_exact`・`declarative_filter::CompareOp::accepts` と
+一致するふるい分けであることは、ブルートフォースオラクル対照の単体テスト
+——`numeric::tests::rescale_bounds_for_column_matches_cmp_exact_oracle`・
+`sql::scalar_index::tests::candidates_typed_range_matches_brute_force_
+oracle_for_each_type`・`sql::scalar_index::tests::resolve_candidates_*_
+typed_compare_*`——と、`tests/scalar_index_typed_range.rs` の SQL 表層結合
+テスト（cold/hot 等価性・RLS 非漏えい・世代進行後の再構築一貫性）の両方で
+固定している）。
 
 ### 対象ファイル（本 Issue 分）
 
 | パス | 変更 |
 | --- | --- |
-| `crates/engine/src/sql/scalar_index.rs` | `OrderedColumnIndex`・`TypedKey`・`typed_columns`・`push_typed_value`・`candidates_typed_range`・`resolve_candidates` の `typed_preds` 引数・予算計上関数・単体テスト |
-| `crates/engine/src/sql/scalar_plan.rs` | `TypedRangePredicate`（アダプタ未実装。`#[cfg_attr(not(test), allow(dead_code))]`） |
-| `crates/engine/src/sql/exec.rs`・`aggregate.rs`・`group_by.rs` | `resolve_candidates` 呼び出しへ `&[]` を追加（配線のみ・挙動不変） |
+| `crates/engine/src/sql/scalar_index.rs` | `OrderedColumnIndex`（`I128` へ列 `scale` 追加）・`TypedKey`・`typed_columns`・`push_typed_value`・`candidates_for`（`TypedCompare` 分岐・`typed_compare_candidates`）・`candidates_typed_range`（テスト専用に縮小）・`resolve_candidates`（`typed_preds` 引数を削除）・`build`（レーン B を常に構築）・単体テスト |
+| `crates/engine/src/numeric.rs` | `rescale_bounds_for_column`・単体テスト |
+| `crates/engine/src/declarative_filter.rs` | `CompareOp::accepts` を `pub(crate)` へ昇格 |
+| `crates/engine/src/sql/scalar_plan.rs` | `ScalarPlan::IndexTypedRange`・`classify_scalar_plan`（`BYTEA` のみ `PlainScan` へ限定）・`TypedRangePredicate` を削除 |
+| `crates/engine/src/sql/explain.rs` | `scalar_plan_token` へ `index_typed_range` 追加 |
+| `crates/engine/src/sql/exec.rs`・`aggregate.rs`・`group_by.rs` | `resolve_candidates` 呼び出しを 2 引数へ更新（コメント更新のみ・呼び出し形状は不変） |
+| `crates/engine/tests/scalar_index_typed_range.rs` | 新設。SQL 表層結合テスト（cold/hot 等価性・NUMERIC の scale 不一致・RLS・世代進行・`BYTEA` フォールバック） |
 
-依存追加なし・`unsafe` なし・spec 本文転記なし。既存クエリの挙動・`EXPLAIN`
-出力・Recall ゲートはいずれも本 Issue の前後で完全に不変（typed 述語が実際に
-発生する経路が無いため）。
+依存追加なし・`unsafe` なし・spec 本文転記なし。`TEXT`・`id` の既存索引経路
+（`Equals`／`StartsWith`／`IndexIdRange`／`IndexConjunction`）の挙動・
+`EXPLAIN` 出力・Recall ゲートはいずれも本 Issue の前後で完全に不変（新しい
+`TypedCompare` 述語を含まないクエリの分類・候補削減は無変更のまま）。
 
-### レビュー対応: 未接続 typed 索引の構築遅延（PR #1032 codex-review 指摘）
+### レビュー対応: 未接続 typed 索引の構築遅延（PR #1032 codex-review 指摘。解消済み）
 
-`resolve_candidates` の `typed_preds` 引数が `sql::exec`／`sql::aggregate`／
-`sql::group_by` から常に空スライスでしか渡されない（上記「`#891` 依存による
-スコープ限定」）にもかかわらず、`ScalarIndex::build`（production が呼ぶ既定
+本 Issue の当初実装では、`resolve_candidates` の `typed_preds` 引数が
+`sql::exec`／`sql::aggregate`／`sql::group_by` から常に空スライスでしか
+渡されないにもかかわらず、`ScalarIndex::build`（production が呼ぶ既定
 入口）はこれら未接続の typed 列（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`／
 `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`）についても `row_count` 件分のメモリ
 確保・全行キー生成・ソートを常に行っていた。これにより、既存の `TEXT`／
 `ENUM` 索引だけなら `MAX_SCALAR_INDEX_BYTES` に収まっていたはずのテーブルで、
 一度も照会されない typed 索引の分だけ予算を消費し `TooLarge`（plain scan
-縮退）へ巻き添えになり得る退行リスクがあった。
+縮退）へ巻き添えになり得る退行リスクがあった（codex-review P2 指摘）。
 
-`TypedRangePredicate` の本線配線（`#891` 接続後の別 Issue）を待たずに解消
-するため、`ScalarIndex::build`（production 経路の既定入口）は typed 列の
-構築を `BOOLEAN` 等と同じ非索引化（`None`）へ遅延させた。typed 索引の構築
-ロジックそのもの（`OrderedColumnIndex`・`candidates_typed_range`・`2^53`
-ゲート等）を検証する単体テストは、テスト専用の
-`ScalarIndex::build_including_unwired_typed_range_columns`（`#[cfg(test)]`）
-経由に切り替えて維持した。`#891` 配線後は `ScalarIndex::build` 側に
-本ロジックを戻す想定（上記「`#891` 接続後の残作業」に合流）。
+さらに codex-review P1 指摘（同 PR）は、`#891` のレーン B（`TypedCompare`）
+が既に production 結線済みであり、`sql::scalar_plan::TypedRangePredicate`
+（`BoundExpr` からの変換アダプタ未実装）を新設するのではなく既存の
+`TypedCompare` を索引境界へ正規化して候補解決へ接続すべきだと指摘した。
+
+この 2 指摘への対応として、`ScalarIndex::build` はレーン B（`DATE`／
+`TIMESTAMP`／`NUMERIC`／`UUID`）を常に構築し `candidates_for` から実際に
+照会されるようにした一方、レーン A（`INTEGER`／`BIGINT`／`REAL`／`DOUBLE`。
+`WHERE` 述語表現が依然として存在しない）は `BOOLEAN` 等と同じ非索引化
+（`None`）へ構築を遅延させたまま維持し、未接続の索引だけが原因で既存の
+`TEXT`／`ENUM` 索引が巻き添えになる退行リスクを解消した（上記「`ScalarIndex::
+build` のレーン別構築」節参照）。

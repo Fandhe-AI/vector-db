@@ -122,18 +122,14 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
 （`sql::scalar_index::OrderedColumnIndex::I64`。`DATE` は日数、`TIMESTAMP`
 はマイクロ秒。`TIMESTAMP` の絶対値が `2^53` を超える値を 1 件でも含む列は
 列単位で索引対象外へ縮退する。`DATE` は値域が `i32` のため構造的にこの上限
-に収まる）で索引化するロジック自体は実装した。WHERE の比較・等価述語
-自体は #891・TASK-199 で結線済み（下記「対象外（申し送り）」参照）だが、
-新しい範囲比較述語は二次索引が未対応のため常に `PlainScan` へ縮退する
-（`BoolEquals` と同じ fail-closed 方針）。production 経路の既定入口
-`ScalarIndex::build` はこの縮退により構築コストだけを負う退行を避ける
-ため、typed 列（`DATE`／`TIMESTAMP` を含む）の構築を `BOOLEAN` 等と
-同じ非索引化（`None`）へ遅延させている（codex-review P2 指摘・PR #1032）。
-索引化ロジックの単体テストはテスト専用入口
-`ScalarIndex::build_including_unwired_typed_range_columns` 経由でのみ検証
-され、SQL 表層からは引き続き未到達のまま。詳細は
-`docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」節
-参照。
+に収まる）で索引化し、WHERE の比較・等価述語（#891・TASK-199 で結線済み。
+下記「対象外（申し送り）」参照）から実際に候補削減へ消費される production
+結線まで完了した（`sql::scalar_index::ScalarIndex::candidates_for` が
+`FilterOp::TypedCompare` を直接消費し、`EXPLAIN` の `scalar_plan:` トークンに
+`index_typed_range` を追加。codex-review 指摘・PR #1032）。`ScalarIndex::
+build`（production の既定入口）は `DATE`／`TIMESTAMP` を常に構築する。
+詳細は `docs/design/scalar-index-prune.md`「Issue #893」節・「レビュー対応」
+節参照。
 
 ## 対象外（申し送り）
 

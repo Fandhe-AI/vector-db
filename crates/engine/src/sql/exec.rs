@@ -1183,14 +1183,16 @@ pub(crate) fn execute_statement_with_cache(
                                         .iter()
                                         .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
                                         .collect();
-                                    // Issue #893: 数値・日時・`NUMERIC`・`UUID`
-                                    // 列の範囲述語（`TypedRangePredicate`）は、
-                                    // 新スカラー型の `WHERE` 述語表現アダプタ
-                                    // 未接続のため常に空スライス（no-op）。
+                                    // 数値・日時・`NUMERIC`・`UUID` 列の範囲
+                                    // 述語（`FilterOp::TypedCompare`。Issue
+                                    // #891・TASK-199 で production 結線済み）は
+                                    // `bound.metadata_filters` に混在したまま
+                                    // 渡り、`ScalarIndex::candidates_for` が
+                                    // 内部で振り分ける（Issue #893 production
+                                    // 接続）。
                                     match index.resolve_candidates(
                                         &bound.metadata_filters,
                                         &id_preds,
-                                        &[],
                                     ) {
                                         crate::sql::scalar_index::CandidateResolution::Use(
                                             slots,
