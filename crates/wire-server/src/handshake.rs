@@ -728,16 +728,19 @@ fn post_auth_loop<'e>(
             }
             b'D' => {
                 // WIRE-11（Issue #933）: Describe。`b'P'` と同じ engine 有無の分岐。
-                match engine {
-                    Some(engine) => {
+                // WIRE-15・TASK-218: `txn`（`engine` と Some/None が一致する—— 上の
+                // `let mut txn = engine.map(...)` 参照）も渡し、`FETCH` の Describe が
+                // 開いているカーソルの列メタデータを参照できるようにする。
+                match (engine, txn.as_mut()) {
+                    (Some(engine), Some(txn)) => {
                         match crate::extended_query::handle_describe(
-                            stream, engine, session, extended,
+                            stream, engine, session, txn, extended,
                         )? {
                             crate::extended_query::LoopSignal::Continue => {}
                             crate::extended_query::LoopSignal::Closed => return Ok(()),
                         }
                     }
-                    None => {
+                    _ => {
                         framing::validate_typed_message_length_prefix(
                             stream,
                             framing::MIN_TYPED_MESSAGE_LEN,

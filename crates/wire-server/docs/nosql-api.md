@@ -668,6 +668,7 @@ Date: <IMF-fixdate>
 | `28000` | `AUTH_REQUIRED` | 401 | Unauthorized | `Authorization` ヘッダ欠落 |
 | `28P01` | `AUTH_INVALID` | 401 | Unauthorized | トークン形式不正・失効・セッション未存在 |
 | `42501` | `FORBIDDEN_TENANT_MISMATCH` | 403 | Forbidden | NoSQL 表層の実要求からは到達不能（射影のみ production エンコーダで固定。後述） |
+| `34000` | `INVALID_CURSOR_NAME` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（カーソル〔`DECLARE`／`FETCH`／`CLOSE`〕は SQL 表層専用で op 許可リストに無い。後述） |
 | `42P01` | `TABLE_NOT_FOUND` | 404 | Not Found | 未定義テーブルへの `search`／`scan`／`aggregate`／`insert` |
 | `P0002` | `ROW_NOT_FOUND` | 404 | Not Found | NoSQL 表層の実要求からは到達不能（対応する op が許可リストに無い。後述） |
 | `23505` | `UNIQUE_VIOLATION` | 409 | Conflict | `insert` の `operation_id` 重複（内容一致の再送） |
@@ -678,12 +679,15 @@ Date: <IMF-fixdate>
 | `53300` | `CONNECTION_LIMIT_EXCEEDED` | 503 | Service Unavailable | 接続数上限（64）超過、同時有効セッション数上限（256）超過 |
 | `55P03` | `LOCK_NOT_AVAILABLE` | 503 | Service Unavailable | SQL 表層の明示トランザクション（SQL-31・TASK-221）が単一ライタを保持している間に、書き込み op（`insert`／`update`／`delete`）が書き込みゲートの待機上限を超えた |
 
-到達不能な 8 分類（`42501`・`P0002`・`42701`・`42P07`・`25000`・`25001`・
-`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
+到達不能な 9 分類（`42501`・`34000`・`P0002`・`42701`・`42P07`・`25000`・
+`25001`・`25P01`・`25P02`）の理由: NoSQL 表層はテナントをセッション
 （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己申告の
 `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で先に拒否する
 ため、`ForbiddenTenantMismatch` を実要求から誘発する経路が構造的に存在しない。
 `RowNotFound` に対応する op（更新・削除系）も NoSQL 表層の許可リストに無い。
+`InvalidCursorName`（`34000`。WIRE-15・TASK-218）はカーソル（`DECLARE`／
+`FETCH`／`CLOSE`）専用の分類だが、NoSQL 表層の `op` 許可リストにカーソル
+操作は無いため実要求からは到達しない。
 `DuplicateColumn`（`42701`）・`DuplicateTable`（`42P07`）は `CREATE TABLE`
 （SQL-23・TASK-202・Issue #899）が誘発する分類だが、NoSQL 表層の `op` 許可
 リストに `create_table` 相当が無いため実要求からは到達しない（`docs/design/

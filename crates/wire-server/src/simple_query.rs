@@ -540,6 +540,20 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::DropTable(_) => OutcomeResponse::Command {
             tag: "DROP TABLE".to_string(),
         },
+        // WIRE-15・TASK-218: `DECLARE`／`CLOSE` は件数を持たない固定タグの
+        // `CommandComplete`。`FETCH` は検索 SELECT と同じ `RowDescription`／
+        // `DataRow`* エンコードを再利用し、タグの数値部分は実際に送出した
+        // 行数（分割送出時は 1 回の Execute で送った行数）にする。
+        SqlOutcome::DeclareCursor => OutcomeResponse::Command {
+            tag: "DECLARE CURSOR".to_string(),
+        },
+        SqlOutcome::Fetch(result) => OutcomeResponse::Rows {
+            result,
+            shape: TagShape::Dynamic("FETCH"),
+        },
+        SqlOutcome::CloseCursor => OutcomeResponse::Command {
+            tag: "CLOSE CURSOR".to_string(),
+        },
     }
 }
 

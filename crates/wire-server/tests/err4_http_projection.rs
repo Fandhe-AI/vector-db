@@ -15,13 +15,15 @@
 //! [`err4_projection_table_is_closed_over_all_error_classes`] で機械的に
 //! 固定する。production コードは変更しない（テスト専任）。
 //!
-//! 到達不能類型（`42501`・`P0002`）の扱い: NoSQL 表層はテナントをセッション
+//! 到達不能類型（`42501`・`P0002`・`34000`）の扱い: NoSQL 表層はテナントをセッション
 //! （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己
 //! 申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で
 //! 先に拒否する（`gate.rs`・`session/middleware.rs`・`router.rs`）ため、
 //! `ForbiddenTenantMismatch`（`42501`）を実要求から誘発する経路が構造的に
 //! 存在しない。`RowNotFound`（`P0002`）に対応する op（更新・削除系）も
-//! NoSQL 表層の許可リストに無い。これらはテナント境界の検査を緩める・
+//! NoSQL 表層の許可リストに無い。`InvalidCursorName`（`34000`。WIRE-15・
+//! TASK-218）はカーソル（`DECLARE`／`FETCH`／`CLOSE`）専用の分類で、NoSQL
+//! 表層の `op` 許可リストにカーソル操作が無いため実要求からは到達しない。これらはテナント境界の検査を緩める・
 //! バイパスする production 経路を新設せず（`.claude/rules/security.md`
 //! P0）、production の応答エンコーダ（`http::response::encode_error`。
 //! ルータ・各 op ハンドラが実際に使う関数）を通したバイト列を実応答と同じ
@@ -193,11 +195,12 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 25] = [
+const EXPECTED_STATUS: [(&str, u16); 26] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
     ("42501", 403),
+    ("34000", 404),
     ("42P01", 404),
     ("P0002", 404),
     ("23505", 409),
@@ -277,7 +280,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 25);
+const _: () = assert!(ErrorClass::ALL.len() == 26);
 
 #[test]
 fn err4_projection_table_is_closed_over_all_error_classes() {
@@ -649,7 +652,8 @@ fn err4_f_internal_error_projects_xx000_to_500() {
     assert_projected(&resp, "XX000");
 }
 
-/// `42501`（テナント越境）・`P0002`（行不在）・明示トランザクション制御
+/// `42501`（テナント越境）・`P0002`（行不在）・`34000`（カーソル不在。
+/// WIRE-15・TASK-218）・明示トランザクション制御
 /// （SQL-31・TASK-221。`25000`/`25001`/`25P01`/`25P02`）は NoSQL 表層の
 /// 実要求からは構造的に到達不能（本ファイル冒頭 doc 参照。NoSQL 表層の `op`
 /// 許可リストにトランザクション制御が無い）。要求駆動ではなく、
@@ -667,6 +671,7 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
     for class in [
         ErrorClass::ForbiddenTenantMismatch,
         ErrorClass::RowNotFound,
+        ErrorClass::InvalidCursorName,
         ErrorClass::DuplicateTable,
         ErrorClass::DuplicateColumn,
         ErrorClass::InvalidTransactionState,

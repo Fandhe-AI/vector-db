@@ -1058,6 +1058,7 @@ pub(crate) fn handle_describe(
     stream: &mut TcpStream,
     engine: &EngineCore,
     session: &SessionState,
+    txn: &engine::sql::transaction::SessionTransaction<'_>,
     state: &mut ExtendedQueryState,
 ) -> io::Result<LoopSignal> {
     let body = match framing::read_length_prefixed_body(
@@ -1074,7 +1075,7 @@ pub(crate) fn handle_describe(
         }
     };
 
-    match handle_describe_body(engine, session, state, &body) {
+    match handle_describe_body(engine, session, txn, state, &body) {
         Ok(DescribeResult::Statement(columns)) => {
             write_describe_response(stream, true, columns)?;
             Ok(LoopSignal::Continue)
@@ -1155,6 +1156,7 @@ fn write_describe_response_portal(
 fn handle_describe_body(
     engine: &EngineCore,
     session: &SessionState,
+    txn: &engine::sql::transaction::SessionTransaction<'_>,
     state: &ExtendedQueryState,
     body: &[u8],
 ) -> Result<DescribeResult, HandlerError> {
@@ -1167,8 +1169,13 @@ fn handle_describe_body(
                 .ok_or(HandlerError::UnknownStatement)?;
             let columns = match statement {
                 PreparedStatement::Empty => None,
+                // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替え、
+                // `ParsedSql::Cursor(CursorStatement::Fetch { .. })` に限り
+                // `txn` が保持する開いているカーソルの列メタデータを返す
+                // （それ以外の `ParsedSql` は `describe_parsed_in_session` と
+                // 完全に同一の判定へ委譲する）。
                 PreparedStatement::Parsed(parsed) => engine
-                    .describe_parsed_in_session(session, parsed)
+                    .describe_parsed_in_txn(session, txn, parsed)
                     .map_err(HandlerError::Sql)?,
             };
             Ok(DescribeResult::Statement(columns))
@@ -1294,8 +1301,11 @@ fn handle_bind_body(
         PreparedStatement::Empty => (PortalBody::Empty, None),
         PreparedStatement::Parsed(parsed) => {
             let parsed = parsed.clone();
+            // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替える
+            // （`handle_describe_body` と同じ理由。`FETCH` の portal 列メタは
+            // Bind 時点で開いているカーソルの列を反映する）。
             let columns = engine
-                .describe_parsed_in_session(session, &parsed)
+                .describe_parsed_in_txn(session, txn, &parsed)
                 .map_err(HandlerError::Sql)?;
             (PortalBody::Parsed(parsed), columns)
         }
