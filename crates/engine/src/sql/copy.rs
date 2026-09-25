@@ -700,7 +700,13 @@ pub struct CopyInSession {
     table: String,
     columns: Vec<String>,
     operation_id: Option<OperationId>,
-    schema: TableSchema,
+    // `Box` で包む: `TableSchema` へ墓標スロット（TABLE-19・TASK-203・Issue #901）
+    // が加わったことで `CopyInSession` 自体のサイズが増え、`CopyPlan::From` が
+    // 包む列挙子として `clippy::large_enum_variant` に抵触するようになった。
+    // ここで内側の非公開フィールドを Box 化してサイズを抑えることで、
+    // `CopyPlan::From` の内包型（公開 API）を変更せずに済ませる
+    // （`CopyPlan::From(CopyInSession)` のまま。外部クレートへの破壊的変更なし）。
+    schema: Box<TableSchema>,
     limits: BatchLimits,
     splitter: RecordSplitter,
     bounds: Vec<BoundInsert>,
@@ -758,7 +764,7 @@ impl CopyInSession {
             columns,
             splitter: RecordSplitter::new(format),
             operation_id,
-            schema,
+            schema: Box::new(schema),
             limits,
             bounds: Vec::new(),
             running_bytes: 0,
@@ -857,7 +863,7 @@ impl CopyInSession {
             row_count: self.bounds.len(),
             operation_id: self.operation_id,
             bounds: self.bounds,
-            schema: self.schema,
+            schema: *self.schema,
         })
     }
 }

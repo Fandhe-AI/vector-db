@@ -148,6 +148,38 @@ DROP・ALTER TYPE のいずれもテーブル単位世代カウンタ
 `ScalarIndexCache`・`PrefilterCache` 系が既存の ADD COLUMN／DROP TABLE と
 同じ仕組みで失効する（drop 専用の新たな失効機構は追加しない）。
 
+## D5: 公開 API 互換性（破壊的変更）
+
+墓標スロット（`dropped: Vec<DroppedSlot>`）を `TableSchema` の非公開
+フィールドとして追加したため、従来 `pub name`／`pub columns` のみで
+構成されていた `TableSchema` は外部クレートから
+`TableSchema { name, columns }` という構造体リテラルで構築できなくなった
+（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。**移行方法**:
+`TableSchema::new(name, columns)` を使う（本リポ内の呼び出し元は移行済み）。
+
+この変更で `TableSchema` を内部に持つ
+`crate::sql::copy::CopyInSession`（`CopyPlan::From` が包む公開型）自体の
+サイズも増え、`CopyPlan`（`To` 分岐との enum サイズ差）が
+`clippy::large_enum_variant` に抵触した。対応として `CopyPlan::From` の
+内包型を `Box<CopyInSession>` へ変更する案を一度採ったが、これは
+`CopyPlan::From` 自体の公開 variant 型を変える別の破壊的変更になるため
+撤回し、代わりに `CopyInSession` 内部の非公開フィールド `schema` を
+`Box<TableSchema>` 化してサイズを抑える設計へ変更した。`CopyPlan::From` の
+内包型は `CopyInSession`（Box なし）のまま不変であり、この変更による
+外部クレートへの破壊的変更はない。
+
+`CatalogError` へ追加した `ColumnNotFound`／`ProtectedColumn`／
+`IncompatibleTypeChange` の 3 variant も、`CatalogError` が
+`#[non_exhaustive]` でないため外部クレートの網羅 `match` を破壊する。
+
+これらはいずれも TABLE-19・TASK-203 が定める DROP COLUMN の物理挙動
+（削除列を物理位置の墓標として残す）を実装する上で本質的に必要な
+データ構造の変更であり、spec のビヘイビア契約自体（テナント境界・
+カタログの読み書き挙動）に影響する差分ではない。spec は挙動契約のみを
+定め、Rust 型のフィールド可視性・enum 内部表現までは規定しないため、
+対応する spec 側定義変更はない（PR 本文・コミット `BREAKING CHANGE:`
+に同旨を明記）。
+
 ## SQL 表層結線
 
 Issue #901 着手時点（origin/main `be1e760`）で、SQL 表層の DDL 許可リスト・

@@ -1030,6 +1030,13 @@ impl<'a> Iterator for PhysicalSlots<'a> {
 /// 物理配置を意識する必要があるのは行の物理ペイロード（`row_codec.rs`）と
 /// カタログの encode/decode（本モジュール）だけである（TABLE-19・TASK-203、
 /// Issue #901）。
+///
+/// **破壊的変更（Issue #901）**: 従来 `pub name`／`pub columns` のみで構成
+/// されていた本型に非公開フィールド `dropped` を追加したため、外部クレート
+/// からの `TableSchema { name, columns }` という構造体リテラル構築はコンパ
+/// イル不能になった。移行先は [`TableSchema::new`]（クレート内の呼び出し元
+/// は移行済み）。詳細・spec 側の扱いは
+/// `docs/design/alter-table-drop-modify-column.md`「D5」参照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
     pub name: String,
