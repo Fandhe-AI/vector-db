@@ -12,8 +12,11 @@
 //! と視覚的に分離するため、独立モジュールとして置く。
 //!
 //! **定数時間方針**: client Finished の検証は [`super::hkdf::ct_eq`]
-//! （GCM タグ検証・本モジュールが共有する唯一の定数時間比較）のみで行い、
-//! 長さ・一致有無以外の分岐を受信値のビットに依存させない。
+//! （GCM タグ検証・本モジュールが共有する唯一の定数時間比較）のみで行う。
+//! `ct_eq` 自体は長さ不一致を早期 return で弾くが、`received.verify_data` は
+//! [`handshake::Finished::parse`] が常に厳密 32 バイトへ正規化してから
+//! 渡すためこの経路では到達せず、受信値のビットに依存する分岐は実質
+//! 最終判定の 1 箇所のみになる。
 //!
 //! **対象外**: alert の実送出・ハンドシェイク状態機械（#965 の担当）。
 //! 本モジュールは失敗理由を [`FinishedError`] へ写像するところまでを担う。
@@ -51,8 +54,10 @@ pub fn build_server_finished(
 /// client Finished を検証する（受信側）。`client_hs_traffic` は
 /// `HandshakeSecret::traffic_secrets` の `client` フィールド、`th_ch_sf` は
 /// `Transcript::hash_through_server_finished()` の戻り値。不一致・長さ違いは
-/// いずれも [`FinishedError::VerifyDataMismatch`]（[`ct_eq`] は長さ不一致でも
-/// 早期 return せず `false` を返すため、分岐は最終判定の 1 箇所のみ）。
+/// いずれも [`FinishedError::VerifyDataMismatch`]（`received.verify_data` は
+/// [`handshake::Finished::parse`] が常に厳密 32 バイトへ正規化済みのため
+/// [`ct_eq`] の長さ不一致による早期 return はこの経路では到達せず、
+/// 受信値のビットに依存する分岐は実質最終判定の 1 箇所のみ）。
 pub fn verify_client_finished(
     client_hs_traffic: &TrafficSecret,
     th_ch_sf: &[u8; 32],
@@ -176,9 +181,11 @@ mod tests {
     }
 
     // 1 ビット反転・全ゼロ・長さ違いの verify_data はいずれも不一致
-    // （ct_eq のみで判定し、早期 return しない設計の外形テスト。
-    // `verify_client_finished` 自体の TrafficSecret 経由の結合は
-    // `tls_transcript_finished_rfc8448` 結合テストが担う）。
+    // （ct_eq 単体の外形テスト。長さ違いは ct_eq 内部の早期 return で
+    // 弾かれる（`verify_client_finished` 経路では `Finished::parse` の
+    // 正規化により到達しない）。`verify_client_finished` 自体の
+    // TrafficSecret 経由の結合は `tls_transcript_finished_rfc8448`
+    // 結合テストが担う）。
     #[test]
     fn bit_flipped_or_wrong_length_verify_data_is_rejected() {
         let finished_key = Secret32::from_bytes([0x11u8; 32]);
