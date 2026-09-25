@@ -80,7 +80,7 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 | ENUM | `DeclarativeFilter::equals`（語彙照合は engine 側 `bind` が `22P02` で行う） | `42601` |
 | BOOLEAN | `DeclarativeFilter::bool_equals` | `42601` |
 | DATE / TIMESTAMP / UUID | `DeclarativeFilter::compare`（`CompareOp::Eq`。形式・範囲検証は engine 側へ委譲） | `42601` |
-| BYTEA | base64 → hex（`typed_json::bytea_literal_text`）→ `compare` | `42601`／`54000`（下記「既知の制約（BYTEA の実効長）」参照） |
+| BYTEA | base64 → hex（`typed_json::bytea_literal_text`）→ `compare` | `42601`／`54000`（下記「BYTEA の実効長（PR #1038 是正）」参照） |
 | NUMERIC | 数値または数値文字列 → `compare_numeric_literal`／`compare` | `42601` |
 | INTEGER / BIGINT / REAL / DOUBLE PRECISION | 対象外（`0A000`） | — |
 | VECTOR / ARRAY / JSON / JSONB | 従来どおり engine 側「`TEXT` 列でない」判定へ委譲 | `22000` |
@@ -90,7 +90,7 @@ Issue #896 導入前は `update` op の JSON/UUID 列 `null` 分岐を wire 層�
 
 `engine::sql::allowlist::SqlSurfaceError` へ `FeatureNotSupported { detail }`（`0A000`）variant を追加し（レビュー指摘対応。以前はこの variant が無く、`scan`／`search`／`aggregate` の束縛 closure〔`Result<_, SqlSurfaceError>` 契約〕を通る際に `FilterError::NumericFilterNotSupported` が `42601`〔`UnsupportedSyntax`〕へ縮退していた）、`bind_filter` を直接呼ぶ層 A テストと HTTP 経由の実応答のいずれも `0A000` を観測する。数値列への `eq` を式レーン（`udf_call::bind_expr`）経由で扱う対応自体は、`BoundStatement`／`PlanSearchBinding` に `expr_filters` を渡す入口が無いため引き続き Issue #945 へ申し送る。
 
-**既知の制約（BYTEA の実効長）**: `bytea_literal_text` 自身は復号後のバイト列を `insert`／`update` と同じ [`engine::bytea::MAX_BYTEA_FIELD_LEN`]（4 MiB）まで許容するが、その後 `DeclarativeFilter::compare` が共有する `declarative_filter::check_literal_len` は再エンコード後の hex テキスト（`\x` 接頭辞＋2 バイト/オクテット）の長さを同じ 4 MiB 上限（`MAX_TEXT_FIELD_LEN`）で検査するため、復号後 約 2 MiB を超える値は `54000` になる（Cursor Bugbot 指摘）。この `check_literal_len` は SQL 表層の `WHERE bytea_col = '\x...'`（`sql::parser::bind_where_predicates` が同じ `DeclarativeFilter::compare` 経路へ束縛する）にも同一に適用されるため、NoSQL `filter` の `eq` は SQL `WHERE` と同じ実効上限のパリティにある——insert（復号後 4 MiB まで）と filter（復号後 約 2 MiB まで）の非対称は本 Issue が新設したものではなく、`declarative_filter` 側の既存制約がそのまま可視化されたもの。是正（hex 長ではなく復号後バイト長で判定する等）は別 Issue へ申し送る。
+**BYTEA の実効長（PR #1038 是正）**: `bytea_literal_text` 自身は復号後のバイト列を `insert`／`update` と同じ [`engine::bytea::MAX_BYTEA_FIELD_LEN`]（4 MiB）まで許容するが、当初 `declarative_filter::bind_typed_compare_literal` は `DeclarativeFilter::compare` の `Bytea` 分岐で `bind_bytea_literal` 呼び出しの前に `check_literal_len` を掛けており、再エンコード後の hex テキスト（`\x` 接頭辞＋2 バイト/オクテット）の長さを `MAX_TEXT_FIELD_LEN`（復号後基準の `MAX_BYTEA_FIELD_LEN` と同値）でそのまま検査してしまうため、復号後 約 2 MiB を超える値は `54000` になっていた（PR #1038 レビュー指摘）。`bind_bytea_literal`（`bytea::parse_hex_text`）自身が確保前に**復号後バイト長**で `MAX_BYTEA_FIELD_LEN` 超過を判定するため、`Bytea` 分岐の `check_literal_len` 事前検査は不要かつ有害と判断し撤去した。是正後は insert／update／`WHERE bytea_col = '\x...'`（SQL・NoSQL いずれも同じ `declarative_filter::bind` 経路）の全経路で復号後 4 MiB を実効上限として揃えている。
 
 ## テスト
 
