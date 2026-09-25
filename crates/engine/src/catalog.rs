@@ -2775,10 +2775,26 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
                 "malformed column line: {line:?}"
             )));
         };
-        if is_v3 && fields.next().is_none() {
-            return Err(CatalogError::CorruptSchema(format!(
-                "malformed column line: {line:?}"
-            )));
+        if is_v3 {
+            // v3 の 5 番目フィールドは `state`（"L"＝生存／"D"＝削除済み）。
+            // `decode_schema_body` の state 検証（"L"／"D" 以外は拒否）と同じ
+            // 契約をここでも徹底する（codex-review P1 指摘・PR #1045: フィールドの
+            // 存在だけを見て値を検証しないと、不正な state 値を持つ破損カタログ値が
+            // 「依存なし」に丸められ `drop_enum_type` が破損カタログを残したまま
+            // ENUM 型を削除できてしまう）。
+            match fields.next() {
+                Some("L") | Some("D") => {}
+                Some(other) => {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "malformed column state field: {other:?}"
+                    )))
+                }
+                None => {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "malformed column line: {line:?}"
+                    )))
+                }
+            }
         }
         if fields.next().is_some() {
             return Err(CatalogError::CorruptSchema(format!(
@@ -3283,6 +3299,52 @@ mod tests {
         assert!(
             matches!(err, CatalogError::CorruptSchema(_)),
             "drop_enum_type must fail-closed on corrupt catalog values, got: {err:?}"
+        );
+
+        // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// `catalog_value_references_enum_type`（`drop_enum_type` 等が使う軽量な
+    /// 依存判定）は v3 カタログ値の 5 番目フィールド（`state`）が「フィールドの
+    /// 存在」だけでなく値そのものが `"L"`／`"D"` であることも検証しなければ
+    /// ならない（codex-review P1 指摘・PR #1045）。値がその他の不正な文字列
+    /// （破損カタログ）である場合に「依存なし」へ丸めてしまうと、
+    /// `drop_enum_type` が破損カタログを残したまま実際には参照されている
+    /// ENUM 型を削除できてしまう。
+    #[test]
+    fn drop_enum_type_rejects_v3_catalog_value_with_invalid_state_field() {
+        let path = unique_db_path("catalog-drop-enum-v3-bad-state");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // v3 形式のカタログ値で、ENUM 型 `mood` を参照する列の state フィールドを
+        // "L"／"D" のいずれでもない不正値にする。値検証を欠くと
+        // `catalog_value_references_enum_type` はフィールドが 5 個存在すること
+        // だけで通過させ「依存なし」と誤判定しうる。
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V3}\ncols:1\nmood_col:enum:{type_name}:0:X\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn.commit().expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on an invalid v3 state field, got: {err:?}"
         );
 
         // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
