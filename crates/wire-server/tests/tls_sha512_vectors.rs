@@ -57,6 +57,71 @@ fn digest_matches_known_digest_for_empty_input() {
     );
 }
 
+// パディング境界長（111/112/113/127/128/129/239/240/256 バイト。`0x80` と
+// 16 バイト長フィールドが 1 ブロックに収まるか次ブロックへ溢れるかの分かれ目）
+// での既知解照合。期待値は `'a'` を n バイト並べた入力に対する独立実装
+// （coreutils `sha512sum`・Python `hashlib.sha512`。両者一致を確認済み）の
+// 出力で、内部の参照実装とは独立に一括・1 バイト刻みの双方を固定する。
+#[test]
+fn digest_matches_independent_known_answers_at_block_boundary_lengths() {
+    const CASES: [(usize, &str); 9] = [
+        (
+            111,
+            "fa9121c7b32b9e01733d034cfc78cbf67f926c7ed83e82200ef86818196921760b4beff48404df811b953828274461673c68d04e297b0eb7b2b4d60fc6b566a2",
+        ),
+        (
+            112,
+            "c01d080efd492776a1c43bd23dd99d0a2e626d481e16782e75d54c2503b5dc32bd05f0f1ba33e568b88fd2d970929b719ecbb152f58f130a407c8830604b70ca",
+        ),
+        (
+            113,
+            "55ddd8ac210a6e18ba1ee055af84c966e0dbff091c43580ae1be703bdb85da31acf6948cf5bd90c55a20e5450f22fb89bd8d0085e39f85a86cc46abbca75e24d",
+        ),
+        (
+            127,
+            "828613968b501dc00a97e08c73b118aa8876c26b8aac93df128502ab360f91bab50a51e088769a5c1eff4782ace147dce3642554199876374291f5d921629502",
+        ),
+        (
+            128,
+            "b73d1929aa615934e61a871596b3f3b33359f42b8175602e89f7e06e5f658a243667807ed300314b95cacdd579f3e33abdfbe351909519a846d465c59582f321",
+        ),
+        (
+            129,
+            "4f681e0bd53cda4b5a2041cc8a06f2eabde44fb16c951fbd5b87702f07aeab611565b19c47fde30587177ebb852e3971bbd8d3fd30da18d71037dfbd98420429",
+        ),
+        (
+            239,
+            "52c853cb8d907f3d4d6b889beb027985d7c273486d75f8baf26f80d24e90c74c6c3de3e22131582380a7d14d43f2941a31385439cd6ddc469f628015e50bf286",
+        ),
+        (
+            240,
+            "4c296d90c61052a62ffb1dd196f1b7b09373b1f93e71836baebf89690546b7595684dbe9467a8e484fa0d1094272b4344a7c24f5fee8daedeb0bf549c985ab5f",
+        ),
+        (
+            256,
+            "6a9169eb662f136d87374070e8828b3e615a7eca32a89446e9225b02832709be095e635c824a2bb70213ba2ea0ababac0809827843992c851903b7ac0c136699",
+        ),
+    ];
+    for (len, expected) in CASES {
+        let input = vec![b'a'; len];
+        assert_eq!(
+            hex(&digest(&input)),
+            expected,
+            "one-shot mismatch at len={len}"
+        );
+
+        let mut hasher = Sha512::new();
+        for byte in input.chunks(1) {
+            hasher.update(byte);
+        }
+        assert_eq!(
+            hex(&hasher.finalize()),
+            expected,
+            "byte-wise mismatch at len={len}"
+        );
+    }
+}
+
 // パディング境界長（111/112/127/128。1 ブロックに収まるか 2 ブロックに
 // なるかの分かれ目）で、あらゆる分割点の `update` が一括 `digest` と一致
 // することを固定する。
