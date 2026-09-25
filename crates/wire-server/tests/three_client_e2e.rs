@@ -327,6 +327,253 @@ fn seed_arbitrary_table_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
 /// （carol は Private 行を持たないため元の集計結果のまま不変）。既存
 /// C1〜C4 テストの seed（`seed_three_tenant_db`）はこの関数の追加では
 /// 変更しない。
+/// `documents`（`VECTOR` 列を持つ書き込み対象）と `notes`（未書き込みの別
+/// テーブル）の 2 テーブルを持つ一時 DB を用意する（Issue #943・WIRE-19。
+/// 明示トランザクション内で「直前に書き込んだテーブル自身は読めない」
+/// 制約（`docs/design/explicit-transaction.md` 参照）を避けつつ、同一
+/// トランザクション内の `SELECT` を検証するために `notes` を用意する）。
+/// `write_users_file` と異なり alice 1 テナントのみで十分（状態遷移の
+/// 検証にテナント分離は関与しない）。
+fn seed_txn_status_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-txn-status");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    storage
+        .create_table(&TableSchema::new(
+            "notes",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        ))
+        .expect("create table");
+    (path, guard)
+}
+
+/// `seed_txn_status_db` 用の単一ユーザー（alice）だけの認証ファイル。
+fn write_alice_only_users_file(path: &Path) {
+    use wire_server::auth::argon2id;
+    let salt = b"0123456789abcdef";
+    let phc = argon2id::encode_phc(b"correct-horse", salt, &argon2id::RECOMMENDED_PARAMS)
+        .expect("valid phc encoding");
+    std::fs::write(path, format!("alice:tenant-a:{phc}\n")).expect("write users file");
+}
+
+/// `psycopg_txn_status.py` を子プロセスとして起動し、stdout の状態名の列
+/// （`IDLE`/`INTRANS`/`INERROR`）を返す。非 0 終了は `panic!`（silent skip
+/// しない）。
+fn run_psycopg_txn_status(port: u16, insert_id: u64, op: &str) -> Vec<String> {
+    let python = resolve_tool("PYTHON_BIN", "python3");
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_txn_status.py");
+    let output = Command::new(&python)
+        .arg(&script)
+        .env("WIRE_HOST", "127.0.0.1")
+        .env("WIRE_PORT", port.to_string())
+        .env("WIRE_USER", "alice")
+        .env("WIRE_PASSWORD", "correct-horse")
+        .env("WIRE_TXN_INSERT_SQL", insert_sql(insert_id, op))
+        .env("WIRE_TXN_SELECT_SQL", "SELECT id FROM notes LIMIT 1")
+        .env(
+            "WIRE_TXN_VERIFY_SQL",
+            format!("SELECT id FROM documents WHERE id = {insert_id} LIMIT 1"),
+        )
+        .env("WIRE_TXN_BAD_SQL", "SELEC id FROM notes")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("failed to spawn {python} (install psycopg via `pip install psycopg` or set PYTHON_BIN): {e}")
+        });
+    assert!(
+        output.status.success(),
+        "psycopg_txn_status.py failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `pg_txn_status.js` を子プロセスとして起動し、stdout の `ReadyForQuery`
+/// 状態バイトの列（`'I'`/`'T'`/`'E'`）を返す。非 0 終了は `panic!`。
+fn run_pg_txn_status(port: u16, insert_id: u64, op: &str) -> Vec<String> {
+    let node = resolve_tool("NODE_BIN", "node");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_txn_status.js");
+    let output = Command::new(&node)
+        .arg(&script)
+        .env("WIRE_HOST", "127.0.0.1")
+        .env("WIRE_PORT", port.to_string())
+        .env("WIRE_USER", "alice")
+        .env("WIRE_PASSWORD", "correct-horse")
+        .env("WIRE_TXN_INSERT_SQL", insert_sql(insert_id, op))
+        .env("WIRE_TXN_SELECT_SQL", "SELECT id FROM notes LIMIT 1")
+        .env(
+            "WIRE_TXN_VERIFY_SQL",
+            format!("SELECT id FROM documents WHERE id = {insert_id} LIMIT 1"),
+        )
+        .env("WIRE_TXN_BAD_SQL", "SELEC id FROM notes")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("failed to spawn {node} (install pg via `npm install pg` or set NODE_BIN): {e}")
+        });
+    assert!(
+        output.status.success(),
+        "pg_txn_status.js failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn insert_sql(id: u64, op: &str) -> String {
+    format!(
+        "INSERT INTO documents (id, embedding, body) VALUES ({id}, '[0.1,0.2,0.3]', 'row') USING OPERATION_ID '{op}'"
+    )
+}
+
+/// psql（無改造）でトランザクション状態の反映を**間接的に**確認する。psql
+/// は libpq と同じく `\set AUTOCOMMIT off` の下では接続の transaction
+/// status が `IDLE` のときに限り次の文の前に暗黙の `BEGIN` を送る
+/// （`docs/design/three-client-e2e-harness.md`「トランザクション状態遷移
+/// （Issue #943・WIRE-19）」節参照。プロンプト文字列 `%x` は対話端末専用の
+/// ため非対話実行では観測できず採らない判断の記録も同節にある）。
+/// もし `wire-server` が `ReadyForQuery` の状態バイトを常に `'I'` のまま
+/// 返す不具合があれば、`INSERT` の後の 2 文目の前にも `BEGIN` が再送され
+/// 「入れ子の BEGIN」（`25001`）で失敗し、続く `COMMIT` も `25P02` で
+/// 拒否されて非 0 終了する。正しく `'T'` を反映していれば `BEGIN` は
+/// 1 回しか送られず、全体が正常終了して `COMMIT` タグが確認できる。
+fn assert_psql_autocommit_off_reflects_transaction_status(
+    port: u16,
+    user: &str,
+    password: &str,
+    insert_id: u64,
+    op: &str,
+) {
+    let psql = resolve_tool("PSQL_BIN", "psql");
+    let insert = insert_sql(insert_id, op);
+    let output = Command::new(&psql)
+        .env("PGPASSWORD", password)
+        .args([
+            "-h",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-U",
+            user,
+            "-d",
+            "irrelevant-db-name",
+            "-X",
+            "-w",
+            "-q",
+            "-At",
+            "-c",
+            "\\set AUTOCOMMIT off",
+            "-c",
+            &insert,
+            "-c",
+            "SELECT id FROM notes LIMIT 1",
+            "-c",
+            "COMMIT",
+        ])
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("failed to spawn {psql} (install libpq-client tools or set PSQL_BIN): {e}")
+        });
+    assert!(
+        output.status.success(),
+        "psql -c sequence under AUTOCOMMIT off must succeed exactly once per BEGIN \
+         (a bug that always reports 'I' would cause a spurious nested BEGIN → 25001 → \
+         25P02 on COMMIT): stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // commit 済みの行が読み戻せる（read-your-writes）ことも独立に確認する。
+    let rows = run_psql(
+        port,
+        user,
+        password,
+        &format!("SELECT id FROM documents WHERE id = {insert_id} LIMIT 1"),
+    );
+    assert_eq!(
+        rows,
+        vec![insert_id.to_string()],
+        "committed row must be visible after AUTOCOMMIT off session"
+    );
+}
+
+/// WIRE-19（Issue #943）: `ReadyForQuery` の状態バイトが明示トランザクション
+/// 状態（`Idle`/`InTransaction`/`Failed`）を反映することを、無改造の実
+/// クライアント 3 種（psql／psycopg／pg）から検証する。層 A
+/// （`wire942_extended_transaction.rs`・`wire19_ready_for_query_status.rs`）が
+/// 生バイトの wire クライアントで固定する契約と同じものを、各ドライバ自身の
+/// トランザクション状態 API・暗黙 `BEGIN` 挙動を通じて追加確認する
+/// （responsibility boundary は本ファイル冒頭のドキュメンテーションコメント
+/// と同じ方針）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_observe_transaction_status_transitions() {
+    // psql・psycopg・pg で 1 つずつ独立したサーバー・DB を使う（各クライアント
+    // が別々の `operation_id`／`id` で書き込むため、テナント境界の検証は
+    // 不要。同一 DB を使い回しても害はないが、状態遷移の検証観点を独立に
+    // 保つため分ける）。
+    for (label, run) in [
+        (
+            "psql",
+            (|port: u16| {
+                assert_psql_autocommit_off_reflects_transaction_status(
+                    port,
+                    "alice",
+                    "correct-horse",
+                    50,
+                    "op-943-psql",
+                );
+            }) as fn(u16),
+        ),
+        (
+            "psycopg",
+            (|port: u16| {
+                let statuses = run_psycopg_txn_status(port, 51, "op-943-psycopg");
+                assert_eq!(
+                    statuses,
+                    vec!["IDLE", "INTRANS", "INTRANS", "IDLE", "INERROR", "IDLE"],
+                    "psycopg: unexpected transaction_status sequence"
+                );
+            }) as fn(u16),
+        ),
+        (
+            "pg",
+            (|port: u16| {
+                let statuses = run_pg_txn_status(port, 52, "op-943-pg");
+                assert_eq!(
+                    statuses,
+                    vec!["I", "T", "T", "T", "I", "I", "T", "E", "I"],
+                    "pg: unexpected ReadyForQuery status sequence"
+                );
+            }) as fn(u16),
+        ),
+    ] {
+        let (db_path, _db_guard) = seed_txn_status_db();
+        let users_dir = temp_db::TempDir::new("three-client-e2e-txn-status-users");
+        let users_path = users_dir.path().join("users.txt");
+        write_alice_only_users_file(&users_path);
+        let server = spawn_wire_server(&users_path, &db_path, &[]);
+        run(server.port);
+        drop(server);
+        let _ = std::io::stdout().flush();
+        eprintln!("[e2e-record] three_clients_observe_transaction_status_transitions: {label} ok");
+    }
+}
+
 fn seed_aggregate_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("three-client-e2e-aggregate-docs");
     let guard = temp_db::CleanupGuard(path.clone());

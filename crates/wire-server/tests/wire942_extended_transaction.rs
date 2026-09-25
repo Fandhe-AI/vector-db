@@ -419,9 +419,11 @@ fn expired_transaction_releases_writer_on_next_protocol_message() {
     begin_and_insert_over_simple_query(&mut stream, 34, "op-942-34");
     std::thread::sleep(max_duration * 2);
 
-    // SQL を伴わない要求（Sync）だけを送る。
+    // SQL を伴わない要求（Sync）だけを送る。`release_if_expired` が
+    // `Active` を `Failed` へ遷移させる（`Idle` へは戻さない）ため、状態は
+    // 直後の Sync 時点ですでに `'E'`（WIRE-19・Issue #943）。
     send_sync(&mut stream);
-    assert_ready_for_query(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
 
     // 別接続の autocommit INSERT がライタを取得できる。
     let mut other = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
@@ -429,12 +431,15 @@ fn expired_transaction_releases_writer_on_next_protocol_message() {
     assert_eq!(read_command_complete(&mut other), "INSERT 0 1");
     read_ready_for_query(&mut other);
 
+    // `54000` は `take_failed_error` 経由の通常のエラー報告であり、`Failed`
+    // を解除しない（Sync は ignore-till-sync を解除するだけ）ため引き続き
+    // `'E'`。
     send_simple_query(&mut stream, "COMMIT");
     expect_error_response_with_sqlstate(&mut stream, "54000");
-    read_ready_for_query(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
     send_simple_query(&mut stream, "ROLLBACK");
     assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
-    read_ready_for_query(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'I');
 
     assert_eq!(visible_rows_with_id(&core, 34), 0);
     assert_eq!(visible_rows_with_id(&core, 35), 1);
@@ -496,13 +501,15 @@ fn expired_transaction_releases_writer_while_client_is_silent() {
         "the writer must be released at the transaction deadline, not at the read timeout"
     );
 
-    // 元の接続は維持されており、期限切れを COMMIT で観測できる。
+    // 元の接続は維持されており、期限切れを COMMIT で観測できる。期限超過は
+    // `Active` を `Failed` へ遷移させ Sync では解除されないため `54000` の後も
+    // `'E'`（WIRE-19・Issue #943）。
     send_simple_query(&mut stream, "COMMIT");
     expect_error_response_with_sqlstate(&mut stream, "54000");
-    read_ready_for_query(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
     send_simple_query(&mut stream, "ROLLBACK");
     assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
-    read_ready_for_query(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'I');
 
     assert_eq!(visible_rows_with_id(&core, 39), 0);
     assert_eq!(visible_rows_with_id(&core, 40), 1);
