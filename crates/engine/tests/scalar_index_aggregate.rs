@@ -383,13 +383,12 @@ fn rls_private_rows_of_other_tenant_never_leak_via_index_path() {
 // --- 契約 5: VECTOR 列なしテーブルは従来経路のまま不変（SQL-13） -----------
 
 #[test]
-// `TableSchema::validate_embedding_dim` 系のチェックにより、本リポジトリの
-// 現行公開経路（`tenant::insert_typed_row` 等）は `VECTOR` 列を持たない
-// テーブルへの行挿入を受け付けない（`tests/sql_aggregate.rs`
-// `sql13_works_on_empty_table_without_vector_column` の既存コメント・
-// TASK-166 スコープ外の既存制約を参照）。そのため本 Issue のスコープでも
-// 「行が 1 件もない `VECTOR` 列なしテーブル」でゲートが不使用のまま従来経路
-// （空集合契約）で応答することのみ検証する。
+// Issue #995 以前は `TableSchema::validate_embedding_dim` 系のチェックにより
+// 本リポジトリの現行公開経路が `VECTOR` 列を持たないテーブルへの行挿入を
+// 受け付けず、空集合契約のみ検証していた。Issue #995 で INSERT 系の全入口が
+// `VECTOR` 列なしテーブルを受理するようになったため、空集合（`before`）に加え
+// 非空コーパス（`after_insert`）でもゲートが不使用のまま従来経路（plain
+// scan）で応答することを確認する。
 fn table_without_vector_column_uses_plain_scan_and_is_unaffected() {
     let path = unique_db_path("scalar-index-aggregate-no-vector");
     let _guard = CleanupGuard(path.clone());
@@ -409,10 +408,41 @@ fn table_without_vector_column_uses_plain_scan_and_is_unaffected() {
     let hot = run(&core, "tenant-a", sql);
     assert_eq!(single_row_cells(&cold), vec![Cell::Integer(0)]);
     assert_eq!(single_row_cells(&cold), single_row_cells(&hot));
-    let after = core.scalar_index_cache_stats().aggregate_index_scans;
+    let after_empty = core.scalar_index_cache_stats().aggregate_index_scans;
     assert_eq!(
-        before, after,
+        before, after_empty,
         "a table without a VECTOR column must never use the scalar index aggregate path"
+    );
+
+    // 非空コーパス（Issue #995）を投入しても plain scan のまま不変であること。
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    for (id, kind, op_id) in [
+        (1u64, "a", "op-1"),
+        (2u64, "b", "op-2"),
+        (3u64, "a", "op-3"),
+    ] {
+        core.execute_insert_sql(
+            &ctx,
+            &format!(
+                "INSERT INTO notes (id, kind) VALUES ({id}, '{kind}') USING OPERATION_ID '{op_id}'"
+            ),
+        )
+        .expect("insert into a table without a VECTOR column should succeed");
+    }
+    let after_insert_cold = run(&core, "tenant-a", sql);
+    let after_insert_hot = run(&core, "tenant-a", sql);
+    assert_eq!(single_row_cells(&after_insert_cold), vec![Cell::Integer(2)]);
+    assert_eq!(
+        single_row_cells(&after_insert_cold),
+        single_row_cells(&after_insert_hot)
+    );
+    let after_insert = core.scalar_index_cache_stats().aggregate_index_scans;
+    assert_eq!(
+        after_empty, after_insert,
+        "a table without a VECTOR column must never use the scalar index aggregate path, \
+         even once it holds rows"
     );
 }
 
