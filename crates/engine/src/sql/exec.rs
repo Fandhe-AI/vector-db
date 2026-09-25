@@ -208,6 +208,10 @@ pub enum Cell {
     /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。BOOLEAN 列（TABLE-13・
     /// TASK-196、Issue #883）の投影結果もこの variant を共有する。
     Bool(bool),
+    /// `INTEGER`／`BIGINT` 列の投影結果（Issue #881・TABLE-13・TASK-196）。
+    /// 既存の `Integer(u64)`（疑似列 `id`・`COUNT` 用）とは意味が異なるため
+    /// 別 variant とする。`INTEGER` 列は `i64::from` で無損失に格上げして格納する。
+    SignedInteger(i64),
     /// `DATE` 列の投影結果（TABLE-13・TASK-197、Issue #884）。1970-01-01 起点の
     /// 日数。テキスト整形は [`crate::datetime::format_date`] に委譲する。
     Date(i32),
@@ -894,6 +898,8 @@ pub(crate) fn execute_statement_with_cache(
                         )?;
                         kept.push(Value::Text(owned));
                     }
+                    Some(row_codec::ScalarRef::Integer(v)) => kept.push(Value::Integer(v)),
+                    Some(row_codec::ScalarRef::BigInt(v)) => kept.push(Value::BigInt(v)),
                     // REAL/DOUBLE は固定長のためヒープ確保・バイト予算計上を
                     // 要しない（`Value::Real`/`Value::Double` はスタック上の値）。
                     Some(row_codec::ScalarRef::Real(v)) => kept.push(Value::Real(v)),
@@ -1931,9 +1937,14 @@ pub(crate) fn execute_statement_with_cache(
                     Value::Uuid(u) => Some(row_codec::ScalarRef::Uuid(*u)),
                     Value::Date(d) => Some(row_codec::ScalarRef::Date(*d)),
                     Value::Timestamp(t) => Some(row_codec::ScalarRef::Timestamp(*t)),
-                    // 配列列は宣言的フィルタ（TEXT 前提）の対象外。`Vector` と
-                    // 同じく型不一致として `None` へ倒す（D-A8）。
-                    Value::Null | Value::Vector(_) | Value::Array(_) => None,
+                    // 配列列は宣言的フィルタ（TEXT 前提）の対象外。`Vector`・
+                    // `Integer`／`BigInt` と同じく型不一致として `None` へ倒す
+                    // （D-A8）。
+                    Value::Null
+                    | Value::Vector(_)
+                    | Value::Array(_)
+                    | Value::Integer(_)
+                    | Value::BigInt(_) => None,
                 })
                 .collect();
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
@@ -2264,6 +2275,8 @@ fn decode_deferred_scalars(
                     })?;
                 out.push(Value::Text(owned));
             }
+            Some(row_codec::ScalarRef::Integer(v)) => out.push(Value::Integer(v)),
+            Some(row_codec::ScalarRef::BigInt(v)) => out.push(Value::BigInt(v)),
             Some(row_codec::ScalarRef::Real(v)) => out.push(Value::Real(v)),
             Some(row_codec::ScalarRef::Double(v)) => out.push(Value::Double(v)),
             Some(row_codec::ScalarRef::Enum(label)) => {
@@ -2532,7 +2545,55 @@ fn project_rows(
                         ColumnType::Text => match decoded.get(*index) {
                             Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
+                            | Some(Value::Array(_))
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Json(_))
+                            | Some(Value::Enum(_))
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::Integer => match decoded.get(*index) {
+                            Some(Value::Integer(v)) => {
+                                cells.push(Cell::SignedInteger(i64::from(*v)))
+                            }
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::BigInt(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Vector(_))
+                            | Some(Value::Real(_))
+                            | Some(Value::Double(_))
+                            | Some(Value::Bool(_))
+                            | Some(Value::Date(_))
+                            | Some(Value::Timestamp(_))
+                            | Some(Value::Array(_))
+                            | Some(Value::Bytes(_))
+                            | Some(Value::Json(_))
+                            | Some(Value::Enum(_))
+                            | Some(Value::Numeric(_))
+                            | Some(Value::Uuid(_)) => {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "scalar payload type mismatch".to_string(),
+                                })
+                            }
+                        },
+                        ColumnType::BigInt => match decoded.get(*index) {
+                            Some(Value::BigInt(v)) => cells.push(Cell::SignedInteger(*v)),
+                            Some(Value::Null) | None => cells.push(Cell::Null),
+                            Some(Value::Integer(_))
+                            | Some(Value::Text(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Bool(_))
@@ -2579,7 +2640,9 @@ fn project_rows(
                                 cells.push(Cell::Text(try_clone_text(label)?))
                             }
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Bool(_))
@@ -2599,7 +2662,9 @@ fn project_rows(
                         ColumnType::Boolean => match decoded.get(*index) {
                             Some(Value::Bool(b)) => cells.push(Cell::Bool(*b)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Text(_))
@@ -2619,7 +2684,9 @@ fn project_rows(
                         ColumnType::Date => match decoded.get(*index) {
                             Some(Value::Date(d)) => cells.push(Cell::Date(*d)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Text(_))
@@ -2639,7 +2706,9 @@ fn project_rows(
                         ColumnType::Timestamp => match decoded.get(*index) {
                             Some(Value::Timestamp(t)) => cells.push(Cell::Timestamp(*t)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Text(_))
@@ -2661,7 +2730,9 @@ fn project_rows(
                                 cells.push(Cell::Array(array_value.clone()))
                             }
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Text(_))
@@ -2691,7 +2762,9 @@ fn project_rows(
                                 cells.push(Cell::Bytes(owned));
                             }
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Text(_))
@@ -2711,7 +2784,9 @@ fn project_rows(
                         ColumnType::Json | ColumnType::Jsonb => match decoded.get(*index) {
                             Some(Value::Json(t)) => cells.push(Cell::Json(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Text(_))
@@ -2731,7 +2806,9 @@ fn project_rows(
                         ColumnType::Numeric { .. } => match decoded.get(*index) {
                             Some(Value::Numeric(d)) => cells.push(Cell::Numeric(*d)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Text(_))
@@ -2751,7 +2828,9 @@ fn project_rows(
                         ColumnType::Uuid => match decoded.get(*index) {
                             Some(Value::Uuid(u)) => cells.push(Cell::Uuid(*u)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
-                            Some(Value::Vector(_))
+                            Some(Value::Integer(_))
+                            | Some(Value::BigInt(_))
+                            | Some(Value::Vector(_))
                             | Some(Value::Real(_))
                             | Some(Value::Double(_))
                             | Some(Value::Text(_))

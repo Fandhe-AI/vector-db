@@ -543,7 +543,6 @@ fn observe_candidate_slots_grouped_inner(
         let scanned =
             row_codec::scan_scalar_columns_masked(schema, metadata, Some(referenced.scalar_mask()))
                 .map_err(SqlSurfaceError::from)?;
-
         if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
             continue;
         }
@@ -706,7 +705,8 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT/ARRAY/BYTEA/JSON/
         // NUMERIC 型の集計結果を HAVING の対象として拒否済みのため到達しない
         // （NUMERIC 列の集計自体が TASK-197・Issue #885 の対象外。`SUM`/`AVG`/
-        // `MIN`/`MAX` は別 Issue #892 の担当）。fail-closed に「不一致」として扱う。
+        // `MIN`/`MAX` は別 Issue #892 の担当）。`SignedInteger`（Issue #881・#892
+        // まで集計対象外）も同様。fail-closed に「不一致」として扱う。
         Cell::Null
         | Cell::Text(_)
         | Cell::Vector(_)
@@ -716,6 +716,7 @@ fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
         | Cell::Array(_)
         | Cell::Bytes(_)
         | Cell::Json(_)
+        | Cell::SignedInteger(_)
         | Cell::Numeric(_)
         | Cell::Uuid(_) => false,
     }

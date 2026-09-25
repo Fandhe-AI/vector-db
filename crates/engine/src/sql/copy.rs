@@ -27,8 +27,8 @@ use crate::row_codec::Value;
 use crate::sql::allowlist::{CopyFormat, InsertLiteral, SqlSurfaceError};
 use crate::sql::parser::{
     bind_bytea_literal, bind_datetime_literal, bind_double_literal, bind_enum_literal,
-    bind_json_literal, bind_numeric_literal, bind_real_literal, bind_uuid_literal,
-    parse_array_literal, parse_vector_literal, BoundInsert,
+    bind_integer_literal, bind_json_literal, bind_numeric_literal, bind_real_literal,
+    bind_uuid_literal, parse_array_literal, parse_vector_literal, BoundInsert,
 };
 
 /// wire 層のホットパスで `lexer::tokenize` を増やさないための安価な覗き見
@@ -582,6 +582,17 @@ fn bind_copy_record(
                 // 追加）。
                 ColumnType::Real => Value::Real(bind_real_literal(s)?),
                 ColumnType::Double => Value::Double(bind_double_literal(s)?),
+                // `INTEGER`／`BIGINT`（Issue #881）も INSERT／UPDATE／UPSERT と
+                // 同じ `bind_integer_literal` を共有する。COPY のフィールドは
+                // 文字列でしか届かないため `InsertLiteral::Number` として包み
+                // 直し、`InsertLiteral::String` 拒否（PG 互換の暗黙変換は
+                // 行わない設計判断）を経由させずに数値リテラル同等の検証
+                // （範囲外 `22003`・非整数形式 `22000`）を適用する。
+                ColumnType::Integer | ColumnType::BigInt => bind_integer_literal(
+                    name,
+                    column.ty.clone(),
+                    &InsertLiteral::Number(s.clone()),
+                )?,
             },
         };
         if let Some(slot) = bound_values.get_mut(col_idx) {
@@ -665,6 +676,11 @@ fn bound_insert_byte_len(bound: &BoundInsert) -> Result<usize, SqlSurfaceError> 
             // ネイティブ幅。Issue #882）。
             Value::Real(_) => std::mem::size_of::<f32>(),
             Value::Double(_) => std::mem::size_of::<f64>(),
+            // INTEGER／BIGINT は `core.rs::validate_insert_batch_byte_and_
+            // chunk_limits` と同一の判定対象量定義（i32／i64 のネイティブ幅。
+            // Issue #881）。
+            Value::Integer(_) => std::mem::size_of::<i32>(),
+            Value::BigInt(_) => std::mem::size_of::<i64>(),
         };
         total = total
             .checked_add(value_len)

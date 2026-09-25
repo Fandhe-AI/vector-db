@@ -370,6 +370,73 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
     Ok(values)
 }
 
+/// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）向けの数値リテラル
+/// 束縛。`literal` は `InsertLiteral::Number`（`allowlist::expect_literal` が
+/// 単項マイナスを正規化済み）のみを受理し、`InsertLiteral::String` は
+/// `22000`（PG 互換の暗黙変換は行わない設計判断）で拒否する。範囲外
+/// （`i32::MIN..=i32::MAX`／`i64::MIN..=i64::MAX`）は `22003`
+/// （[`SqlSurfaceError::numeric_out_of_range`]）、小数点・16 進数等の非整数形式は
+/// `22000` で拒否する。エラーメッセージには列名のみを含め、リテラル本文は含めない
+/// （長大な数字列の反射防止）。
+pub(crate) fn bind_integer_literal(
+    name: &str,
+    ty: ColumnType,
+    literal: &InsertLiteral,
+) -> Result<crate::row_codec::Value, SqlSurfaceError> {
+    let raw = match literal {
+        InsertLiteral::Number(s) => s,
+        InsertLiteral::String(_) | InsertLiteral::Bool(_) | InsertLiteral::Null => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {name:?} expects an integer literal, got a non-integer literal"
+            )))
+        }
+    };
+    match ty {
+        ColumnType::Integer => match raw.parse::<i32>() {
+            Ok(v) => Ok(crate::row_codec::Value::Integer(v)),
+            Err(e) => match e.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    Err(SqlSurfaceError::numeric_out_of_range(format!(
+                        "value out of range for INTEGER column {name:?}"
+                    )))
+                }
+                _ => Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an integer literal"
+                ))),
+            },
+        },
+        ColumnType::BigInt => match raw.parse::<i64>() {
+            Ok(v) => Ok(crate::row_codec::Value::BigInt(v)),
+            Err(e) => match e.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    Err(SqlSurfaceError::numeric_out_of_range(format!(
+                        "value out of range for BIGINT column {name:?}"
+                    )))
+                }
+                _ => Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects an integer literal"
+                ))),
+            },
+        },
+        ColumnType::Text
+        | ColumnType::Vector(_)
+        | ColumnType::Real
+        | ColumnType::Double
+        | ColumnType::Boolean
+        | ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::Array(_)
+        | ColumnType::Bytea
+        | ColumnType::Json
+        | ColumnType::Jsonb
+        | ColumnType::Enum(_)
+        | ColumnType::Numeric { .. }
+        | ColumnType::Uuid => Err(SqlSurfaceError::Internal {
+            detail: "bind_integer_literal called for a non-integer column".to_string(),
+        }),
+    }
+}
+
 /// `REAL`／`DOUBLE PRECISION` 列（TABLE-13・TASK-196）のリテラル束縛を 1 箇所へ
 /// 集約するヘルパー（F7・Issue #882 計画）。`raw`（`InsertLiteral::Number` の
 /// 生テキスト。負号は `expect_literal` が既に前置済み）を
@@ -439,6 +506,8 @@ pub(crate) fn bind_datetime_literal(
         | ColumnType::Real
         | ColumnType::Double
         | ColumnType::Vector(_)
+        | ColumnType::Integer
+        | ColumnType::BigInt
         | ColumnType::Boolean
         | ColumnType::Array(_)
         | ColumnType::Bytea
@@ -629,6 +698,8 @@ pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSur
         .find_map(|(idx, c)| match &c.ty {
             ColumnType::Vector(dim) => Some((idx, *dim)),
             ColumnType::Text
+            | ColumnType::Integer
+            | ColumnType::BigInt
             | ColumnType::Real
             | ColumnType::Double
             | ColumnType::Boolean
@@ -677,6 +748,8 @@ pub(crate) fn text_column_index(
             match &column.ty {
                 ColumnType::Text => Ok(idx),
                 ColumnType::Vector(_)
+                | ColumnType::Integer
+                | ColumnType::BigInt
                 | ColumnType::Real
                 | ColumnType::Double
                 | ColumnType::Boolean
@@ -1451,6 +1524,10 @@ fn bind_insert_row(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
+            (
+                ColumnType::Integer | ColumnType::BigInt,
+                InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_),
+            ) => bind_integer_literal(name, column.ty.clone(), literal)?,
             // F7（Issue #882 計画）: REAL/DOUBLE は数値リテラルのみ受理する
             // （文字列からの暗黙変換は行わない。#896 へ申し送り）。
             (ColumnType::Real, InsertLiteral::Number(n)) => {
@@ -1609,6 +1686,8 @@ pub(crate) fn bind_json_literal(
             crate::json::canonicalize_jsonb_text(s).map_err(|e| json_column_error(e, s))?
         }
         ColumnType::Text
+        | ColumnType::Integer
+        | ColumnType::BigInt
         | ColumnType::Vector(_)
         | ColumnType::Real
         | ColumnType::Double
@@ -1820,6 +1899,10 @@ fn bind_set_assignments(
                     "column {name:?} expects a boolean literal (true/false)"
                 )))
             }
+            (
+                ColumnType::Integer | ColumnType::BigInt,
+                InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_),
+            ) => bind_integer_literal(name, column.ty.clone(), literal)?,
             (ColumnType::Real, InsertLiteral::Number(n)) => {
                 crate::row_codec::Value::Real(bind_real_literal(n)?)
             }
@@ -2431,6 +2514,9 @@ fn bind_upsert_assignments(
                             "column {name:?} expects a boolean literal (true/false)"
                         )))
                     }
+                    (ColumnType::Integer | ColumnType::BigInt, InsertLiteral::Number(_) | InsertLiteral::String(_) | InsertLiteral::Bool(_)) => {
+                        bind_integer_literal(name, column.ty.clone(), literal)?
+                    }
                     (ColumnType::Real, InsertLiteral::Number(n)) => {
                         crate::row_codec::Value::Real(bind_real_literal(n)?)
                     }
@@ -2613,6 +2699,16 @@ fn bind_file_insert(
             (ColumnType::Vector(_), _) => {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "column {name:?}: VECTOR column must not be provided for file-form INSERT"
+                )))
+            }
+            // INTEGER／BIGINT 列も他のスカラー型（REAL／DOUBLE PRECISION 等）と同じ
+            // 理由でファイル形 INSERT の対象外とする（Issue #881 レビュー指摘。
+            // typed INSERT/UPDATE/UPSERT 向けの `bind_integer_literal` をファイル形へ
+            // 露出させない。当初この分岐だけ他の非 TEXT 型より緩く受理していたのを
+            // codex/review・Cursor 指摘で是正）。
+            (ColumnType::Integer | ColumnType::BigInt, _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: INTEGER/BIGINT column is not supported for file-form INSERT"
                 )))
             }
             // REAL／DOUBLE PRECISION 列も他のスカラー型（BOOLEAN 等）と同じ理由で
@@ -3211,6 +3307,14 @@ fn resolve_aggregate_input(
                     (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
+                    // `INTEGER`／`BIGINT` 列の集計対応は Issue #892 の担当。
+                    // 本 Issue（#881）では既存の TEXT/VECTOR 以外の列参照と同じ
+                    // fail-closed 拒否に倒す。
+                    (ColumnType::Integer | ColumnType::BigInt, _) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} cannot be used in aggregate functions yet"
+                        )))
+                    }
                     // F10（Issue #882 計画）: REAL/DOUBLE の集計対応は #892 の
                     // 担当。現時点ではすべての集計関数（COUNT を含む）で拒否する。
                     (ColumnType::Real | ColumnType::Double, _) => {
@@ -5078,6 +5182,36 @@ mod tests {
         )
         .expect_err("DOUBLE PRECISION column must be rejected for file-form INSERT");
         assert_eq!(err_double.wire_code(), "22000");
+    }
+
+    #[test]
+    // codex/review P1・Cursor Medium 指摘（PR #1008・Issue #881）: `bind_file_insert`
+    // が INTEGER／BIGINT だけを typed INSERT 向け `bind_integer_literal` で受理し、
+    // REAL・DOUBLE・BOOLEAN 等の他の非 TEXT スカラー型と異なる緩い扱いになっていた。
+    // 他の非 TEXT 型と同じ `not supported for file-form INSERT`（`22000`）へ是正した
+    // ことを固定する。
+    fn bind_insert_form_file_form_rejects_integer_and_bigint_columns() {
+        let mut schema = file_docs_schema();
+        schema
+            .columns
+            .push(ColumnDef::new("count", ColumnType::Integer, true));
+        schema
+            .columns
+            .push(ColumnDef::new("big_count", ColumnType::BigInt, true));
+
+        let err_integer = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, count) VALUES ('a.txt', 'hello', 1) USING OPERATION_ID 'op-file-int'",
+            &schema,
+        )
+        .expect_err("INTEGER column must be rejected for file-form INSERT");
+        assert_eq!(err_integer.wire_code(), "22000");
+
+        let err_bigint = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, big_count) VALUES ('a.txt', 'hello', 1) USING OPERATION_ID 'op-file-bigint'",
+            &schema,
+        )
+        .expect_err("BIGINT column must be rejected for file-form INSERT");
+        assert_eq!(err_bigint.wire_code(), "22000");
     }
 
     #[test]

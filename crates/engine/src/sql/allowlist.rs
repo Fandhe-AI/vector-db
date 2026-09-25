@@ -1931,17 +1931,23 @@ impl<'a> Parser<'a> {
 
     /// VALUES リストの 1 要素（文字列リテラルまたは数値リテラルのみ。関数呼び出し・
     /// 括弧・`NULL` キーワード等は許可リスト外）。
+    /// `INTEGER`／`BIGINT` 列（Issue #881・TABLE-13・TASK-196）の負数リテラルを
+    /// 受理するため、`-` の直後に `Number` トークンが続く形（`parse_having` の
+    /// 単項マイナス処理と同じ規範。空白を挟む形も許容）だけを単項マイナスとして
+    /// 認め、`InsertLiteral::Number("-<digits>")` へ正規化する。`- -1`・`-'x'`・
+    /// `+1` はいずれも従来どおり構造的に受理しない（`42601`）。実際の値域検証・
+    /// パースは束縛段（`sql::parser::bind_integer_literal`）が行う。
     fn expect_literal(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
         // F7（Issue #882 計画）: `REAL`/`DOUBLE PRECISION` の負リテラル
-        // （`-1.5` 等）を受理するため、`HAVING` 述語（約 L1359）と同じ
-        // `['-'] <Number>` の文法を先読みで判定する。`Number` 以外（文字列・
+        // （`-1.5` 等）も同じ規範で受理する（`HAVING` 述語〔約 L1359〕と同じ
+        // `['-'] <Number>` の文法を先読みで判定）。`Number` 以外（文字列・
         // ベクトルリテラル）の直前の `-` は許可リスト外のまま拒否する。
         if matches!(self.peek(), Some(Token::Punct('-'))) {
             self.advance();
             return match self.advance() {
                 Some(Token::Number(n)) => Ok(InsertLiteral::Number(format!("-{n}"))),
                 other => Err(SqlSurfaceError::unsupported(format!(
-                    "expected numeric literal after '-', got {other:?}"
+                    "expected numeric literal after unary minus, got {other:?}"
                 ))),
             };
         }
@@ -4406,6 +4412,89 @@ mod tests {
             stmt.operation_id.as_ref().map(OperationId::as_str),
             Some("op-0001")
         );
+    }
+
+    // --- 単項マイナス（Issue #881・TABLE-13・TASK-196） ---
+
+    /// `-` の直後に数値トークンが続く形は単項マイナスとして受理し、
+    /// `InsertLiteral::Number("-<digits>")` へ正規化する（`INTEGER`／`BIGINT`
+    /// 列の負数リテラルを許可リストの構造段で通すための変更。値域検証・
+    /// パースは束縛段（`sql::parser::bind_integer_literal`）が行う）。
+    #[test]
+    fn accepts_negative_number_literal_in_values() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', -5) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("negative number literal should be accepted");
+        assert_eq!(
+            stmt.rows,
+            vec![vec![
+                InsertLiteral::Number("1".to_string()),
+                InsertLiteral::String("[0.1,0.2]".to_string()),
+                InsertLiteral::Number("-5".to_string()),
+            ]]
+        );
+    }
+
+    /// 空白を挟んだ単項マイナス（`- 5`）も同じ形として受理する。
+    #[test]
+    fn accepts_negative_number_literal_with_whitespace_between_minus_and_digits() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', - 5) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("negative number literal with whitespace should be accepted");
+        assert_eq!(stmt.rows[0][2], InsertLiteral::Number("-5".to_string()));
+    }
+
+    /// `- -1`（二重マイナス）は構造的に受理しない（`42601`）。単項マイナスの
+    /// 直後は数値トークンのみを許すため、2 個目の `-` はそこで構文エラーになる。
+    #[test]
+    fn rejects_double_minus_number_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', - -1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// `+1`（単項プラス）は `NUMERIC` 列の符号付きリテラル（Issue #885・D6・
+    /// PR #1020 codex-review 指摘対応）を許可リストの構造段で通すために現在は
+    /// 受理し、`InsertLiteral::Number("+1")` へ正規化する（本テストでの
+    /// `catalog_with` は列型を持たないため、非 NUMERIC 列に対する拒否
+    /// （束縛段の型不一致・不正値 `22000`）はここでは検証しない。詳細は
+    /// `expect_literal` のドキュメンテーションコメント参照）。
+    #[test]
+    fn accepts_unary_plus_number_literal_structurally() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', +1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("unary plus number literal should be accepted structurally");
+        assert_eq!(stmt.rows[0][2], InsertLiteral::Number("+1".to_string()));
+    }
+
+    /// `-'x'`（マイナスの直後に文字列リテラル）は構造的に受理しない（`42601`）。
+    #[test]
+    fn rejects_minus_followed_by_string_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding, n) VALUES (1, '[0.1,0.2]', -'x') USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     // --- RETURNING（Issue #873・SQL-21） ---

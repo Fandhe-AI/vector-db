@@ -197,6 +197,8 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
                     match &column.ty {
                         ColumnType::Vector(_) => needs_embedding = true,
                         ColumnType::Text
+                        | ColumnType::Integer
+                        | ColumnType::BigInt
                         | ColumnType::Real
                         | ColumnType::Double
                         | ColumnType::Boolean
@@ -524,6 +526,30 @@ pub fn execute_scan(
                                         detail: "scalar payload type mismatch".to_string(),
                                     })
                                 }
+                            },
+                            ColumnType::Integer => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::Integer(v))) => {
+                                    cells.push(Cell::SignedInteger(i64::from(*v)))
+                                }
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scanned scalar type mismatch for INTEGER column"
+                                            .to_string(),
+                                    })
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
+                            },
+                            ColumnType::BigInt => match scanned.get(*index) {
+                                Some(Some(row_codec::ScalarRef::BigInt(v))) => {
+                                    cells.push(Cell::SignedInteger(*v))
+                                }
+                                Some(Some(_)) => {
+                                    return Err(SqlSurfaceError::Internal {
+                                        detail: "scanned scalar type mismatch for BIGINT column"
+                                            .to_string(),
+                                    })
+                                }
+                                Some(None) | None => cells.push(Cell::Null),
                             },
                             ColumnType::Boolean => match scanned.get(*index) {
                                 Some(Some(row_codec::ScalarRef::Bool(b))) => {

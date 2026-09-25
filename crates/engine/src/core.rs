@@ -3752,6 +3752,8 @@ impl EngineCore {
                     crate::row_codec::Value::Vector(v) => {
                         v.len().saturating_mul(std::mem::size_of::<f32>())
                     }
+                    crate::row_codec::Value::Integer(_) => std::mem::size_of::<i32>(),
+                    crate::row_codec::Value::BigInt(_) => std::mem::size_of::<i64>(),
                     // REAL/DOUBLE は固定長ペイロード（row_codec の
                     // SCALAR_REAL_ENTRY_LEN/SCALAR_DOUBLE_ENTRY_LEN と同じ本体幅）。
                     crate::row_codec::Value::Real(_) => std::mem::size_of::<f32>(),

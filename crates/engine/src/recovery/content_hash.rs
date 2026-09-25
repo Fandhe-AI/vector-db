@@ -214,10 +214,19 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             b.push_u8(2);
             push_vector(b, vector)?;
         }
-        // タグ 3・4（Integer・BigInt）は Issue #881 の予約割り当て。TABLE-13・
+        // Issue #881 D7: 既存タグ（Null=0／Text=1／Vector=2）の意味・並びは
+        // 変更せず、`INTEGER`／`BIGINT` にタグ 3／4 を新設する。TABLE-13・
         // Issue #882 計画 F9: Real=5・Double=6（正規化後の LE ビット列）。
         // BOOLEAN は TABLE-13 の宣言順で 7 とする（Issue #883。他の型と衝突しない
         // 新規タグ）。8〜9 は DATE/TIMESTAMP（別 Issue の作業）向けに予約する。
+        Value::Integer(v) => {
+            b.push_u8(3);
+            b.push_raw(&v.to_le_bytes());
+        }
+        Value::BigInt(v) => {
+            b.push_u8(4);
+            b.push_raw(&v.to_le_bytes());
+        }
         // NUMERIC は当初宣言順の 10 を想定していたが、base（main）マージ取り込みで
         // ARRAY（Issue #888）がタグ 10 を先に使用していたため、Issue #885 の
         // origin/main への rebase 時点（NUMERIC の content_hash はまだ一度も
@@ -1423,6 +1432,57 @@ mod tests {
         let h1 = for_typed_insert(7, Visibility::Public, &embedding, &cols_a).expect("hash");
         let h2 = for_typed_insert(7, Visibility::Public, &embedding, &cols_b).expect("hash");
         assert_ne!(h1, h2);
+    }
+
+    // --- INTEGER / BIGINT（Issue #881・TABLE-13・TASK-196） -----------------
+
+    // タグ 3（Integer）／タグ 4（BigInt）で値が異なれば区別できる（同一内容の
+    // 再送は 23505、内容不一致は 22023 という RECOVER-10 の契約を成立させる前提）。
+    #[test]
+    fn for_typed_insert_differs_by_integer_and_bigint_value() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let n_a = Value::Integer(1);
+        let n_b = Value::Integer(2);
+        let cols_a: [(&str, &Value); 1] = [("n", &n_a)];
+        let cols_b: [(&str, &Value); 1] = [("n", &n_b)];
+        let h1 = for_typed_insert(7, Visibility::Public, &embedding, &cols_a).expect("hash");
+        let h2 = for_typed_insert(7, Visibility::Public, &embedding, &cols_b).expect("hash");
+        assert_ne!(h1, h2);
+
+        let b_a = Value::BigInt(1);
+        let b_b = Value::BigInt(2);
+        let cols_c: [(&str, &Value); 1] = [("b", &b_a)];
+        let cols_d: [(&str, &Value); 1] = [("b", &b_b)];
+        let h3 = for_typed_insert(7, Visibility::Public, &embedding, &cols_c).expect("hash");
+        let h4 = for_typed_insert(7, Visibility::Public, &embedding, &cols_d).expect("hash");
+        assert_ne!(h3, h4);
+    }
+
+    // 同一内容（同じ列名・同じ Integer/BigInt 値）の再送は同一ハッシュになる
+    // （台帳照合による再送判定 23505 が成立する前提）。
+    #[test]
+    fn for_typed_insert_is_stable_for_identical_integer_and_bigint_resend() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let n = Value::Integer(42);
+        let b = Value::BigInt(-42);
+        let cols: [(&str, &Value); 2] = [("n", &n), ("b", &b)];
+        let h1 = for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash");
+        let h2 = for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash");
+        assert_eq!(h1, h2);
+    }
+
+    // Integer と BigInt はタグ（3 と 4）で区別され、たとえ値が偶然一致しても
+    // 異なる列型として異なるハッシュになる（タグ混同による衝突が無いことの固定）。
+    #[test]
+    fn for_typed_insert_distinguishes_integer_from_bigint_tag_even_with_same_numeric_value() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let n = Value::Integer(5);
+        let b = Value::BigInt(5);
+        let cols_int: [(&str, &Value); 1] = [("v", &n)];
+        let cols_big: [(&str, &Value); 1] = [("v", &b)];
+        let h_int = for_typed_insert(7, Visibility::Public, &embedding, &cols_int).expect("hash");
+        let h_big = for_typed_insert(7, Visibility::Public, &embedding, &cols_big).expect("hash");
+        assert_ne!(h_int, h_big);
     }
 
     // codex-review P1・cursor bugbot 指摘（PR #248）の回帰固定: visibility のみが
