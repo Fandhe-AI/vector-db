@@ -1294,6 +1294,14 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #909）: 本 variant の追加により `ParsedSql` を
     /// 網羅的にマッチする既存コードはすべて更新済み。
     DropView(crate::sql::allowlist::ValidatedDropView),
+    /// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])`（TASK-206・
+    /// INDEX-7・SQL-23、Issue #908）。DDL 実行権限ゲート
+    /// （`sql::ddl::require_ddl_permission`）の判定は `EngineCore::
+    /// execute_parsed_in_session` が担い、`validate_create_index_tokens` 自体は
+    /// カタログ照会を一切行わない（`CreateView` と同じ設計）。
+    CreateIndex(crate::sql::allowlist::ValidatedCreateIndex),
+    /// `DROP INDEX <name>`（TASK-206・INDEX-7・SQL-23、Issue #908）。
+    DropIndex(crate::sql::allowlist::ValidatedDropIndex),
 }
 
 /// `parsed` が保持する `operation_id`（`USING OPERATION_ID '<id>'`。書き込み系
@@ -2203,6 +2211,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::CreateIndex(_)
+                    | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback => {
@@ -2238,6 +2248,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::CreateIndex(_)
+                    | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback => {
@@ -2270,6 +2282,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::AlterTable(_)
                     | crate::sql::SqlOutcome::CreateView(_)
                     | crate::sql::SqlOutcome::DropView(_)
+                    | crate::sql::SqlOutcome::CreateIndex(_)
+                    | crate::sql::SqlOutcome::DropIndex(_)
                     | crate::sql::SqlOutcome::Begin
                     | crate::sql::SqlOutcome::Commit
                     | crate::sql::SqlOutcome::Rollback => {
@@ -2480,6 +2494,15 @@ impl EngineCore {
             return Ok(ParsedSql::Update(stmt));
         }
 
+        // TASK-206・INDEX-7・SQL-23（Issue #908）: `DROP INDEX` は汎用の
+        // `is_drop_statement`（`DROP TABLE` 扱い）より前に分岐する。
+        // `validate_drop_index_tokens` はカタログ照会を一切行わない
+        // （`DropTable`・`DropView` と同じ設計）。
+        if crate::sql::allowlist::is_drop_index_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_drop_index_tokens(&tokens)?;
+            return Ok(ParsedSql::DropIndex(stmt));
+        }
+
         let is_drop_view_statement = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("DROP")
@@ -2522,6 +2545,15 @@ impl EngineCore {
             // `parse_create_function` へ渡ることはない）。
             let stmt = crate::sql::allowlist::validate_create_view_tokens(&tokens)?;
             return Ok(ParsedSql::CreateView(stmt));
+        }
+
+        // TASK-206・INDEX-7・SQL-23（Issue #908）: `CREATE INDEX` も
+        // `CreateView` と同じくカタログ照会を一切行わない構造検証のみで束縛し、
+        // `sql::allowlist::validate_sql_tokens` 内の `CREATE FUNCTION` 分岐へ
+        // 渡さない。
+        if crate::sql::allowlist::is_create_index_statement(&tokens) {
+            let stmt = crate::sql::allowlist::validate_create_index_tokens(&tokens)?;
+            return Ok(ParsedSql::CreateIndex(stmt));
         }
 
         // `DropTable` と同じ設計（Issue #899・#902 で DDL 実行権限ゲートの判定
@@ -2785,6 +2817,22 @@ impl EngineCore {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 let outcome = crate::sql::ddl::execute_drop_view(&self.storage, stmt)?;
                 Ok(crate::sql::SqlOutcome::DropView(outcome))
+            }
+            // TASK-206・INDEX-7・SQL-23（Issue #908）: `DropTable`・`CreateView` と
+            // 同じ判定順序（DDL 実行権限ゲート → カタログ照会を含む実行本体）。
+            // 権限を持たない主体には対象テーブル・索引の有無を問わず常に `42501`
+            // のみを返す。`ctx` は取らない（索引宣言はテナントスコープの操作では
+            // なく、索引の物理表現は既存の `(table, PolicyContext)` 可視
+            // スナップショット由来キャッシュのまま）。
+            ParsedSql::CreateIndex(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_create_index(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::CreateIndex(outcome))
+            }
+            ParsedSql::DropIndex(stmt) => {
+                crate::sql::ddl::require_ddl_permission(session)?;
+                let outcome = crate::sql::ddl::execute_drop_index(&self.storage, stmt)?;
+                Ok(crate::sql::SqlOutcome::DropIndex(outcome))
             }
             ParsedSql::Statement(stmt) => {
                 self.execute_validated_in_session(ctx, session, stmt.clone())
@@ -3127,6 +3175,9 @@ impl EngineCore {
             // （`DropTable` と同じ扱い）。
             ParsedSql::CreateView(_) => Ok(None),
             ParsedSql::DropView(_) => Ok(None),
+            // TASK-206・INDEX-7（Issue #908）: 索引 DDL も結果列を持たない。
+            ParsedSql::CreateIndex(_) => Ok(None),
+            ParsedSql::DropIndex(_) => Ok(None),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
                 match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {

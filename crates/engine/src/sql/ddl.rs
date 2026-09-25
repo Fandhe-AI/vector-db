@@ -1,5 +1,6 @@
-//! DDL（`CREATE TABLE`・`DROP TABLE`・`ALTER TABLE ADD COLUMN` 等）の実行権限
-//! ゲートと実行本体（SQL-23・TASK-85・TASK-202・TASK-203、Issue #899・#900・#902）。
+//! DDL（`CREATE TABLE`・`DROP TABLE`・`ALTER TABLE ADD COLUMN`・`CREATE INDEX` 等）の
+//! 実行権限ゲートと実行本体（SQL-23・TASK-85・TASK-202・TASK-203・TASK-205・
+//! TASK-206、Issue #899・#900・#902・#909・#908）。
 //!
 //! 責務境界: `core.rs::EngineCore::execute_parsed_in_session` の
 //! `ParsedSql::CreateTable`／`ParsedSql::DropTable`／`ParsedSql::AlterTable`
@@ -37,10 +38,10 @@
 //! 別軸の権限であり（テーブル・カタログは全テナント共有）、RLS の判定を
 //! 一切変更しない。
 
-use crate::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
+use crate::catalog::{CatalogError, ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema};
 use crate::sql::allowlist::{
-    SqlSurfaceError, ValidatedAlterTableAddColumn, ValidatedCreateTable, ValidatedCreateView,
-    ValidatedDropTable, ValidatedDropView,
+    SqlSurfaceError, ValidatedAlterTableAddColumn, ValidatedCreateIndex, ValidatedCreateTable,
+    ValidatedCreateView, ValidatedDropIndex, ValidatedDropTable, ValidatedDropView,
 };
 use crate::sql::ddl_column_type::SqlColumnTypeName;
 use crate::sql::mode::SessionState;
@@ -125,7 +126,14 @@ pub(crate) fn execute_create_table(
         // `Storage::alter_table_add_column`）専用の変種で、`Storage::create_table`
         // からは返らない（列数上限は `validate_create_table_tokens` が構造検証
         // 段階で `54000` として既に拒否する。到達不能）。
-        | CatalogError::TooManyColumns { .. } => SqlSurfaceError::Internal {
+        | CatalogError::TooManyColumns { .. }
+        // 索引宣言（TASK-206・INDEX-7、Issue #908）専用の変種で、
+        // `Storage::create_table` からは返らない（到達不能）。索引名との衝突は
+        // `TableAlreadyExists` として返る。
+        | CatalogError::IndexAlreadyExists(_)
+        | CatalogError::IndexNotFound(_)
+        | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     })?;
@@ -357,7 +365,13 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::ViewNotFound(_)
         | CatalogError::DependentViewsExist(_)
-        | CatalogError::ViewLimitExceeded(_) => SqlSurfaceError::Internal {
+        | CatalogError::ViewLimitExceeded(_)
+        // 索引宣言（TASK-206・INDEX-7、Issue #908）専用の変種で、
+        // `alter_table_add_column` からは返らない（到達不能）。
+        | CatalogError::IndexAlreadyExists(_)
+        | CatalogError::IndexNotFound(_)
+        | CatalogError::IndexKindMismatch(_)
+        | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }
@@ -450,6 +464,90 @@ fn map_drop_view_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+/// `CREATE INDEX`（TASK-206・INDEX-7・SQL-23、Issue #908）の成功応答。
+/// [`CreateTableOutcome`] と同じくフィールドを持たない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateIndexOutcome {}
+
+/// `DROP INDEX`（TASK-206・INDEX-7・SQL-23、Issue #908）の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropIndexOutcome {}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
+/// （TASK-206・INDEX-7、Issue #908）。`crate::catalog::Storage::create_index`
+/// （単一 write txn 内で名前衝突・対象の種別と存在・列整合・件数上限を判定して
+/// 保存し、対象テーブルの世代を進める）へ委譲する。構文検証段
+/// （`validate_create_index_tokens`）はカタログを一切照会していない。
+pub(crate) fn execute_create_index(
+    storage: &Storage,
+    validated: &ValidatedCreateIndex,
+) -> Result<CreateIndexOutcome, SqlSurfaceError> {
+    let kind = if validated.is_hnsw() {
+        IndexKind::Hnsw
+    } else {
+        IndexKind::Scalar
+    };
+    let def = IndexDef::new(
+        validated.name().to_string(),
+        validated.table().to_string(),
+        kind,
+        validated.columns().to_vec(),
+    );
+    storage.create_index(&def).map_err(map_create_index_error)?;
+    Ok(CreateIndexOutcome {})
+}
+
+/// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
+/// （TASK-206・INDEX-7、Issue #908）。`crate::catalog::Storage::drop_index` へ委譲する。
+pub(crate) fn execute_drop_index(
+    storage: &Storage,
+    validated: &ValidatedDropIndex,
+) -> Result<DropIndexOutcome, SqlSurfaceError> {
+    storage
+        .drop_index(validated.name())
+        .map_err(map_drop_index_error)?;
+    Ok(DropIndexOutcome {})
+}
+
+/// `Storage::create_index` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （ERR-6: 名前衝突 `42P07`、対象テーブル不存在 `42P01`、対象がビュー `42809`、
+/// 列不存在 `42703`、種別と列型の不整合 `0A000`、件数上限 `54000`）。エラー文言に
+/// テナント・行内容・redb 内部詳細は含めない（security.md P0）。
+fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::IndexAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::IndexKindMismatch(detail) => SqlSurfaceError::FeatureNotSupported { detail },
+        CatalogError::IndexLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        // 識別子形状・列数（構文検証段で既に拒否済みのため通常は到達しない）。
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("malformed index definition in CREATE INDEX")
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "CREATE INDEX failed".to_string(),
+        },
+    }
+}
+
+/// `Storage::drop_index` の [`CatalogError`] を SQL 表層の契約へ写像する
+/// （ERR-6: 索引不存在 `42704`、テーブル・ビュー名を指定 `42809`）。
+fn map_drop_index_error(e: CatalogError) -> SqlSurfaceError {
+    match e {
+        CatalogError::IndexNotFound(name) => SqlSurfaceError::UndefinedObject { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::Invalid(_) => {
+            SqlSurfaceError::unsupported("malformed index reference in DROP INDEX")
+        }
+        CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
+        _ => SqlSurfaceError::Internal {
+            detail: "DROP INDEX failed".to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +626,61 @@ mod tests {
     fn drop_view_write_lock_timeout_maps_to_lock_not_available() {
         let err = map_drop_view_error(CatalogError::WriteLockTimeout);
         assert_eq!(err.wire_code(), "55P03");
+    }
+
+    /// `CREATE INDEX`／`DROP INDEX`（TASK-206・INDEX-7、Issue #908）の
+    /// `CatalogError` 写像（ERR-6。書き込みゲートの待機上限超過は他の DDL と
+    /// 同じく `55P03`、索引件数上限は `54000`、未知の内部事象は `XX000`）。
+    #[test]
+    fn index_ddl_catalog_errors_map_to_err6_codes() {
+        let cases: [(SqlSurfaceError, &str); 10] = [
+            (
+                map_create_index_error(CatalogError::IndexAlreadyExists("i".into())),
+                "42P07",
+            ),
+            (
+                map_create_index_error(CatalogError::TableNotFound("t".into())),
+                "42P01",
+            ),
+            (
+                map_create_index_error(CatalogError::WrongObjectKind("v".into())),
+                "42809",
+            ),
+            (
+                map_create_index_error(CatalogError::ColumnNotFound("c".into())),
+                "42703",
+            ),
+            (
+                map_create_index_error(CatalogError::IndexKindMismatch("k".into())),
+                "0A000",
+            ),
+            (
+                map_create_index_error(CatalogError::IndexLimitExceeded("n".into())),
+                "54000",
+            ),
+            (
+                map_create_index_error(CatalogError::WriteLockTimeout),
+                "55P03",
+            ),
+            (
+                map_drop_index_error(CatalogError::IndexNotFound("i".into())),
+                "42704",
+            ),
+            (
+                map_drop_index_error(CatalogError::WrongObjectKind("t".into())),
+                "42809",
+            ),
+            (
+                map_drop_index_error(CatalogError::WriteLockTimeout),
+                "55P03",
+            ),
+        ];
+        for (err, code) in cases {
+            assert_eq!(err.wire_code(), code, "{err:?}");
+        }
+        let internal = map_drop_index_error(CatalogError::CorruptSchema("x".into()));
+        assert_eq!(internal.wire_code(), "XX000");
+        assert_eq!(internal.client_message(), "internal error");
     }
 
     #[test]

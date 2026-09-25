@@ -493,6 +493,15 @@ mod tests {
         // 同じく `0A000` で拒否されなければならない（`check_write_placement`
         // ドキュメント参照）。
         assert_eq!(classify_statement("DROP TABLE t"), StatementEffect::Write);
+        // TASK-206・INDEX-7（Issue #908）: 索引宣言 DDL も書き込み系（カタログを
+        // commit する）として分類され、複文中で最後以外なら `0A000`。
+        assert_eq!(
+            classify_statement("CREATE INDEX i ON t (body)"),
+            StatementEffect::Write
+        );
+        assert_eq!(classify_statement("DROP INDEX i"), StatementEffect::Write);
+        assert!(check_write_placement(&["CREATE INDEX i ON t (body)", "SELECT 1"], false).is_err());
+        assert!(check_write_placement(&["SELECT 1", "DROP INDEX i"], false).is_ok());
         assert_eq!(
             classify_statement("BEGIN"),
             StatementEffect::TransactionControl(crate::sql::transaction::TxnControl::Begin)

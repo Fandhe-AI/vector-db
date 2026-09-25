@@ -196,7 +196,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 27] = [
+const EXPECTED_STATUS: [(&str, u16); 29] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -233,6 +233,12 @@ const EXPECTED_STATUS: [(&str, u16); 27] = [
     // `err4_f_unreachable_classes_project_via_production_encoder` 参照）。
     ("2BP01", 400),
     ("42809", 400),
+    // TASK-206・INDEX-7・SQL-23（Issue #908）: `CREATE INDEX`／`DROP INDEX` が
+    // 新設する 2 分類（索引不在・参照列不在）。索引名の衝突は `42P07` を共有する。
+    // SQL 表層専用の DDL であり NoSQL `op` 許可リストには含めないため、
+    // production の応答エンコーダ経由で射影のみ検証する。
+    ("42704", 400),
+    ("42703", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -291,7 +297,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 28);
+const _: () = assert!(ErrorClass::ALL.len() == 30);
 
 /// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
@@ -689,7 +695,9 @@ fn err4_f_internal_error_projects_xx000_to_500() {
 /// `DROP VIEW` は SQL 表層専用の DDL で、いずれも NoSQL `op` 許可リストに
 /// 含まれない（`gate.rs`・`http/query/op.rs`）。明示トランザクション制御
 /// （SQL-31・TASK-221。`25000`/`25001`/`25P01`/`25P02`）も NoSQL 表層の `op`
-/// 許可リストにトランザクション制御が無いため同様に到達不能。要求駆動ではなく、
+/// 許可リストにトランザクション制御が無いため同様に到達不能。`42704`／`42703`
+/// （TASK-206・INDEX-7・SQL-23、Issue #908。`CREATE INDEX`／`DROP INDEX`）も
+/// SQL 表層専用の DDL の分類で同様に到達不能。要求駆動ではなく、
 /// production の応答エンコーダ（[`wire_server::http::response::encode_error`]。
 /// ルータ・各 op ハンドラが実際に使う関数）を通したバイト列を実応答と同じパーサで
 /// 解析し、射影のみを検証する。
@@ -714,6 +722,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         ErrorClass::ActiveSqlTransaction,
         ErrorClass::NoActiveSqlTransaction,
         ErrorClass::InFailedSqlTransaction,
+        // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引 DDL は SQL 表層専用。
+        ErrorClass::UndefinedObject,
+        ErrorClass::UndefinedColumn,
     ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());

@@ -32,6 +32,11 @@ const MAX_ERROR_DETAIL_LEN: usize = crate::error_format::MAX_MESSAGE_LEN;
 /// リソース確保（DoS）」対応）。`catalog::MAX_COLUMN_COUNT` と同値を採用する。
 const MAX_INSERT_COLUMNS: usize = 256;
 
+/// `CREATE INDEX` の列リストが持てる要素数の上限（TASK-206・INDEX-7、Issue #908）。
+/// `MAX_INSERT_COLUMNS` と同値を採用する（無制限 `Vec` 確保を避ける。
+/// `.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」対応）。
+pub(crate) const MAX_INDEX_DDL_COLUMNS: usize = 256;
+
 /// `CREATE TABLE`（SQL-23・TASK-85、Issue #899）の列リストが持てる列数の上限。
 /// `catalog::MAX_COLUMN_COUNT` と同値を採用する（`MAX_INSERT_COLUMNS` と同じ
 /// 「無制限 `Vec` 確保を避ける」設計方針。列を `Vec` へ push する**前**に判定し、
@@ -357,6 +362,14 @@ pub enum SqlSurfaceError {
     /// ERR-6: `23505`）。行キー衝突（[`SqlSurfaceError::IdConflict`]。物理キー
     /// `(tenant_id, id)` の衝突）とは別の固定文言を返す。
     UniqueViolation,
+    /// `DROP INDEX` で指定した名前が索引として存在しない（TASK-206・INDEX-7、
+    /// Issue #908。[`crate::catalog::CatalogError::IndexNotFound`] の写像。
+    /// ERR-6: `42704`）。
+    UndefinedObject { name: String },
+    /// 索引 DDL が参照した列が対象テーブルに存在しない（TASK-206・INDEX-7、
+    /// Issue #908。[`crate::catalog::CatalogError::ColumnNotFound`] の写像。
+    /// ERR-6: `42703`）。
+    UndefinedColumn { name: String },
 }
 
 impl SqlSurfaceError {
@@ -531,6 +544,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::WrongObjectType { .. } => ErrorClass::WrongObjectType,
             SqlSurfaceError::NotNullViolation { .. } => ErrorClass::NotNullViolation,
             SqlSurfaceError::UniqueViolation => ErrorClass::UniqueViolation,
+            SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
+            SqlSurfaceError::UndefinedColumn { .. } => ErrorClass::UndefinedColumn,
         }
     }
 
@@ -639,6 +654,13 @@ impl std::fmt::Display for SqlSurfaceError {
             // UniqueViolation` の `Display` と同じ考え方）。キー値・行 id・
             // テナント名は含めない（security.md P0）。
             SqlSurfaceError::UniqueViolation => write!(f, "unique constraint violation"),
+            // 名前はクライアント自身が指定した識別子（`UndefinedTable` と同じ扱い）。
+            SqlSurfaceError::UndefinedObject { name } => {
+                write!(f, "index does not exist: {name}")
+            }
+            SqlSurfaceError::UndefinedColumn { name } => {
+                write!(f, "column does not exist: {name}")
+            }
         }
     }
 }
@@ -3371,6 +3393,167 @@ pub(crate) fn validate_create_view_tokens(
         base_relation: body.table_name,
         body_sql,
     })
+}
+
+/// `CREATE INDEX <name> ON <table> [USING hnsw] (<col>[, ...])` の許可形状構造
+/// 検証結果（TASK-206・INDEX-7・SQL-23、Issue #908）。[`ValidatedDropTable`] と
+/// 同じくカタログ照会を一切行わない（列の存在・型整合・名前衝突・対象の種別は
+/// `sql::ddl::execute_create_index` → `catalog::Storage::create_index` が単一の
+/// 書き込みトランザクション内で判定する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCreateIndex {
+    pub(crate) name: String,
+    pub(crate) table: String,
+    /// `USING hnsw` 指定の有無（`hnsw` 以外の `USING` 値は構造検証段で `0A000`
+    /// 拒否済み）。
+    pub(crate) hnsw: bool,
+    pub(crate) columns: Vec<String>,
+}
+
+impl ValidatedCreateIndex {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub fn is_hnsw(&self) -> bool {
+        self.hnsw
+    }
+
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
+/// `DROP INDEX <name>` の許可形状構造検証結果（TASK-206・INDEX-7・SQL-23、
+/// Issue #908）。[`ValidatedDropView`] と同じくカタログ照会を一切行わない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedDropIndex {
+    pub(crate) name: String,
+}
+
+impl ValidatedDropIndex {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// 先頭 2 トークンが `CREATE INDEX` か（`core.rs::EngineCore::parse_tokens` の
+/// 分岐判定。`CREATE`・`INDEX` は予約語化せず文頭でのみ文脈的に照合する）。
+pub(crate) fn is_create_index_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX"))
+}
+
+/// 先頭 2 トークンが `DROP INDEX` か（[`is_create_index_statement`] と同じ流儀）。
+pub(crate) fn is_drop_index_statement(tokens: &[Token]) -> bool {
+    matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DROP"))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("INDEX"))
+}
+
+/// [`ValidatedCreateIndex`] の構造検証本体（TASK-206・INDEX-7、Issue #908）。
+/// カタログを参照しない範囲の判定はここで完結させる（fail-closed。権限の無い
+/// 呼び出し元へ存在情報を漏らさないよう、カタログ照会を要する検査は一切行わない）:
+/// - `USING <ident>` が `hnsw` 以外 → `0A000`（`FeatureNotSupported`）。
+/// - `USING hnsw` なのに列が複数 → `0A000`。
+/// - 列リストの要素が式・関数呼び出し・リテラル → `0A000`。
+/// - 部分索引の `WHERE` 句 → `0A000`。
+/// - 列リストに重複する列名 → `42601`。列数上限超過 → `54000`。
+///
+/// `UNIQUE`／`CONCURRENTLY`／`IF NOT EXISTS`／`INCLUDE`／`WITH (...)`／
+/// `ASC|DESC`／opclass・スキーマ修飾名・`$n` 等は、いずれも期待するトークン列と
+/// 一致しないため `expect_*` ヘルパー経由で構造的に `42601` へ落ちる。
+pub(crate) fn validate_create_index_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedCreateIndex, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("CREATE")?;
+    p.expect_ident_matching("INDEX")?;
+    let name = p.expect_ident()?;
+    p.expect_ident_matching("ON")?;
+    let table = p.expect_ident()?;
+    let hnsw = if p.peek_ident_matches("USING") {
+        p.advance();
+        let method = p.expect_ident()?;
+        if !method.eq_ignore_ascii_case("hnsw") {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: truncate_for_error(&format!("index method {method} is not supported")),
+            });
+        }
+        true
+    } else {
+        false
+    };
+    p.expect_punct('(')?;
+    let mut columns = vec![parse_index_column(&mut p)?];
+    while matches!(p.peek(), Some(Token::Punct(','))) {
+        p.advance();
+        if columns.len() >= MAX_INDEX_DDL_COLUMNS {
+            return Err(SqlSurfaceError::payload_too_large("too many index columns"));
+        }
+        columns.push(parse_index_column(&mut p)?);
+    }
+    p.expect_punct(')')?;
+    if hnsw && columns.len() != 1 {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "USING hnsw requires exactly one column".to_string(),
+        });
+    }
+    let mut seen = std::collections::HashSet::new();
+    for c in &columns {
+        if !seen.insert(c.as_str()) {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "duplicate index column: {c}"
+            )));
+        }
+    }
+    // 部分索引（PostgreSQL 拡張構文）の `WHERE` 句は許可形状外の「機能」として
+    // `0A000`（`expect_end_of_statement` の汎用検査に落とすと `42601` になる）。
+    if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "partial indexes (WHERE clause) are not supported".to_string(),
+        });
+    }
+    p.expect_end_of_statement()?;
+    Ok(ValidatedCreateIndex {
+        name,
+        table,
+        hnsw,
+        columns,
+    })
+}
+
+/// [`validate_create_index_tokens`] の列リスト 1 要素。裸の識別子のみを受理する
+/// （式・関数呼び出し・括弧・リテラルは `0A000` で拒否する）。
+fn parse_index_column(p: &mut Parser<'_>) -> Result<String, SqlSurfaceError> {
+    if !matches!(p.peek(), Some(Token::Ident(_))) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "index columns must be plain identifiers".to_string(),
+        });
+    }
+    let name = p.expect_ident()?;
+    if matches!(p.peek(), Some(Token::Punct('('))) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "expression indexes are not supported".to_string(),
+        });
+    }
+    Ok(name)
+}
+
+/// [`ValidatedDropIndex`] の構造検証本体。`IF EXISTS`・`CASCADE`・複数名の同時
+/// 指定はいずれもトレイリングトークン検査により構造的に `42601` へ落ちる。
+pub(crate) fn validate_drop_index_tokens(
+    tokens: &[Token],
+) -> Result<ValidatedDropIndex, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("DROP")?;
+    p.expect_ident_matching("INDEX")?;
+    let name = p.expect_ident()?;
+    p.expect_end_of_statement()?;
+    Ok(ValidatedDropIndex { name })
 }
 
 /// [`ValidatedDropView`] の構造検証本体。
