@@ -102,7 +102,10 @@ Issue #953 で不透明バイト列として実装済み）へ組み立てる必
    - `subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }`:
      AlgorithmIdentifier は葉・中間を問わず構造検査（先頭に整形式の OID が
      1 個・任意の `parameters` は高々 1 個の TLV・余剰要素なし）を通し、OID・
-     parameters 有無・鍵ビット列を保持する
+     parameters 有無・鍵ビット列を保持する。`subjectPublicKey` BIT STRING も
+     葉・中間を問わず形状検査（値が空でない・未使用ビット数 0〜7・未使用
+     ビットの 0 埋め・内容 1 バイト以上）を通し、違反は `InvalidPublicKey`
+     とする（`signatureValue`・unique ID と共通の BIT STRING 形状検査）
    - 任意の `issuerUniqueID [1] IMPLICIT`・`subjectUniqueID [2] IMPLICIT`:
      存在すれば `BIT STRING` の形状（未使用ビット数 0〜7・非 0 なら最終
      オクテットの未使用ビットが 0）を検査する
@@ -159,8 +162,8 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
 - 期待公開鍵との照合は `super::hkdf::ct_eq`（定数時間比較）で行う。公開鍵は
   公開データそのものだが、導出元が秘密鍵であるため保守的に定数時間で
   比較する
-- 中間証明書の SPKI アルゴリズムは制限しない（AlgorithmIdentifier の構造
-  だけ検査する）
+- 中間証明書の SPKI アルゴリズム・鍵長は制限しない（AlgorithmIdentifier の
+  構造と `subjectPublicKey` BIT STRING の形状だけ検査する）
 
 ## `Certificate` メッセージの組み立て
 
@@ -214,7 +217,10 @@ validity はチェーン内の**全証明書**に対して現在時刻（呼び�
   追加／PKCS#8 DER を証明書として渡す／version 欠落（v1）・v2（`1`）／
   `tbsCertificate.signature` と外側の不一致／両側とも空の AlgorithmIdentifier・
   余剰要素付き・不正な OID の AlgorithmIdentifier／中間証明書 SPKI の
-  AlgorithmIdentifier の余剰要素・切り詰め OID／serialNumber の負数・ゼロ・
+  AlgorithmIdentifier の余剰要素・切り詰め OID／中間証明書 SPKI の
+  BIT STRING の形状違反（空・未使用ビット数オクテットのみ・未使用ビット数
+  8・非 0 パディング・内容なし。いずれも `index: 1` の `InvalidPublicKey`。
+  0 埋めの非 0 未使用ビット数は受理）／serialNumber の負数・ゼロ・
   21 オクテット・非最小符号化（20 オクテット・符号ビット確保の先頭 `0x00` は
   受理）／`signatureValue` の署名データ欠落・非 0 パディング（0 パディングは
   受理）／SPKI parameters 付き／BIT STRING 未使用ビット非 0／鍵長 31・33／
