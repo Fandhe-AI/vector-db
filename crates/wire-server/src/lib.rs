@@ -86,8 +86,19 @@
 //!   RFC 8446 §5.2〜§5.5。Issue #959）・`tls::ed25519`（Ed25519 署名生成・
 //!   検証。RFC 8032 §5.1。Issue #961）・`tls::certificate_verify`
 //!   （`CertificateVerify` の署名対象構成・生成・検証。RFC 8446 §4.4.3。
-//!   Issue #961）まで実装済み。接続経路（`handshake.rs`・`server.rs`）への
-//!   結線は #966 以降
+//!   Issue #961）・`tls::server_handshake`（サーバー側ハンドシェイク状態機械。
+//!   Issue #965）まで実装済み。`SSLRequest` への `'S'` 応答・接続への実結線
+//!   （[`tls::stream::TlsStream`]・`handshake.rs` の二段ネゴシエーション）は
+//!   Issue #966（詳細は `docs/design/tls-wire-connection.md`）。CLI からの
+//!   証明書・鍵読み込み（#967）・HTTPS 表層（#968）・実クライアント接続試験
+//!   （#969）・channel binding（#970）はいずれも後続 sub-issue の担当
+//! - [`wire_stream`][]: 認証後接続ハンドラが読み書きするストリームの抽象
+//!   [`wire_stream::WireStream`]（`Read + Write` + タイムアウト設定・
+//!   shutdown・緊急応答用複製・終了処理）。`TcpStream`（平文）・
+//!   [`tls::stream::TlsStream`]（TLS。Issue #966）の双方に実装し、
+//!   `handshake`・`simple_query`・`extended_query`・`copy`・
+//!   `protocol_dispatch` のハンドラ本体は本 trait のオブジェクトを介して
+//!   同一ロジックを共有する
 //! - `fault_injection`（feature `fault-injection` 限定・テスト専用。
 //!   Issue #705）: `--fault-inject post-commit-panic` opt-in CLI 引数の閉じた
 //!   語彙パーサと、`simple_query::execute_and_respond` の登録ブロック内から
@@ -121,3 +132,4 @@ pub mod server;
 pub mod simple_query;
 pub mod surface;
 pub mod tls;
+pub mod wire_stream;

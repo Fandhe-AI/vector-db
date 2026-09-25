@@ -13,10 +13,11 @@
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（正式なフレーミング上限体系。対象ビヘイビア WIRE-4, WIRE-10）。
 
-use std::io::{self, Write};
+use std::io;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use crate::wire_stream::WireStream;
 use engine::error_format::{ClassifiedError, ErrorClass};
 
 use crate::auth::{self, base64_std, scram, AuthMethod, UserStore};
@@ -91,7 +92,7 @@ type Result<T> = std::result::Result<T, HandshakeError>;
 // 低レベル読み書きプリミティブ
 // ---------------------------------------------------------------------------
 
-fn write_all(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+fn write_all<S: WireStream>(stream: &mut S, data: &[u8]) -> Result<()> {
     stream.write_all(data)?;
     Ok(())
 }
@@ -121,7 +122,7 @@ fn write_ssl_no_response(stream: &mut TcpStream) -> Result<()> {
     write_all(stream, b"N")
 }
 
-fn write_authentication_cleartext_password(stream: &mut TcpStream) -> Result<()> {
+fn write_authentication_cleartext_password<S: WireStream>(stream: &mut S) -> Result<()> {
     // 'R' + length(4) + AuthenticationCleartextPassword コード(4) = 3
     let mut msg = Vec::with_capacity(9);
     msg.push(b'R');
@@ -130,7 +131,7 @@ fn write_authentication_cleartext_password(stream: &mut TcpStream) -> Result<()>
     write_all(stream, &msg)
 }
 
-fn write_authentication_ok(stream: &mut TcpStream) -> Result<()> {
+fn write_authentication_ok<S: WireStream>(stream: &mut S) -> Result<()> {
     let mut msg = Vec::with_capacity(9);
     msg.push(b'R');
     msg.extend_from_slice(&8i32.to_be_bytes());
@@ -147,7 +148,7 @@ const MAX_SASL_MESSAGE_LEN: usize = 2048;
 /// `AuthenticationSASL`（'R'/10）: 提示する機構は [`scram::MECHANISM_NAME`]
 /// の 1 つのみ（`-PLUS` は TLS 未実装のため提示しない。Issue #941・TASK-228 へ
 /// 引き継ぐ）。
-fn write_authentication_sasl(stream: &mut TcpStream) -> Result<()> {
+fn write_authentication_sasl<S: WireStream>(stream: &mut S) -> Result<()> {
     let mut body = Vec::new();
     body.extend_from_slice(scram::MECHANISM_NAME.as_bytes());
     body.push(0);
@@ -162,7 +163,7 @@ fn write_authentication_sasl(stream: &mut TcpStream) -> Result<()> {
 }
 
 /// `AuthenticationSASLContinue`（'R'/11）: server-first-message を運ぶ。
-fn write_authentication_sasl_continue(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+fn write_authentication_sasl_continue<S: WireStream>(stream: &mut S, data: &[u8]) -> Result<()> {
     let total_len = (8 + data.len()) as i32;
     let mut msg = Vec::with_capacity(5 + data.len());
     msg.push(b'R');
@@ -176,7 +177,7 @@ fn write_authentication_sasl_continue(stream: &mut TcpStream, data: &[u8]) -> Re
 /// proof の検証に成功した場合にのみ送出し、これを送った直後は必ず
 /// `AuthenticationOk` 以降の既存シーケンスへ進む（`v=` を送ってからエラーに
 /// する経路は作らない）。
-fn write_authentication_sasl_final(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+fn write_authentication_sasl_final<S: WireStream>(stream: &mut S, data: &[u8]) -> Result<()> {
     let total_len = (8 + data.len()) as i32;
     let mut msg = Vec::with_capacity(5 + data.len());
     msg.push(b'R');
@@ -190,7 +191,7 @@ fn write_authentication_sasl_final(stream: &mut TcpStream, data: &[u8]) -> Resul
 /// 「int32 の長さ（`-1` は不可）」「client-first-message 本体」の順。
 /// PasswordMessage と型バイトは同じだが本文形状が異なるため
 /// `read_password_message` は流用しない。
-fn read_sasl_initial_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_sasl_initial_response<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> {
     let type_byte = match framing::read_typed_frame_header(stream)? {
         Some(b) => b,
         None => return Err(HandshakeError::Protocol("expected SASLInitialResponse")),
@@ -231,7 +232,7 @@ fn read_sasl_initial_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
 /// `SASLResponse`（型 'p'）を読む。本文は raw bytes（PasswordMessage と異なり
 /// NUL 終端ではない）。
-fn read_sasl_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_sasl_response<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> {
     let type_byte = match framing::read_typed_frame_header(stream)? {
         Some(b) => b,
         None => return Err(HandshakeError::Protocol("expected SASLResponse")),
@@ -246,7 +247,7 @@ fn read_sasl_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// BackendKeyData（'K'）: pid・secret key を通知する。CancelRequest 経路は本タスクの
 /// スコープ外だが、クライアント実装（psql 等）が本メッセージの到達を前提に
 /// StartupMessage 後続シーケンスを進めるため送出する。
-fn write_backend_key_data(stream: &mut TcpStream, pid: i32, secret: i32) -> Result<()> {
+fn write_backend_key_data<S: WireStream>(stream: &mut S, pid: i32, secret: i32) -> Result<()> {
     let mut msg = Vec::with_capacity(13);
     msg.push(b'K');
     msg.extend_from_slice(&12i32.to_be_bytes());
@@ -255,7 +256,7 @@ fn write_backend_key_data(stream: &mut TcpStream, pid: i32, secret: i32) -> Resu
     write_all(stream, &msg)
 }
 
-fn write_parameter_status(stream: &mut TcpStream, name: &str, value: &str) -> Result<()> {
+fn write_parameter_status<S: WireStream>(stream: &mut S, name: &str, value: &str) -> Result<()> {
     let mut body = Vec::with_capacity(name.len() + value.len() + 2);
     body.extend_from_slice(name.as_bytes());
     body.push(0);
@@ -277,8 +278,8 @@ fn write_parameter_status(stream: &mut TcpStream, name: &str, value: &str) -> Re
 /// 明示トランザクション（SQL-31・TASK-221・WIRE-19）の状態バイトへそのまま
 /// 写像する。呼び出し元に `SessionTransaction` が無い箇所（ハンドシェイク
 /// 直後）は `TransactionStatus::Idle` を渡す。
-fn write_ready_for_query(
-    stream: &mut TcpStream,
+fn write_ready_for_query<S: WireStream>(
+    stream: &mut S,
     status: engine::sql::transaction::TransactionStatus,
 ) -> Result<()> {
     write_all(
@@ -293,8 +294,8 @@ fn write_ready_for_query(
 /// `HandshakeError`／`handshake::Result` は本モジュール限定の型のため、モジュール
 /// 境界をまたいで直接公開せず、戻り値を `io::Result` へ写像したこの関数のみを
 /// `pub(crate)` にする（`HandshakeError` 自体は private のまま維持する）。
-pub(crate) fn write_error_response_io(
-    stream: &mut TcpStream,
+pub(crate) fn write_error_response_io<S: WireStream>(
+    stream: &mut S,
     class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
@@ -304,8 +305,8 @@ pub(crate) fn write_error_response_io(
 /// `write_ready_for_query` の `io::Result` 版ラッパー。[`crate::simple_query`] は
 /// 本モジュール限定の `handshake::Result` を扱えないため、`ReadyForQuery` を
 /// 送出する唯一の経路としてこの関数を `pub(crate)` にする。
-pub(crate) fn write_ready_for_query_io(
-    stream: &mut TcpStream,
+pub(crate) fn write_ready_for_query_io<S: WireStream>(
+    stream: &mut S,
     status: engine::sql::transaction::TransactionStatus,
 ) -> io::Result<()> {
     write_ready_for_query(stream, status).map_err(io::Error::from)
@@ -318,7 +319,11 @@ pub(crate) fn write_ready_for_query_io(
 /// そのまま受け取り severity は `ERROR` 固定〕を経由しており、`ErrorClass::
 /// ConnectionLimitExceeded` のような `FATAL` 契約の分類でも `ERROR` に丸められる
 /// 不整合があった）。
-fn write_error_response(stream: &mut TcpStream, class: ErrorClass, message: &str) -> Result<()> {
+fn write_error_response<S: WireStream>(
+    stream: &mut S,
+    class: ErrorClass,
+    message: &str,
+) -> Result<()> {
     let msg = crate::error_response::encode(class, message)?;
     write_all(stream, &msg)
 }
@@ -413,7 +418,7 @@ fn parse_startup_params(params_body: &[u8]) -> Result<String> {
 /// 拒否する。review 指摘: `password\0suffix\0` のような多重 NUL フレームを
 /// Argon2id 照合へそのまま渡すと、フレーミングの曖昧さがパスワード照合の意味論に
 /// 混入するため fail-closed で拒否する）。
-fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_password_message<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> {
     let type_byte = match framing::read_typed_frame_header(stream)? {
         Some(b) => b,
         None => return Err(HandshakeError::Protocol("expected PasswordMessage")),
@@ -468,8 +473,8 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// `engine::sql::mode::SessionState`（取得モード・宣言的 UDF レジストリ）で、
 /// いずれも本ループの全クエリを通じて 1 個の値を使い回す（`EngineCore` 自体は
 /// セッション状態を保持しない設計。`sql::mode` モジュールドキュメント参照）。
-fn post_auth_loop<'e>(
-    stream: &mut TcpStream,
+fn post_auth_loop<'e, S: WireStream>(
+    stream: &mut S,
     ctx: &engine::policy::PolicyContext,
     engine: Option<&'e engine::core::EngineCore>,
     session: &mut engine::sql::mode::SessionState,
@@ -944,8 +949,8 @@ const FRAME_DEADLINE_POLL: Duration = Duration::from_millis(100);
 ///   `framing::FrameDeadlineGuard` でフレーム全体の期限を課す（期限超過は接続を
 ///   閉じてライタを解放する）。`applied` は現在ソケットに設定中の値で、変更が
 ///   必要なときだけ `set_read_timeout` を呼ぶ。
-fn read_next_frame_header(
-    stream: &mut TcpStream,
+fn read_next_frame_header<S: WireStream>(
+    stream: &mut S,
     txn: &mut Option<engine::sql::transaction::SessionTransaction<'_>>,
     base_timeout: Option<Duration>,
     applied: &mut Option<Duration>,
@@ -1017,8 +1022,8 @@ fn read_next_frame_header(
 /// - `Frame(Truncated)`: 相手が既に切断しているため応答を送らずに `Ok(())`。
 /// - `Io`: サーバー側の異常として `Err` をそのまま返す（呼び出し元の
 ///   `server::accept_loop` がログに残す）。
-fn respond_and_close(
-    stream: &mut TcpStream,
+fn respond_and_close<S: WireStream>(
+    stream: &mut S,
     err: HandshakeError,
     fallback_message: &str,
 ) -> io::Result<()> {
@@ -1088,7 +1093,11 @@ enum AuthOutcome {
 /// フローを実行する（Issue #940・WIRE-18・TASK-222。サーバー全体で 1 方式に
 /// 固定し、ユーザーごとには切り替えない設計）。`AuthenticationOk` 以降の
 /// 共通シーケンスは呼び出し元（[`handle_connection_inner`]）が担う。
-fn authenticate(stream: &mut TcpStream, store: &UserStore, username: &str) -> Result<AuthOutcome> {
+fn authenticate<S: WireStream>(
+    stream: &mut S,
+    store: &UserStore,
+    username: &str,
+) -> Result<AuthOutcome> {
     match store.auth_method() {
         AuthMethod::Cleartext => authenticate_cleartext(stream, store, username),
         AuthMethod::ScramSha256 => authenticate_scram(stream, store, username),
@@ -1096,8 +1105,8 @@ fn authenticate(stream: &mut TcpStream, store: &UserStore, username: &str) -> Re
 }
 
 /// ポインタ: TASK-67・WIRE-3。既存の cleartext password フロー。
-fn authenticate_cleartext(
-    stream: &mut TcpStream,
+fn authenticate_cleartext<S: WireStream>(
+    stream: &mut S,
     store: &UserStore,
     username: &str,
 ) -> Result<AuthOutcome> {
@@ -1118,8 +1127,8 @@ fn authenticate_cleartext(
 /// [`auth::AUTH_FAILURE_DELAY`]）・同一のエラー応答で列挙攻撃を防ぐ。
 /// TLS 未実装のためチャネルバインディング（`-PLUS`／`p=<cb-name>`）は
 /// 提示・受理しない（`08P01`。Issue #941・TASK-228 へ引き継ぐ）。
-fn authenticate_scram(
-    stream: &mut TcpStream,
+fn authenticate_scram<S: WireStream>(
+    stream: &mut S,
     store: &UserStore,
     username: &str,
 ) -> Result<AuthOutcome> {
@@ -1358,7 +1367,7 @@ fn connection_counter() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// フィクスチャ一時ディレクトリ名の一意性を pid・時刻だけに委ねないための

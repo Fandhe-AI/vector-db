@@ -24,8 +24,7 @@
 //! 開始から終了までを 1 回の関数呼び出しで完結させる単純化のため、
 //! ErrorResponse は CopyDone／CopyFail 受信後にまとめて送る）。
 
-use std::io::{self, Write};
-use std::net::TcpStream;
+use std::io;
 
 use engine::core::{CopyPlan, EngineCore};
 use engine::error_format::{ClassifiedError, ErrorClass};
@@ -37,6 +36,7 @@ use engine::sql::mode::SessionState;
 
 use crate::framing::{self, FrameError};
 use crate::result_encoder;
+use crate::wire_stream::WireStream;
 
 /// [`FrameError`] を `io::Result` の失敗へ変換する。`Truncated`（相手が既に
 /// 切断）は「応答なしで終了してよい」を表すため `UnexpectedEof` へ、それ以外
@@ -70,7 +70,7 @@ fn frame_err_to_io(e: FrameError) -> io::Error {
 /// の結果を返す（fail-closed に接続を終える）。`Truncated`／`Io` は応答を
 /// 送る意味がない（前者は相手が既に切断済み、後者はサーバー側 I/O 異常）ため
 /// 従来どおり無応答で終了する。
-fn respond_frame_error_and_terminate(stream: &mut TcpStream, e: FrameError) -> io::Error {
+fn respond_frame_error_and_terminate<S: WireStream>(stream: &mut S, e: FrameError) -> io::Error {
     if let Some(class) = e.error_class() {
         let _ = crate::handshake::write_error_response_io(stream, class, e.client_message());
     }
@@ -97,8 +97,8 @@ fn respond_frame_error_and_terminate(stream: &mut TcpStream, e: FrameError) -> i
 /// 非現実的に大きく実効的な上限として機能しない。件数上限
 /// [`crate::limits::COPY_DISCARD_MAX_MESSAGES`] をバイト予算とは別に設けることで、
 /// フレームサイズに関わらず読み捨て件数そのものを有界化する）。
-fn enforce_discard_budget(
-    stream: &mut TcpStream,
+fn enforce_discard_budget<S: WireStream>(
+    stream: &mut S,
     discarded_bytes: usize,
     discarded_messages: usize,
 ) -> io::Result<()> {
@@ -125,8 +125,8 @@ fn enforce_discard_budget(
 /// post_auth_loop` は明示トランザクションが `Idle` の場合に限り本モジュール
 /// （`crate::copy::run`）へ委譲するため（SQL-31・TASK-221。`Active`／`Failed`
 /// 中の COPY は本モジュールへ到達する前に `0A000`／`25P02` で拒否される）。
-fn respond_error_and_ready(
-    stream: &mut TcpStream,
+fn respond_error_and_ready<S: WireStream>(
+    stream: &mut S,
     class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
@@ -137,7 +137,7 @@ fn respond_error_and_ready(
     )
 }
 
-fn respond_sql_error(stream: &mut TcpStream, e: &SqlSurfaceError) -> io::Result<()> {
+fn respond_sql_error<S: WireStream>(stream: &mut S, e: &SqlSurfaceError) -> io::Result<()> {
     respond_error_and_ready(stream, e.error_class(), &e.client_message())
 }
 
@@ -287,7 +287,11 @@ fn encode_copy_data_row_into(
 /// 暗黙適用・`LIMIT` 有界の走査）はこの関数の呼び出し前に完了済みであり、
 /// 本関数はエンコードと送出のみを担う（実行エラーは `CopyOutResponse` より
 /// 前に確定しているため、この経路には到達しない）。
-fn run_copy_to(stream: &mut TcpStream, format: CopyFormat, result: &QueryResult) -> io::Result<()> {
+fn run_copy_to<S: WireStream>(
+    stream: &mut S,
+    format: CopyFormat,
+    result: &QueryResult,
+) -> io::Result<()> {
     let response = match encode_copy_response(b'H', result.columns.len()) {
         Ok(b) => b,
         Err(()) => {
@@ -366,8 +370,8 @@ fn run_copy_to(stream: &mut TcpStream, format: CopyFormat, result: &QueryResult)
 /// が通常のクエリループへ戻ってクライアントが実際にソケットを閉じるまで
 /// 接続スロットを保持し続けていた。`Closed` はループを終了させるべき
 /// 場合——Terminate 受信・ストリーム側の早期 EOF——にのみ返す）。
-fn run_copy_from(
-    stream: &mut TcpStream,
+fn run_copy_from<S: WireStream>(
+    stream: &mut S,
     engine: &EngineCore,
     ctx: &PolicyContext,
     mut session: CopyInSession,
@@ -544,8 +548,8 @@ fn run_copy_from(
 /// `simple_query::execute_and_respond` と同じ設計（`ResponseBoundaryGuard` は
 /// 呼び出し元 [`run`] が関数全体を覆い、`EmergencyResponseRegistration` は
 /// commit 呼び出しだけをブロックスコープで覆う）。
-fn finish_copy_from(
-    stream: &mut TcpStream,
+fn finish_copy_from<S: WireStream>(
+    stream: &mut S,
     engine: &EngineCore,
     ctx: &PolicyContext,
     session: CopyInSession,
@@ -563,7 +567,7 @@ fn finish_copy_from(
     let outcome = {
         let _emergency_registration =
             crate::simple_query::emergency_response_bytes().and_then(|bytes| {
-                let clone = stream.try_clone().ok()?;
+                let clone = stream.emergency_channel()?;
                 Some(
                     engine::recovery::panic_hook::EmergencyResponseRegistration::register(
                         bytes.to_vec(),
@@ -611,8 +615,8 @@ fn finish_copy_from(
 /// `run_copy_from` が Terminate（'X'）受信を `Closed` として返してきた場合、
 /// 呼び出し元はここで新たに応答を送らずそのまま伝播し、接続ループを
 /// 終了させる（[`run_copy_from`] のドキュメント参照）。
-pub(crate) fn run(
-    stream: &mut TcpStream,
+pub(crate) fn run<S: WireStream>(
+    stream: &mut S,
     engine: &EngineCore,
     ctx: &PolicyContext,
     session: &mut SessionState,
