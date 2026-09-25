@@ -147,12 +147,13 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
   ファイル形 INSERT は `path`／`body` の non-nullable `TEXT` 列を要求するが、本
   Issue の `TEXT` 列は常に `nullable = true`。`NOT NULL` 構文（別 Issue）の実装
   まで、SQL 表層で作成したテーブルへのファイル形 INSERT は使えない。
-- **`VECTOR` 列を持たないテーブルは行の INSERT ができない**: 既存の行ストア層
-  （`tenant::insert_typed_row` 系）は `TableSchema::validate_embedding_dim` を
-  経由し、`VECTOR` 列を持たないテーブルへの呼び出しを構造的に拒否する
-  （`table has no VECTOR column`）。本 Issue はこの既存契約を変更しない
-  （テーブル定義自体は 0 本の `VECTOR` 列を許すが、行の書き込みは別の制約に
-  左右される）。
+- **`VECTOR` 列を持たないテーブルへの INSERT は空 embedding のみ受理**: 行ストア層
+  （`tenant::insert_typed_row` 系）は `TableSchema::validate_row_embedding_dim`
+  （Issue #995・TABLE-1）を経由し、`VECTOR` 列を持たないテーブルでは
+  `dim == 0`（embedding 省略）の行のみ受理し、非空 embedding は
+  `table has no VECTOR column` で fail-closed に拒否する。本 Issue はこの
+  契約自体を変更しない（テーブル定義は 0 本の `VECTOR` 列を許し、行の書き込み
+  可否は `validate_row_embedding_dim` の契約に従う）。
 - **テーブル総数の上限は未設定**: `catalog::MAX_LIST_TABLES`（列挙 API 側の上限）
   とは別に、許可された DDL 主体からの `CREATE TABLE` 連打（テーブル数の枯渇）に
   対する専用の上限は本 Issue では導入しない。DDL 主体はオーナーが明示的に許可した
