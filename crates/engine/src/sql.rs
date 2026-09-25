@@ -37,8 +37,9 @@
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
-//! - [`ddl`][]: `DROP TABLE`（SQL-23・TASK-203、Issue #902）の DDL 実行権限ゲート
-//!   （`require_ddl_permission`。将来の DDL 全般が通る単一の判定点）と実行本体
+//! - [`ddl`][]: `CREATE TABLE`／`DROP TABLE`／`ALTER TABLE ADD COLUMN`（SQL-23・
+//!   TASK-202・TASK-203、Issue #899・#900・#902）の DDL 実行権限ゲート
+//!   （`require_ddl_permission`。DDL 全般が通る単一の判定点）と実行本体
 //! - [`using_plan`][]: `USING PLAN('<query>')` 文末句（`ORDER BY` の代替。SQL-5）の
 //!   LLM クエリ展開結果 → 既存 C4 ハイブリッド実行形への束縛（TASK-77）
 //! - [`aggregate`][]: 集計関数のみを結果列とする `GROUP BY` なし単一行 SELECT の
@@ -126,6 +127,7 @@ pub mod allowlist;
 pub(crate) mod arena_cache;
 pub mod copy;
 pub mod ddl;
+pub(crate) mod ddl_column_type;
 pub(crate) mod describe;
 pub mod exec;
 pub mod explain;
@@ -163,6 +165,14 @@ pub use sparse_cache::SparseIndexCacheStats;
 pub use hnsw_cache::{classify_ann_plan, AnnPlan, AnnShapeInput};
 pub use scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
 pub mod using_operation_id;
+
+/// `allowlist::ValidatedAlterTableAddColumn::column_type`（TASK-202・SQL-23。
+/// Issue #900）を外部から名前解決可能にするための再エクスポート。
+/// `ddl_column_type` モジュール自体は内部実装として `pub(crate)` のまま維持する
+/// （`ScalarIndexCacheStats`・`AnnPlan` 等と同方針）。`SqlOutcome::AlterTable` の
+/// 中身（`AlterTableOutcome`）は公開モジュール [`ddl`] から直接参照できる
+/// （`CreateTableOutcome`／`DropTableOutcome` と同じ扱い）。
+pub use ddl_column_type::SqlColumnTypeName;
 pub(crate) mod using_plan;
 
 /// `EngineCore::visible_bitmap_cache_stats`（`pub`）の戻り値型を外部から
@@ -199,6 +209,10 @@ pub use visible_cache::VisibleBitmapCacheStats;
 ///
 /// **Issue #865（SQL-17・TASK-191）で追加した破壊的変更（BREAKING CHANGE）**:
 /// `Update` variant を追加した（既存の網羅的 `match` はワイルドカードアームの
+/// 追加が必要）。
+///
+/// **Issue #900（TASK-202・SQL-23）で追加した破壊的変更（BREAKING CHANGE）**:
+/// `AlterTable` variant を追加した（既存の網羅的 `match` はワイルドカードアームの
 /// 追加が必要）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlOutcome {
@@ -297,6 +311,14 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     DropTable(ddl::DropTableOutcome),
+    /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（TASK-202・SQL-23。
+    /// Issue #900）がセッション経由の実行経路で成功したことを示す応答。DDL
+    /// 権限ゲート（`sql::ddl::require_ddl_permission`）・実行本体
+    /// （`sql::ddl::execute_alter_table_add_column`）は
+    /// [`crate::core::EngineCore::execute_parsed_in_session`] の `AlterTable`
+    /// 分岐に委譲しており、本 variant はその [`ddl::AlterTableOutcome`] を
+    /// そのまま運ぶ薄いラッパー（`Insert`・`Truncate` と同じ設計）。
+    AlterTable(ddl::AlterTableOutcome),
     /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、Issue #909）
     /// がセッション経由の実行経路で成功したことを示す応答。`DropTable` と
     /// 同じ設計で、本 variant はその [`ddl::CreateViewOutcome`] をそのまま

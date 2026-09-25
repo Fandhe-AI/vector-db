@@ -15,18 +15,21 @@
 //! [`err4_projection_table_is_closed_over_all_error_classes`] で機械的に
 //! 固定する。production コードは変更しない（テスト専任）。
 //!
-//! 到達不能類型（`42501`・`P0002`）の扱い: NoSQL 表層はテナントをセッション
-//! （`SessionPrincipal::policy_context()`）からのみ導出し、クライアント自己
-//! 申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの位置でも `42601` で
-//! 先に拒否する（`gate.rs`・`session/middleware.rs`・`router.rs`）ため、
-//! `ForbiddenTenantMismatch`（`42501`）を実要求から誘発する経路が構造的に
-//! 存在しない。`RowNotFound`（`P0002`）に対応する op（更新・削除系）も
-//! NoSQL 表層の許可リストに無い。これらはテナント境界の検査を緩める・
-//! バイパスする production 経路を新設せず（`.claude/rules/security.md`
-//! P0）、production の応答エンコーダ（`http::response::encode_error`。
-//! ルータ・各 op ハンドラが実際に使う関数）を通したバイト列を実応答と同じ
-//! パーサ（`http_common::parse_single_response`）で解析し、射影のみを検証
-//! する（[`err4_f_unreachable_classes_project_via_production_encoder`]）。
+//! 到達不能類型（`42501`・`P0002`・`42701`）の扱い: NoSQL 表層はテナントを
+//! セッション（`SessionPrincipal::policy_context()`）からのみ導出し、
+//! クライアント自己申告の `tenant_id` 相当値は JSON／ヘッダ／パスいずれの
+//! 位置でも `42601` で先に拒否する（`gate.rs`・`session/middleware.rs`・
+//! `router.rs`）ため、`ForbiddenTenantMismatch`（`42501`）を実要求から誘発
+//! する経路が構造的に存在しない。`RowNotFound`（`P0002`）に対応する op
+//! （更新・削除系）も NoSQL 表層の許可リストに無い。`DuplicateColumn`
+//! （`42701`。`ALTER TABLE ADD COLUMN` の列名重複。TASK-202・SQL-23・
+//! Issue #900）に対応する `op` も NoSQL 表層の許可リストに無い（DDL は
+//! NoSQL 表層の対象外）。これらはテナント境界の検査を緩める・バイパスする
+//! production 経路を新設せず（`.claude/rules/security.md` P0）、production
+//! の応答エンコーダ（`http::response::encode_error`。ルータ・各 op ハンドラ
+//! が実際に使う関数）を通したバイト列を実応答と同じパーサ
+//! （`http_common::parse_single_response`）で解析し、射影のみを検証する
+//! （[`err4_f_unreachable_classes_project_via_production_encoder`]）。
 //!
 //! `data` キー付き `XX000`（緊急応答。`RECOVER-5` (3)・ERR-5 ポインタ）も
 //! 同様に実要求からは到達不能: `http::response::encode_error_may_be_committed`
