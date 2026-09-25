@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use engine::error_format::ErrorClass;
+use engine::error_format::{ClassifiedError, ErrorClass};
 
 use crate::auth::{self, base64_std, scram, AuthMethod, UserStore};
 use crate::framing::{self, FrameError};
@@ -572,15 +572,33 @@ fn post_auth_loop<'e>(
                             // 未対応（`0A000`）。`crate::copy::run` へは委譲せず
                             // トランザクションを Failed へ遷移させる
                             // （`sql::transaction` モジュールドキュメント参照）。
-                            if txn.is_active() {
-                                txn.fail();
-                                write_error_response_io(
-                                    stream,
-                                    ErrorClass::FeatureNotSupported,
-                                    "COPY is not supported inside an explicit transaction",
-                                )?;
-                                write_ready_for_query_io(stream)?;
-                                continue;
+                            // `Failed` 中の COPY も autocommit として実行させず、
+                            // 他の文と同じく `25P02` で拒否する（`Idle` 以外は
+                            // `crate::copy::run` へ到達させない。PR #1041 レビュー
+                            // 指摘: `is_active()` のみの判定では `Failed` 中の
+                            // COPY が autocommit で永続化されていた）。
+                            match txn.status() {
+                                engine::sql::transaction::TransactionStatus::Idle => {}
+                                engine::sql::transaction::TransactionStatus::InTransaction => {
+                                    txn.fail();
+                                    write_error_response_io(
+                                        stream,
+                                        ErrorClass::FeatureNotSupported,
+                                        "COPY is not supported inside an explicit transaction",
+                                    )?;
+                                    write_ready_for_query_io(stream)?;
+                                    continue;
+                                }
+                                engine::sql::transaction::TransactionStatus::Failed => {
+                                    let err = engine::sql::allowlist::SqlSurfaceError::InFailedSqlTransaction;
+                                    write_error_response_io(
+                                        stream,
+                                        err.error_class(),
+                                        &err.client_message(),
+                                    )?;
+                                    write_ready_for_query_io(stream)?;
+                                    continue;
+                                }
                             }
                             // Issue #939 レビュー指摘（discussion_r4096720859）:
                             // COPY サブプロトコル中に Terminate（'X'）を受信した
@@ -806,6 +824,18 @@ fn post_auth_loop<'e>(
                 let kind = crate::protocol_dispatch::classify(other);
                 crate::protocol_dispatch::reject_and_close(stream, kind, write_error_response_io)?;
                 return Ok(());
+            }
+        }
+
+        // SQL-31・TASK-221（PR #1041 レビュー指摘）: 拡張クエリプロトコルの
+        // Parse／Bind／Describe／Execute 等でエラー応答を返した場合
+        // （`ignore_till_sync` が立つ）、明示トランザクション中なら種類を問わず
+        // `Failed` へ遷移させる（PostgreSQL と同じ）。`Active` のまま残すと後続の
+        // `COMMIT` が先行する書き込みを永続化してしまう。`fail` は `Active` 以外
+        // では何もしないため、トランザクション外・既に `Failed` の挙動は不変。
+        if extended.ignore_till_sync {
+            if let Some(txn) = txn.as_mut() {
+                txn.fail();
             }
         }
     }

@@ -147,7 +147,13 @@ pub(crate) fn execute_and_respond<'e>(
     }
 
     match engine::sql::statement_splitter::split_statements(sql) {
-        Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
+        Err(e) => {
+            // 分割・位置検証のエラーも、明示トランザクション中なら `Failed` へ
+            // 遷移させる（SQL-31・TASK-221。PR #1041 レビュー指摘: `Active` の
+            // まま残すと後続の `COMMIT` が先行する書き込みを永続化してしまう）。
+            txn.fail();
+            respond_error_and_ready(stream, e.error_class(), &e.client_message())
+        }
         Ok(engine::sql::statement_splitter::SplitOutcome::Single) => run_statement(
             stream,
             engine,
@@ -171,6 +177,7 @@ pub(crate) fn execute_and_respond<'e>(
             if let Err(e) =
                 engine::sql::statement_splitter::check_write_placement(&stmts, txn.is_active())
             {
+                txn.fail();
                 return respond_error_and_ready(stream, e.error_class(), &e.client_message());
             }
             // 途中の文がエラーになった場合にメッセージ受信前の状態へ巻き戻す

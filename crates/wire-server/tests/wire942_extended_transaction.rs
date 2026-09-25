@@ -225,3 +225,137 @@ fn begin_insert_rollback_over_extended_protocol_discards_the_row() {
         other => panic!("expected Query, got {other:?}"),
     }
 }
+
+/// engine API から `id` の行が可視かどうかを数える（wire 経由の結果件数 0 だけ
+/// では「書き込みが起きなかった」のか「破棄された」のかを区別できないため）。
+fn visible_rows_with_id(core: &EngineCore, id: u64) -> usize {
+    let mut session = engine::sql::mode::SessionState::default();
+    let ctx = engine::policy::PolicyContext::new("tenant-a").expect("valid tenant id");
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            &format!("SELECT id FROM documents WHERE id = {id} LIMIT 1"),
+        )
+        .expect("select via engine API");
+    match outcome {
+        engine::sql::SqlOutcome::Query(result) => result.rows.len(),
+        other => panic!("expected Query, got {other:?}"),
+    }
+}
+
+fn insert_sql(id: u64, op: &str) -> String {
+    format!(
+        "INSERT INTO documents (id, embedding, body) VALUES ({id}, '[0.1,0.2,0.3]', 'row') USING OPERATION_ID '{op}'"
+    )
+}
+
+/// 簡易クエリで `BEGIN` → `INSERT` を送り、`Active` にする。
+fn begin_and_insert_over_simple_query(stream: &mut std::net::TcpStream, id: u64, op: &str) {
+    send_simple_query(stream, "BEGIN");
+    assert_eq!(read_command_complete(stream), "BEGIN");
+    read_ready_for_query(stream);
+    send_simple_query(stream, &insert_sql(id, op));
+    assert_eq!(read_command_complete(stream), "INSERT 0 1");
+    read_ready_for_query(stream);
+}
+
+/// `COMMIT` が `25P02` で拒否され、`ROLLBACK` で `Idle` へ戻ることを確認する。
+fn expect_commit_rejected_then_rollback(stream: &mut std::net::TcpStream) {
+    send_simple_query(stream, "COMMIT");
+    expect_error_response_with_sqlstate(stream, "25P02");
+    read_ready_for_query(stream);
+    send_simple_query(stream, "ROLLBACK");
+    assert_eq!(read_command_complete(stream), "ROLLBACK");
+    read_ready_for_query(stream);
+}
+
+/// 簡易クエリの構文エラーでもトランザクションが `Failed` へ遷移し、後続の
+/// `COMMIT` が先行する `INSERT` を永続化しないこと（PR #1041 レビュー指摘）。
+#[test]
+fn simple_query_parse_error_inside_transaction_blocks_commit() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 30, "op-942-30");
+    send_simple_query(&mut stream, "SELEC id FROM documents");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+
+    expect_commit_rejected_then_rollback(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 30), 0);
+}
+
+/// 複数文メッセージの分割エラー（文数上限超過 `54000`）でもトランザクションが
+/// `Failed` へ遷移すること（PR #1041 レビュー指摘の横断確認）。
+#[test]
+fn simple_query_split_error_inside_transaction_blocks_commit() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 31, "op-942-31");
+    let too_many = "SELECT id FROM documents LIMIT 1;"
+        .repeat(engine::sql::statement_splitter::MAX_STATEMENTS_PER_QUERY + 1);
+    send_simple_query(&mut stream, &too_many);
+    expect_error_response_with_sqlstate(&mut stream, "54000");
+    read_ready_for_query(&mut stream);
+
+    expect_commit_rejected_then_rollback(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 31), 0);
+}
+
+/// 拡張クエリプロトコルの Parse エラーでもトランザクションが `Failed` へ遷移し、
+/// 後続の `COMMIT` が先行する `INSERT` を永続化しないこと（PR #1041 レビュー
+/// 指摘の横断確認）。
+#[test]
+fn extended_parse_error_inside_transaction_blocks_commit() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 32, "op-942-32");
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("bad1", "SELEC id FROM documents", 0),
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    send_sync(&mut stream);
+    assert_ready_for_query(&mut stream);
+
+    expect_commit_rejected_then_rollback(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 32), 0);
+}
+
+/// `Failed` 中の COPY が autocommit として実行されず `25P02` で拒否されること
+/// （PR #1041 レビュー指摘）。CopyInResponse へ進まずに ErrorResponse が返る。
+#[test]
+fn copy_while_transaction_failed_is_rejected_with_in_failed_sql_transaction() {
+    let (core, _guard) = new_core_with_documents_table();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 33, "op-942-33");
+    // 入れ子の BEGIN で Failed へ遷移させる。
+    send_simple_query(&mut stream, "BEGIN");
+    expect_error_response_with_sqlstate(&mut stream, "25001");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "COPY documents (id, embedding, body) FROM STDIN USING OPERATION_ID 'op-942-copy'",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "25P02");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+    assert_eq!(visible_rows_with_id(&core, 33), 0);
+}
