@@ -70,7 +70,13 @@ pub(crate) fn execute_create_table(
     storage: &Storage,
     validated: &ValidatedCreateTable,
 ) -> Result<CreateTableOutcome, SqlSurfaceError> {
-    let schema = TableSchema::new(validated.table_name.clone(), validated.columns.clone());
+    let mut schema = TableSchema::new(validated.table_name.clone(), validated.columns.clone());
+    // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）。`validated.primary_key` は
+    // `sql::allowlist::finalize_primary_key` が `id` 単独宣言を `None` へ既に
+    // 正規化済みのため、ここでは素通しするだけでよい。
+    if let Some(primary_key) = validated.primary_key.clone() {
+        schema = schema.with_primary_key(primary_key);
+    }
     storage.create_table(&schema).map_err(|e| match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
         CatalogError::Invalid(detail) => {
@@ -201,6 +207,7 @@ mod tests {
                 ),
                 crate::catalog::ColumnDef::new("body", crate::catalog::ColumnType::Text, true),
             ],
+            primary_key: None,
         };
         execute_create_table(&storage, &validated).expect("create table must succeed");
         let schema = storage.get_table_schema("docs").expect("schema must exist");
@@ -217,6 +224,7 @@ mod tests {
                 crate::catalog::ColumnType::Text,
                 true,
             )],
+            primary_key: None,
         };
         execute_create_table(&storage, &validated).expect("first create must succeed");
         let err = execute_create_table(&storage, &validated)
@@ -234,6 +242,7 @@ mod tests {
                 crate::catalog::ColumnDef::new("a", crate::catalog::ColumnType::Vector(4), false),
                 crate::catalog::ColumnDef::new("b", crate::catalog::ColumnType::Vector(4), false),
             ],
+            primary_key: None,
         };
         let err = execute_create_table(&storage, &validated)
             .expect_err("two VECTOR columns must be rejected");

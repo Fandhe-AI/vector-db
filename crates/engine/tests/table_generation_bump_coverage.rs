@@ -107,14 +107,19 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `insert_typed_row` のドキュメンテーションコメントが計 33 行増え、以下
     // 2 件の行番号がさらに移動したための追随（旧: 2184／2263）。PR #1044
     // レビュー対応（`DROP TABLE` 配線済み記述への訂正コメント）で `catalog.rs`
-    // 冒頭側にさらに 2 行増え、再度追随（旧: 2217／2296）。
-    ("catalog.rs", 2225),
+    // 冒頭側にさらに 2 行増え、再度追随（旧: 2217／2296）。Issue #903
+    // （`PRIMARY KEY` 宣言構文。`TableSchema::primary_key`／`with_primary_key`・
+    // `validate_primary_key`・`ColumnType::is_primary_key_allowed`／
+    // `primary_key_tag`・カタログ v4 encode/decode・`alter_table_drop_column`
+    // の主キー列拒否）で `catalog.rs` 冒頭側にさらに行が追加され、以下 2 件の
+    // 行番号がさらに移動したための追随（旧: 2225／2304）。
+    ("catalog.rs", 2474),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（`alter_enum_type_add_value` の commit 呼び出しは
     // 依存テーブルの世代を明示的に進行させるため ALLOWLIST 対象外のまま）。
-    ("catalog.rs", 2304),
+    ("catalog.rs", 2553),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

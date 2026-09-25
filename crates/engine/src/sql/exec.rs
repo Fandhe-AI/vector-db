@@ -3321,6 +3321,9 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
+        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約
+        // 違反。行キー衝突（`IdConflict`）と原因は異なるが `23505` は共有する。
+        TenantWriteError::UniqueViolation => SqlSurfaceError::unique_violation(),
         // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked`／
         // `update_row_columns_unchecked` 自体は `operation_id` 必須化ガード
         // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs`

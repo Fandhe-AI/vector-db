@@ -15,8 +15,11 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 ```
 
 - `<type>` は `TEXT` または `VECTOR ( <N> )` のみ（TABLE-13／14 の追加型は別 Issue の
-  管轄。制約構文・`IF NOT EXISTS`・`USING OPERATION_ID` の付与はいずれも許可リスト外
-  （構造的に受理しない・`42601`）。
+  管轄。`IF NOT EXISTS`・`CONSTRAINT <name>`・`UNIQUE`／`NOT NULL`／`DEFAULT`／
+  `CHECK`／`REFERENCES`・`USING OPERATION_ID` の付与はいずれも許可リスト外
+  （構造的に受理しない・`42601`）。列制約 `PRIMARY KEY`・表制約
+  `PRIMARY KEY (<col>[, ...])`（複合キーを含む）のみを制約構文として追加受理する
+  （TABLE-16・TASK-204、Issue #903。詳細は `docs/design/sql-primary-key.md` 参照）。
 - `TEXT`／`VECTOR` は `lexer::Keyword` へ追加しない（`SET`・`CREATE`・`TRUNCATE`・
   `TABLE` と同方針。statement 中の所定位置でのみ文脈的キーワードとして照合し、
   同名の列名・テーブル名として使う既存 SQL を壊さない）。
