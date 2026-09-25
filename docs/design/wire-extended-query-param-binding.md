@@ -83,8 +83,14 @@ node pg（`values` 付き `query`）・psql `\bind`・JDBC 等、パラメータ
   - `where_equality_dummy_flags`（`sql::params::
     where_equality_literal_is_param` が `WHERE` 等価述語ごとに判定）:
     `$n` 由来の等価述語に限り、ENUM 列ラベルの語彙照合（`22P02`）を省略する
-    （`bind_aggregate`／`bind_projection_for_describe`／`bind_scan` の
+    （crate 内限定の `bind_aggregate_with_dummy_flags`／
+    `bind_projection_for_describe`／`bind_scan_with_dummy_flags` の
     いずれの経路でも同じ配列を共有する）。
+  - これらのフラグは `PreparedSql`（フィールド非公開）が Parse 時点の元
+    トークン列から計算した値に限られ、クレート外から指定する経路はない。
+    公開 API の `sql::parser::bind_aggregate`／`bind_scan`・
+    `EngineCore::describe_parsed_in_session` は従来どおりのシグネチャで
+    フラグを受け取らず、常に全値検証を行う（PR #1012 codex-review P1）。
 
   省略するのは「ダミー値 `"0"` そのものの値に依存する検証」だけである。
   固定ダミーを通常どおり検証すると、正当なベクトル／ENUM 位置を持つ
