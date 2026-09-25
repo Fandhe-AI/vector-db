@@ -23,7 +23,8 @@
 //!   同モジュールの `ServerCertificateChain::certificate_message` が担う
 //!   （Issue #963）
 //! - `CertificateVerify` の署名生成・署名対象の構成は #961 が担う
-//! - transcript hash・`Finished::verify_data` の生成と検証は #964 が担う。
+//! - transcript hash・`Finished::verify_data` の生成と検証は
+//!   [`super::transcript`]・[`super::finished`]（Issue #964）が担う。
 //!   本モジュールは `Finished` の長さ（32 バイト固定。暗号スイートが
 //!   `TLS_AES_128_GCM_SHA256` に固定のため）のみ検証する
 //! - 状態機械・alert の実送出・「状態外メッセージ」判定・レコード種別
@@ -34,7 +35,8 @@
 //! （type・長さ・random・拡張・証明書・署名・verify_data）は通信路上に
 //! 平文で流れる、または相手と共有される値であり、本モジュールでは秘密値
 //! として扱わない。長さによる分岐は公開値にのみ依存する。`verify_data`
-//! の比較は本モジュールでは行わない（#964 が定数時間比較を担う）。本
+//! の比較は本モジュールでは行わない（[`super::finished`]・Issue #964 が
+//! 定数時間比較を担う）。本
 //! モジュールは中身をバイト比較・テーブル参照に用いない。
 //!
 //! 受信データ経路のため `unwrap`／`expect`／添字アクセスを用いず `get()`・
@@ -645,7 +647,7 @@ impl CertificateVerify {
 /// 残り全体が `verify_data`。暗号スイートが `TLS_AES_128_GCM_SHA256` に
 /// 固定されているため長さはちょうど [`FINISHED_VERIFY_DATA_LEN`]
 /// （32 バイト）でなければならない。値そのものの検証（transcript hash
-/// との比較）は #964 が担う。
+/// との比較）は [`super::finished`]（Issue #964）が担う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finished {
     pub verify_data: Vec<u8>,
@@ -705,7 +707,8 @@ fn encode_message(
 
 /// parse 済みの 1 メッセージ（型付き解釈前）。受信した生バイト列を
 /// 完全に復元できることが要件（ヘッダは `(msg_type, body.len())` から
-/// 一意に決まる）。#964 の transcript hash は受信した生バイト列を
+/// 一意に決まる）。[`super::transcript`]（Issue #964）の transcript hash は
+/// 受信した生バイト列を
 /// そのまま入力にする必要があるため、この復元可能性を崩さない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawHandshake {
@@ -714,15 +717,29 @@ pub struct RawHandshake {
 }
 
 impl RawHandshake {
-    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), HandshakeError> {
+    /// 4 バイトのハンドシェイクヘッダ（`msg_type` + u24 本文長）だけを
+    /// 組み立てる。本文をコピーせずにヘッダと本文を別々に扱いたい呼び出し元
+    /// （[`super::transcript::Transcript`] がヘッダ・本文を順に SHA-256 へ
+    /// 投入する経路。PR #1033 レビュー指摘）と [`RawHandshake::encode_into`]
+    /// が共有する、ヘッダ構成の単一情報源。本文長が 24 ビットに収まらない
+    /// 場合は `Err`。
+    pub fn header(&self) -> Result<[u8; HANDSHAKE_HEADER_LEN], HandshakeError> {
         let len = u32::try_from(self.body.len())
             .map_err(|_| HandshakeError::Encode("body length overflow"))?;
-        // encode_message と同じ all-or-nothing 契約: 検証を書き込み前に行う（#953 指摘）。
         if len > MAX_HANDSHAKE_WIRE_BODY_LEN {
             return Err(HandshakeError::Encode("24-bit length field overflow"));
         }
-        out.push(self.msg_type.as_u8());
-        put_u24(out, len)?;
+        // 上の検査で上位バイトは 0 が保証される。添字アクセスを避けるため
+        // パターンで分解する。
+        let [_, b1, b2, b3] = len.to_be_bytes();
+        Ok([self.msg_type.as_u8(), b1, b2, b3])
+    }
+
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), HandshakeError> {
+        // encode_message と同じ all-or-nothing 契約: 検証（`header` 内）を
+        // 書き込み前に行う（#953 指摘）。
+        let header = self.header()?;
+        out.extend_from_slice(&header);
         out.extend_from_slice(&self.body);
         Ok(())
     }
@@ -1602,5 +1619,39 @@ mod tests {
             .feed(&oversized)
             .expect_err("must reject capacity-exceeding feed");
         assert!(matches!(err, HandshakeError::Decode(_)));
+    }
+
+    // PR #1033 review（P2）: `RawHandshake::header` は `encode_into`／`to_bytes`
+    // の先頭 4 バイトと一致し（ヘッダ構成の単一情報源）、24 ビット長を超える
+    // 本文は拒否する。
+    #[test]
+    fn raw_handshake_header_matches_encoded_prefix() {
+        for len in [0usize, 1, 0xFF, 0x100, 0x1_0000, 0x12_3456] {
+            let raw = RawHandshake {
+                msg_type: HandshakeType::Certificate,
+                body: vec![0xA5; len],
+            };
+            let header = raw.header().expect("length fits in u24");
+            let encoded = raw.to_bytes().expect("encodable");
+            assert_eq!(encoded.get(..HANDSHAKE_HEADER_LEN), Some(&header[..]));
+            assert_eq!(encoded.get(HANDSHAKE_HEADER_LEN..), Some(&raw.body[..]));
+        }
+        let max = RawHandshake {
+            msg_type: HandshakeType::Finished,
+            body: vec![0u8; MAX_HANDSHAKE_WIRE_BODY_LEN as usize],
+        };
+        assert_eq!(
+            max.header().expect("max u24 length"),
+            [20, 0xFF, 0xFF, 0xFF]
+        );
+        let over = RawHandshake {
+            msg_type: HandshakeType::Finished,
+            body: vec![0u8; MAX_HANDSHAKE_WIRE_BODY_LEN as usize + 1],
+        };
+        assert!(matches!(over.header(), Err(HandshakeError::Encode(_))));
+        let mut out = vec![0x42];
+        assert!(over.encode_into(&mut out).is_err());
+        // all-or-nothing: 失敗時に `out` へ何も書き込まない。
+        assert_eq!(out, vec![0x42]);
     }
 }
