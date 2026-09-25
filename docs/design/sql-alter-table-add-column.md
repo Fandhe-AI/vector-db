@@ -85,9 +85,17 @@ DDL 実行権限ゲートをそのまま共有する（判定点・拒否コー�
   `core.rs::execute_parsed_in_session` の `AlterTable` 分岐の先頭で、カタログ照会
   （ENUM 型名・テーブル・列の存在確認）より必ず先に呼ぶ。
 - **判定順序**: (1) 字句解析・構造検証（`42601`）→ (2) 権限ゲート（`42501`）→
-  (3) write トランザクション内のカタログ操作（`42P01`／`42701`／`54000`／`42601`／
-  `55P03`／`XX000`）。権限の無い主体には、テーブル・列が存在するかどうかを一切返さない
-  （存在オラクル化の防止）。
+  (3) 対象テーブルの存在確認（不在なら `42P01`、同名のビューなら `42809`）→
+  (4) 型名解決（`VECTOR` は `0A000`、未登録 ENUM 型名は `42601`）→ (5) write
+  トランザクション内のカタログ操作（テーブル存在の再確認〔競合で消えた場合も
+  (3) と同じ写像〕・`42701`／`54000`／`42601`／`55P03`／`XX000`）。権限の無い主体
+  には、テーブル・列・ビューが存在するかどうかを一切返さない（存在オラクル化の防止）。
+  (3) を (4) より先に置くのは、存在しないテーブルへの要求が型名の不正で答えられ
+  ないようにするため（PR #1052 レビュー指摘）。
+- **ビューが対象の場合**: `CREATE VIEW`（Issue #909）の書き込み系方針と揃え、
+  ビューへの `ALTER TABLE ADD COLUMN` は `42809`（`WrongObjectType`）で拒否する。
+  判定は `catalog::Storage::view_definition` を単一の情報源とし、読み直し自体の
+  失敗は「ビューではない」と同一視せず `catalog::table_lookup_error` で写像する。
 - **wire-server 側**: `--ddl-allowed-users <user[,user...]>`（`CREATE TABLE`／
   `DROP TABLE` と共通。`wire_server::ddl_permission_opt`・
   `UserStore::with_ddl_allowed_users`）。認証成功直後に認証済み username が許可
@@ -120,13 +128,14 @@ DDL 実行権限ゲートをそのまま共有する（判定点・拒否コー�
 
 | `CatalogError` | 写像先 | `wire_code` |
 | --- | --- | --- |
-| `TableNotFound` | `UndefinedTable` | `42P01` |
+| `TableNotFound`（同名のビューが無い） | `UndefinedTable` | `42P01` |
+| `TableNotFound`（同名のビューが有る）・`WrongObjectKind` | `WrongObjectType` | `42809` |
 | `ColumnAlreadyExists` | `DuplicateColumn`（`CREATE TABLE` と共有） | `42701` |
 | `TooManyColumns` | `PayloadTooLarge` | `54000` |
 | `Invalid` | `UnsupportedSyntax` | `42601` |
 | `TypeNotFound` | `UnsupportedSyntax` | `42601` |
 | `WriteLockTimeout` | `LockNotAvailable` | `55P03` |
-| その他（`Backend`・`CorruptSchema`・`TableAlreadyExists`・`RowNotFound`・`IncompatibleRowKeyFormat`・`TableGenerationCounterOverflow`・`TypeAlreadyExists`・`DependentObjectsStillExist`・`ColumnNotFound`・`ProtectedColumn`・`IncompatibleTypeChange`） | `Internal`（固定文言） | `XX000` |
+| その他（`Backend`・`CorruptSchema`・`TableAlreadyExists`・`RowNotFound`・`IncompatibleRowKeyFormat`・`TableGenerationCounterOverflow`・`TypeAlreadyExists`・`DependentObjectsStillExist`・`ColumnNotFound`・`ProtectedColumn`・`IncompatibleTypeChange`・`ViewNotFound`・`DependentViewsExist`・`ViewLimitExceeded`） | `Internal`（固定文言） | `XX000` |
 
 ワイルドカード腕は置かず、`CatalogError` の全 variant を明示列挙する（将来の variant
 追加をコンパイラが検出できるようにするため）。

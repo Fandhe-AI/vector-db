@@ -519,6 +519,89 @@ fn reserved_column_names_are_rejected_with_42601() {
     ));
 }
 
+/// 対象テーブルの存在確認は型名解決より先に行う（PR #1052 codex P1 指摘の
+/// 回帰テスト）。存在しないテーブルへの要求は、型名が未登録 ENUM・`VECTOR`・
+/// 構文上は妥当なスカラー型のいずれであっても一律 `42P01` になる。
+#[test]
+fn undefined_table_takes_precedence_over_type_name_resolution() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+
+    for sql in [
+        "ALTER TABLE nonexistent_table ADD COLUMN feeling unregistered_mood",
+        "ALTER TABLE nonexistent_table ADD COLUMN v VECTOR(4)",
+        "ALTER TABLE nonexistent_table ADD COLUMN note NUMERIC(39,0)",
+        "ALTER TABLE nonexistent_table ADD COLUMN note TEXT",
+    ] {
+        let err = alter_table(&core, &mut session, sql)
+            .expect_err(&format!("expected {sql:?} to be rejected"));
+        assert_eq!(
+            err.wire_code(),
+            "42P01",
+            "unexpected wire_code for {sql:?}: {err:?}"
+        );
+    }
+}
+
+/// 対象がビュー（Issue #909）の場合は `CREATE VIEW` の書き込み系方針と同じく
+/// `42809`（型名の正誤・`VECTOR` 指定に関わらず）。ビューもベーステーブルも
+/// 変更されない。
+#[test]
+fn alter_table_on_a_view_is_rejected_with_42809() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    core.execute_sql_in_session(
+        &ctx("owner"),
+        &mut session,
+        &format!("CREATE VIEW v_docs AS SELECT * FROM {TABLE}"),
+    )
+    .expect("create view");
+
+    for sql in [
+        "ALTER TABLE v_docs ADD COLUMN note TEXT",
+        "ALTER TABLE v_docs ADD COLUMN feeling unregistered_mood",
+        "ALTER TABLE v_docs ADD COLUMN v VECTOR(4)",
+    ] {
+        let err = alter_table(&core, &mut session, sql)
+            .expect_err(&format!("expected {sql:?} to be rejected"));
+        assert_eq!(
+            err.wire_code(),
+            "42809",
+            "unexpected wire_code for {sql:?}: {err:?}"
+        );
+    }
+    assert!(
+        !column_exists(&core, &ctx("owner"), TABLE, "note"),
+        "ALTER TABLE on a view must not alter its base table"
+    );
+}
+
+/// DDL 権限の無いセッションでは、ビュー名を指定しても `42501` のみ（ビューの
+/// 存在も権限ゲートより前には観測できない）。
+#[test]
+fn permission_denial_precedes_view_detection() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let mut admin = ddl_session();
+    core.execute_sql_in_session(
+        &ctx("owner"),
+        &mut admin,
+        &format!("CREATE VIEW v_docs AS SELECT * FROM {TABLE}"),
+    )
+    .expect("create view");
+
+    let mut session = SessionState::default();
+    let err = alter_table(
+        &core,
+        &mut session,
+        "ALTER TABLE v_docs ADD COLUMN note TEXT",
+    )
+    .expect_err("unprivileged ALTER TABLE must be rejected");
+    assert_eq!(err.wire_code(), "42501");
+}
+
 #[test]
 fn unregistered_enum_type_name_is_rejected_with_42601() {
     let (core, path) = new_core_with_table();

@@ -118,16 +118,19 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
 エントリを能動的に解放する処理は実装していない（各キャッシュの容量上限に
 より有界のまま維持され、正しさは世代照合が担保する。能動的解放はスコープ外）。
 
-## `2BP01`（VIEW・FOREIGN KEY からの参照）は対象外
+## `2BP01`（VIEW からの参照）実装済み（Issue #909）
 
-VIEW（#909）・FOREIGN KEY（#907）はいずれも未実装のため、依存オブジェクト
-検査は構造的に発生しない。`sql::ddl::execute_drop_table` のドキュメンテーション
-コメントに、実装される際の挿入位置（`require_ddl_permission` の直後・
-`Storage::drop_table` 呼び出しの直前）をコメントとして残した。
+`CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・TASK-205）の実装により、
+`Storage::drop_table` は対象テーブルを参照するビューが 1 つでも残っている場合
+`CatalogError::DependentViewsExist` → `SqlSurfaceError::DependentObjectsStillExist`
+（`2BP01`）で拒否するようになった（同一 write txn 内・TOCTOU 回避。詳細は
+`docs/design/create-view.md` 参照）。対象名がビューだった場合は
+`CatalogError::WrongObjectKind` → `SqlSurfaceError::WrongObjectType`（`42809`）。
+FOREIGN KEY（#907）由来の `2BP01` は引き続き未実装のまま。
 
 ## 対象外・申し送り
 
-- `2BP01` 依存オブジェクト検査（#907・#909 待ち）
+- `2BP01` 依存オブジェクト検査（FOREIGN KEY 分・#907 待ち）
 - NoSQL 表層の `drop_table` op（#910 の担当）
 - `CREATE TABLE`・`ALTER TABLE` の SQL 構文（#899〜#901）
 - ドロップ済みテーブルのキャッシュエントリの能動的解放（現状は世代照合による

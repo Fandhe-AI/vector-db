@@ -70,6 +70,8 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::CreateTable(_)
         | SqlOutcome::DropTable(_)
         | SqlOutcome::AlterTable(_)
+        | SqlOutcome::CreateView(_)
+        | SqlOutcome::DropView(_)
         | SqlOutcome::Begin
         | SqlOutcome::Commit
         | SqlOutcome::Rollback => None,
