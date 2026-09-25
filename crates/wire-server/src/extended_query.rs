@@ -1794,17 +1794,28 @@ fn execute_portal<'e>(
         .get_mut(portal_name)
         .ok_or(HandlerError::UnknownPortal)?;
 
+    // 完了済み portal（`Done`）の再 Execute は保持済みの完了タグを再送する
+    // だけで行を一切送出しないため、カーソル束縛の検証より先に処理する
+    // （PR #1049 レビュー指摘 Cursor Bugbot Low 対応: `CLOSE`／`COMMIT`／
+    // `ROLLBACK` 後に完了済み `FETCH` portal を再 Execute すると `34000` を
+    // 返していた。`Done` の扱いを `FETCH` 以外の portal と揃える）。
+    if let PortalState::Done { tag } = &portal.state {
+        let tag = tag.clone();
+        return write_command_complete(stream, &tag);
+    }
+
     // カーソル `FETCH` 由来 portal の中断保持分（`PortalState::Suspended`）を
     // 再送出する前に、実行成功時点で束縛した世代・カーソル個体識別子が現在も
     // 有効かを検証する（PR #1049 レビュー指摘対応。cursor Bugbot P1「終了した
     // カーソルの FETCH portal から行を送出できる」の是正）。`CLOSE`（同名の
     // 再 `DECLARE` を含む）・`COMMIT`／`ROLLBACK`（→ 新しい世代／`Idle`）の
-    // いずれを挟んでいても不一致となり fail-closed に拒否する。`Fetch` 以外
-    // から作った portal は `cursor_binding` が常に `None` のため対象外
-    // （既存の挙動を変えない）。`Ready`（初回実行）はこの分岐に到達しない
-    // （`needs_execution` 判定で上のブロックへ流れ、この時点では既に
-    // `return` 済みのため）。
-    if let Some(binding) = &portal.cursor_binding {
+    // いずれを挟んでいても不一致となり fail-closed に拒否する。検証対象は
+    // 保持行を送出し得る `Suspended` のみ（`Done` は直前で処理済み、`Failed`
+    // は下の分岐で `PortalFailed` になる）。`Fetch` 以外から作った portal は
+    // `cursor_binding` が常に `None` のため対象外（既存の挙動を変えない）。
+    // `Ready`（初回実行）はこの分岐に到達しない（`needs_execution` 判定で
+    // 上のブロックへ流れ、この時点では既に `return` 済みのため）。
+    if let (PortalState::Suspended(_), Some(binding)) = (&portal.state, &portal.cursor_binding) {
         let still_valid = txn.active_generation() == Some(binding.txn_generation)
             && txn.cursor_id(&binding.cursor_name) == Some(binding.cursor_id);
         if !still_valid {
@@ -1813,11 +1824,6 @@ fn execute_portal<'e>(
                 engine::sql::allowlist::SqlSurfaceError::invalid_cursor_name(),
             ));
         }
-    }
-
-    if let PortalState::Done { tag } = &portal.state {
-        let tag = tag.clone();
-        return write_command_complete(stream, &tag);
     }
 
     let finished_tag = {

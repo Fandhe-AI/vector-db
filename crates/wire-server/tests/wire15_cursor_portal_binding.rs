@@ -292,3 +292,111 @@ fn suspended_fetch_portal_still_resumes_without_intervening_close_or_commit() {
     assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
     read_ready_for_query(&mut stream);
 }
+
+// --- 完了済み（Done）FETCH portal の再 Execute（PR #1049 レビュー指摘 Cursor
+// Bugbot Low の回帰防止） ------------------------------------------------------
+//
+// 束縛検証は保持行を送出し得る `Suspended` のみが対象。全行送出済みの `Done`
+// portal は `CLOSE`／`COMMIT`／`ROLLBACK` を挟んでも、`FETCH` 以外の portal と
+// 同じく保持済みの完了タグだけを再送する（行は一切送出しない）。
+
+/// `DECLARE`（内側 SELECT が `rows` 件を返す）→ 拡張クエリで `FETCH <rows> FROM
+/// c` を named portal `pf` へ Bind → `max_rows=0` で Execute して全行＋
+/// `CommandComplete` を受け取り、portal を `Done` にする。完了タグを返す。
+fn declare_and_complete_fetch_portal(stream: &mut std::net::TcpStream, rows: u64) -> Vec<u8> {
+    send_simple_query(stream, "BEGIN");
+    assert_eq!(read_command_complete(stream), "BEGIN");
+    read_ready_for_query(stream);
+
+    send_simple_query(
+        stream,
+        &format!("DECLARE c CURSOR FOR SELECT id FROM documents LIMIT {rows}"),
+    );
+    assert_eq!(read_command_complete(stream), "DECLARE CURSOR");
+    read_ready_for_query(stream);
+
+    parse_and_bind(stream, "sf", "pf", &format!("FETCH {rows} FROM c"));
+    send_length_prefixed_message(stream, b'E', &execute_body("pf", 0));
+    for _ in 0..rows {
+        let (kind, _) = read_message(stream);
+        assert_eq!(kind, b'D', "expected DataRow");
+    }
+    let (kind, tag) = read_message(stream);
+    assert_eq!(kind, b'C', "expected CommandComplete after all rows");
+    tag
+}
+
+/// 完了済み `pf` を再 Execute すると、エラーも `DataRow` も返さず初回と同じ
+/// 完了タグの `CommandComplete` のみが返り、`Sync` で `ReadyForQuery` に戻る。
+fn assert_done_replay_resends_tag_only(stream: &mut std::net::TcpStream, expected_tag: &[u8]) {
+    send_length_prefixed_message(stream, b'E', &execute_body("pf", 0));
+    let (kind, body) = read_message(stream);
+    assert_eq!(
+        kind,
+        b'C',
+        "a completed FETCH portal must replay CommandComplete, got {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        body, expected_tag,
+        "replayed completion tag must be unchanged"
+    );
+    send_sync(stream);
+    let (kind, _) = read_message(stream);
+    assert_eq!(kind, b'Z', "expected ReadyForQuery after Sync");
+}
+
+#[test]
+fn done_fetch_portal_replays_completion_after_cursor_close() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 3);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    let tag = declare_and_complete_fetch_portal(&mut stream, 3);
+
+    send_simple_query(&mut stream, "CLOSE c");
+    assert_eq!(read_command_complete(&mut stream), "CLOSE CURSOR");
+    read_ready_for_query(&mut stream);
+
+    assert_done_replay_resends_tag_only(&mut stream, &tag);
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+}
+
+#[test]
+fn done_fetch_portal_replays_completion_after_commit() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 3);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    let tag = declare_and_complete_fetch_portal(&mut stream, 3);
+
+    send_simple_query(&mut stream, "COMMIT");
+    assert_eq!(read_command_complete(&mut stream), "COMMIT");
+    read_ready_for_query(&mut stream);
+
+    assert_done_replay_resends_tag_only(&mut stream, &tag);
+}
+
+#[test]
+fn done_fetch_portal_replays_completion_after_rollback() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 3);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    let tag = declare_and_complete_fetch_portal(&mut stream, 3);
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+
+    assert_done_replay_resends_tag_only(&mut stream, &tag);
+}
