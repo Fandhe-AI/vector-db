@@ -20,6 +20,14 @@
 //! バイト列を [`RecordBuffer`] へ蓄積するだけなので、途中のタイムアウトで
 //! 呼び出しをまたいでも取りこぼしがない。
 //!
+//! # 入力終端（EOF）の契約
+//!
+//! `read` が `Ok(0)` を返すのは相手の `close_notify` を受信した後に限る。
+//! `close_notify` なしで生ソケットが EOF になった場合は、部分レコードが
+//! 残っていれば `InvalidData`（truncation）、レコード境界なら
+//! `UnexpectedEof` を返し、いずれもストリームを失敗状態に固定する
+//! （以後の `read`／`write` は常にエラー。fail-closed）。
+//!
 //! # 緊急応答（RECOVER-6）との関係
 //!
 //! `WireStream::emergency_channel` は `None` を返す（平文の緊急応答
@@ -221,8 +229,21 @@ impl<S: WireStream> Read for TlsStream<S> {
                                 "TLS record truncated by peer EOF",
                             ));
                         }
-                        self.eof = true;
-                        return Ok(0);
+                        // レコード境界での EOF でも close_notify を受信して
+                        // いない以上、正常終端とは区別できない（切り詰め
+                        // 攻撃・応答末尾の欠落を正常終了と取り違えない。
+                        // RFC 8446 §6.1）。`UnexpectedEof` で返しストリームを
+                        // 失敗状態に固定する。正常終端（`Ok(0)`）は
+                        // `AppEvent::CloseNotify` 受信後に限る。上位の pg
+                        // wire 層（`framing::read_typed_frame_header`）は
+                        // メッセージ境界での `UnexpectedEof` を平文 TCP の
+                        // 切断と同じ「接続終了」として静かに扱い、メッセージ
+                        // 途中なら `FrameError::Truncated`（応答なし）となる。
+                        self.failed = true;
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "TLS peer closed the connection without close_notify",
+                        ));
                     }
                 }
                 Err(e) => {
@@ -627,10 +648,12 @@ mod tests {
         assert_eq!(again.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// バッファが空のまま close_notify なしで切断された場合は従来どおり
-    /// `Ok(0)`（上位の pg wire 層が切断として扱う）を返すこと。
+    /// レコード境界であっても close_notify を受信せずに EOF になった場合は
+    /// 正常終端（`Ok(0)`）ではなく `UnexpectedEof` を返し、以後の読み書きも
+    /// 失敗し続けること（切断と正常終了を取り違えない。PR #1056 レビュー
+    /// 指摘）。
     #[test]
-    fn eof_on_record_boundary_is_clean_eof() {
+    fn eof_on_record_boundary_without_close_notify_fails_closed() {
         let (server_sock, client_sock) = loopback_pair();
         let (_server_session, client_session) = test_session_pair();
         let mut client = TlsStream::new(client_sock, client_session);
@@ -642,7 +665,54 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set timeout");
         let mut buf = [0u8; 64];
-        assert_eq!(client.read(&mut buf).expect("clean eof"), 0);
+        let err = client
+            .read(&mut buf)
+            .expect_err("EOF without close_notify must not be a clean EOF");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            client.read(&mut buf).is_err(),
+            "stream must stay failed after EOF without close_notify"
+        );
+        assert!(
+            client.write(b"x").is_err(),
+            "writes must also fail after EOF without close_notify"
+        );
+    }
+
+    /// 平文を受け取った後に close_notify を受信し、その後に生ソケットが
+    /// EOF になった場合は正常終端（`Ok(0)`）として扱い、繰り返し読んでも
+    /// `Ok(0)` のままであること。
+    #[test]
+    fn eof_after_close_notify_is_clean_eof() {
+        let (mut server_sock, client_sock) = loopback_pair();
+        let (mut server_session, client_session) = test_session_pair();
+        let mut client = TlsStream::new(client_sock, client_session);
+
+        let mut records = server_session
+            .seal_application_data(b"last words")
+            .expect("seal");
+        records.extend(server_session.close_notify().expect("close_notify"));
+        let mut wire = Vec::new();
+        for record in &records {
+            record
+                .serialize_into(&mut wire, RecordKind::Ciphertext)
+                .expect("serialize");
+        }
+        server_sock.write_all(&wire).expect("write records");
+        server_sock
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut out = Vec::new();
+        client
+            .read_to_end(&mut out)
+            .expect("clean EOF after close_notify");
+        assert_eq!(out, b"last words");
+        let mut buf = [0u8; 8];
+        assert_eq!(client.read(&mut buf).expect("still clean eof"), 0);
     }
 
     #[test]

@@ -378,3 +378,136 @@ fn read_timeout_is_restored_to_connection_setting_after_tls_handshake() {
         "connection read timeout was not restored to the short connection setting: took {elapsed:?}"
     );
 }
+
+/// 1 接続だけを受け付け、`handle_connection_with_options`（TLS opt-in）の
+/// 戻り値を `JoinHandle` で返す。上位 wire 層が切断を静かに扱う（panic・
+/// エラー終了しない）ことを戻り値で直接検証するためのヘルパー。
+fn spawn_single_tls_connection(
+    users_path: &std::path::Path,
+) -> (
+    std::net::SocketAddr,
+    std::thread::JoinHandle<std::io::Result<()>>,
+) {
+    let store = UserStore::load_from_file(users_path).expect("valid user store");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set write timeout");
+        wire_server::handshake::handle_connection_with_options(
+            stream,
+            &store,
+            None,
+            Some(tls_client::test_config()),
+        )
+    });
+    (addr, handle)
+}
+
+/// `SSLRequest` → TLS ハンドシェイク → StartupMessage → cleartext 認証 →
+/// ReadyForQuery までを進めた TLS チャネルを返す。
+fn authenticate_over_tls(addr: std::net::SocketAddr) -> tls_client::TlsTestChannel {
+    let mut socket = TcpStream::connect(addr).expect("connect");
+    write_ssl_request(&mut socket);
+    assert_eq!(&read_exact_n(&mut socket, 1), b"S");
+    let client = tls_client::drive_client_handshake_over_socket(&mut socket);
+    let mut channel = tls_client::TlsTestChannel::new(client, socket);
+
+    write_startup_message(&mut channel, "alice", "irrelevant-db-name");
+    let (type_byte, _) = read_typed_message(&mut channel);
+    assert_eq!(type_byte, b'R');
+    write_typed_message(&mut channel, b'p', b"pw-alice\0");
+    let (type_byte, body) = read_typed_message(&mut channel);
+    assert_eq!(type_byte, b'R');
+    assert_eq!(
+        i32::from_be_bytes(body[..4].try_into().expect("4 bytes")),
+        0
+    );
+    drain_to_ready_for_query(&mut channel);
+    channel
+}
+
+/// 生ソケットから EOF まで TLS レコードを読み、クライアント鍵で復号した
+/// 内側の content type 列を返す。
+fn collect_inner_content_types(
+    client: &mut tls_client::TestClient,
+    socket: &mut TcpStream,
+) -> Vec<wire_server::tls::record::ContentType> {
+    use wire_server::tls::record::{self, RecordKind};
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut types = Vec::new();
+    while let Ok(Some(rec)) = record::read_record(socket, RecordKind::Ciphertext) {
+        let inner = client
+            .opener
+            .open(&rec)
+            .expect("server record must decrypt");
+        types.push(inner.content_type);
+    }
+    types
+}
+
+/// PR #1056 レビュー指摘（close_notify なしの EOF をエラー扱いへ変更）後も、
+/// 認証後にクライアントが close_notify も Terminate も送らず TCP を閉じた
+/// 場合、上位の pg wire 層は通常のクライアント切断として静かに終了する
+/// こと（panic せず `Ok(())`、ErrorResponse も close_notify も送らない。
+/// ストリームは失敗状態に固定されるため以後の送出は行われない）。
+#[test]
+fn client_disconnect_without_close_notify_is_handled_as_quiet_disconnect() {
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let (addr, handle) = spawn_single_tls_connection(&users_path);
+
+    let channel = authenticate_over_tls(addr);
+    let (mut client, mut socket) = channel.into_parts();
+    socket
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown write");
+
+    let types = collect_inner_content_types(&mut client, &mut socket);
+    assert!(
+        types.is_empty(),
+        "server must not send anything after an unclean client disconnect, got {types:?}"
+    );
+
+    let result = handle.join().expect("connection handler must not panic");
+    assert!(
+        result.is_ok(),
+        "unclean client disconnect must end the connection quietly: {result:?}"
+    );
+}
+
+/// Terminate（'X'）送信後にクライアントが close_notify なしで TCP を閉じても、
+/// サーバーは pg wire の応答（ApplicationData）を一切送らず、best-effort の
+/// close_notify（alert）のみを送って `Ok(())` で終了すること。
+#[test]
+fn terminate_then_disconnect_without_close_notify_ends_quietly() {
+    use wire_server::tls::record::ContentType;
+
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let (addr, handle) = spawn_single_tls_connection(&users_path);
+
+    let mut channel = authenticate_over_tls(addr);
+    write_typed_message(&mut channel, b'X', &[]);
+    let (mut client, mut socket) = channel.into_parts();
+    socket
+        .shutdown(std::net::Shutdown::Write)
+        .expect("shutdown write");
+
+    let types = collect_inner_content_types(&mut client, &mut socket);
+    assert!(
+        types.iter().all(|t| *t == ContentType::Alert),
+        "only a close_notify alert may follow Terminate, got {types:?}"
+    );
+
+    let result = handle.join().expect("connection handler must not panic");
+    assert!(
+        result.is_ok(),
+        "Terminate followed by disconnect must end quietly: {result:?}"
+    );
+}

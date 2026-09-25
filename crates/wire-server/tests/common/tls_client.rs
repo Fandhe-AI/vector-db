@@ -501,6 +501,12 @@ impl TlsTestChannel {
     pub fn into_socket(self) -> std::net::TcpStream {
         self.socket
     }
+
+    /// 切断後にサーバーから届くレコードを復号して検査するため、
+    /// [`TestClient`]（鍵材料）と生ソケットの両方を取り出す。
+    pub fn into_parts(self) -> (TestClient, std::net::TcpStream) {
+        (self.client, self.socket)
+    }
 }
 
 impl Read for TlsTestChannel {
