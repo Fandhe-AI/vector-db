@@ -3834,6 +3834,118 @@ mod tests {
         ));
     }
 
+    /// カタログ v4（UNIQUE 制約セクション。TABLE-16・TASK-204、Issue #905）の
+    /// 破損値デコードを固定する回帰テスト群（codex-review 指摘・Issue #905
+    /// PR レビュー: `drop_enum_type_rejects_corrupt_catalog_value_...` と同種の
+    /// 破損値検査が存在しなかった）。有効な v4 バイト列
+    /// （`v4\ncols:1\na:text:-:0:L\nuniq:1\nU:a\n`）を基準に、`uniq:` 行の欠落・
+    /// 不正な件数・`U:` 行の空要素・上限超過・末尾余剰行の各パターンを
+    /// `CatalogError::CorruptSchema` で拒否することを確認する。
+    #[test]
+    fn decode_v4_rejects_missing_uniq_line() {
+        // `uniq:` セクション自体が存在しない（列行の直後で終端）。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn decode_v4_rejects_malformed_uniq_count() {
+        // `uniq:` 接頭辞はあるが件数が数値として解釈できない。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\nuniq:not-a-number\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+
+        // `uniq:` 接頭辞そのものが欠落している（別の行が代わりに現れる）。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\nU:a\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+
+        // 形式の一意性契約（TABLE-16）: v4 は UNIQUE 制約 1 件以上を要求する。
+        // `uniq:0` は「UNIQUE 制約を持たないスキーマは v2/v3 で書く」契約に
+        // 反するため拒否される。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\nuniq:0\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn decode_v4_rejects_uniq_count_over_limit() {
+        let over_limit = MAX_UNIQUE_CONSTRAINTS + 1;
+        let bytes = format!("v4\ncols:1\na:text:-:0:L\nuniq:{over_limit}\n").into_bytes();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn decode_v4_rejects_u_line_with_empty_element() {
+        // `U:` 行の値が空文字列（列を 1 つも参照しない制約）。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\nuniq:1\nU:\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+
+        // 先頭・末尾・中間のカンマによる空要素（例: `U:a,,b`／`U:,a`／`U:a,`）。
+        for corrupt in ["U:a,,b\n", "U:,a\n", "U:a,\n"] {
+            let bytes = format!("v4\ncols:1\na:text:-:0:L\nuniq:1\n{corrupt}").into_bytes();
+            assert!(
+                matches!(
+                    decode_schema("t", &bytes),
+                    Err(CatalogError::CorruptSchema(_))
+                ),
+                "expected {corrupt:?} to be rejected"
+            );
+        }
+
+        // `U:` 接頭辞そのものが欠落している。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\nuniq:1\na\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn decode_v4_rejects_truncated_unique_constraint_lines() {
+        // `uniq:` が宣言した件数より `U:` 行が少ない（末尾で入力が尽きる）。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\nuniq:2\nU:a\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn decode_v4_rejects_trailing_surplus_line_after_unique_constraints() {
+        // `uniq:` セクションの後に、末尾の空行 1 行以外の余剰行がある。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\nuniq:1\nU:a\nsurplus\n".to_vec();
+        assert!(matches!(
+            decode_schema("t", &bytes),
+            Err(CatalogError::CorruptSchema(_))
+        ));
+    }
+
+    #[test]
+    fn decode_v4_roundtrips_with_valid_unique_constraint_section() {
+        // 上記の破損値テストが基準とする有効な v4 バイト列自体は受理される
+        // （対照テスト）。
+        let bytes = b"v4\ncols:1\na:text:-:0:L\nuniq:1\nU:a\n".to_vec();
+        let schema = decode_schema("t", &bytes).expect("valid v4 catalog value must decode");
+        assert_eq!(schema.unique_constraints().len(), 1);
+        assert_eq!(schema.unique_constraints()[0].columns(), &["a".to_string()]);
+    }
+
     /// `drop_enum_type` は破損カタログ値を「依存なし」に丸めず `CorruptSchema`
     /// として拒否する（PR #1015 レビュー指摘・codex-review P1。Issue #890）。
     /// `decode_rejects_invalid_utf8` と同じ破損データ（不正 UTF-8）を、実際に

@@ -699,6 +699,68 @@ fn missing_embedder_is_rejected_fail_closed_with_no_side_effects() {
     assert_eq!(rows.rows.len(), 0);
 }
 
+/// UNIQUE 制約（TABLE-16・TASK-204、Issue #905）を持つテーブルへのファイル形
+/// `INSERT` は、`tenant::replace_typed_rows_by_text_key` が意図的にサイレント
+/// バイパスせず fail-closed に拒否する（`docs/design/unique-constraint.md`
+/// 「対象外」節）。この回帰テストは、拒否がクライアント起因のエラー分類
+/// （`SqlSurfaceError::InvalidInput`）へ写像され、内部エラー（`XX000`。
+/// `SqlSurfaceError::Internal`）へ丸められないことを固定する（codex-review
+/// 指摘・Issue #905 PR レビュー: コード自体は正しく分類済みだったが、この
+/// 分類を固定するテストが存在しなかった）。
+#[test]
+fn file_form_insert_on_table_with_unique_constraint_is_rejected_as_invalid_input() {
+    let path = unique_db_path("index-unique-constraint-reject");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_incremental_config(small_chunk_config());
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        &format!("CREATE TABLE documents (embedding VECTOR({DIM}), path TEXT UNIQUE, body TEXT)"),
+    )
+    .expect("create table with UNIQUE constraint should succeed");
+
+    let err = core
+        .execute_insert_sql(
+            &ctx,
+            &insert_file_sql("documents", "docs/unique.txt", "line one", "op-uniq-1"),
+        )
+        .expect_err("file-form insert on a UNIQUE-constrained table must be rejected");
+    assert_eq!(
+        err.wire_code(),
+        "22000",
+        "file-form INSERT on a UNIQUE-constrained table must be classified as a client-input \
+         error (InvalidInput), not an internal error (XX000): {err:?}"
+    );
+
+    // 拒否は副作用ゼロ（台帳未記録・行未挿入）である。
+    let op = OperationId::parse("op-uniq-1").expect("valid operation_id");
+    assert_eq!(
+        core.operation_recorded(&ctx, "documents", &op)
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::NotRecorded
+    );
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
+    let rows = core
+        .execute_sql(
+            &read_ctx,
+            &format!(
+                "SELECT body FROM documents WHERE path = 'docs/unique.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
+            ),
+        )
+        .expect("select should succeed");
+    assert_eq!(rows.rows.len(), 0);
+}
+
 #[test]
 fn embedder_dim_mismatch_with_table_schema_is_rejected_with_no_side_effects() {
     let path = unique_db_path("index-embedder-dim-mismatch");
