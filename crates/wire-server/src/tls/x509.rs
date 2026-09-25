@@ -38,7 +38,9 @@
 //! 1. 証明書 DER 長の上限検査（[`MAX_CERTIFICATE_DER_LEN`]）。確保より前に
 //!    判定する
 //! 2. [`super::der::validate_structure`] による TLV 全体の整形式・入れ子
-//!    深さ上限の検証
+//!    深さ上限・universal 型ごとの primitive/constructed の別と primitive
+//!    値の DER 正規形（`BIT STRING`・`INTEGER`・OID・時刻型・文字列型等）の
+//!    検証（時刻型の違反は `InvalidTime`、それ以外は `Malformed`）
 //! 3. `Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
 //!    signatureValue BIT STRING }`（後続バイトは拒否）
 //! 4. `tbsCertificate` の各フィールドを順に読む（version → serialNumber →
@@ -69,7 +71,7 @@
 use std::fmt;
 use std::path::Path;
 
-use super::der::{self, DerReader};
+use super::der::{self, DerError, DerReader, DerTime};
 use super::handshake::{Certificate, CertificateEntry};
 use super::hkdf::ct_eq;
 use super::pem;
@@ -131,8 +133,9 @@ fn classify_spki_oid(oid: &[u8]) -> KeyAlgorithm {
 /// 証明書内容・実バイト・時刻値は含めない（分類のみ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum X509Error {
-    /// DER 構文（タグ・長さ・入れ子深さ・後続バイト等）そのものの違反、
-    /// または本パーサが要求する固定フィールド順序からの逸脱。
+    /// DER 構文（タグ・長さ・入れ子深さ・後続バイト等）・universal 型の
+    /// primitive/constructed の別・primitive 値の正規形（時刻型を除く）の
+    /// 違反、または本パーサが要求する固定フィールド順序からの逸脱。
     Malformed,
     /// 証明書 DER が [`MAX_CERTIFICATE_DER_LEN`] を超える。
     CertificateTooLarge,
@@ -153,10 +156,11 @@ pub enum X509Error {
     /// 葉証明書の SPKI アルゴリズムが Ed25519 以外、または Ed25519 だが
     /// parameters を持つ等 RFC 8410 §3 の形状に反する。
     UnsupportedPublicKeyAlgorithm(KeyAlgorithm),
-    /// SPKI の `subjectPublicKey` BIT STRING が DER の形状として不正
-    /// （値が空・未使用ビット数 8 以上・非 0 パディング・内容 0 バイト。
-    /// 葉・中間を問わず全証明書に適用）、または葉証明書でちょうど
-    /// 32 バイトの Ed25519 鍵として取り出せない。
+    /// SPKI の `subjectPublicKey` BIT STRING が DER としては正当だが内容が
+    /// 0 バイト（葉・中間を問わず全証明書に適用）、または葉証明書で未使用
+    /// ビット数 0 のちょうど 32 バイトの Ed25519 鍵として取り出せない。
+    /// BIT STRING の DER 形状違反（値が空・未使用ビット数 8 以上・非 0
+    /// パディング）は構造検証の段階で [`X509Error::Malformed`] になる。
     InvalidPublicKey,
     /// 葉証明書の SPKI 公開鍵が期待公開鍵（秘密鍵から導出済み）と一致しない。
     PublicKeyMismatch,
@@ -323,29 +327,17 @@ fn validate_serial_number(serial: &[u8]) -> Result<(), X509Error> {
 }
 
 /// OBJECT IDENTIFIER の値部分（BER/DER の base-128 可変長サブ識別子列）が
-/// 最小限整形式であることを検査する（`validate_structure` はタグ・長さ・
-/// 入れ子だけを見て primitive の中身には潜らないため、OID として無意味な
-/// バイト列——空・サブ識別子が継続ビット付きのまま終端・先頭バイトが
-/// 非最小符号化の `0x80`——を通してしまう）。DER の値そのものの解釈
-/// （既知 OID との比較）は呼び出し元の責務のまま変えない。
+/// 整形式であることを検査する（空・サブ識別子先頭の `0x80`・切り詰めを
+/// 拒否）。判定本体は [`super::der::validate_structure`] が全階層で使う
+/// [`super::der::is_well_formed_oid`] と共有し、ここではフィールド単位で
+/// 読んだ OID に対して拒否理由を `Malformed` へ写像するだけにする。既知
+/// OID との比較は呼び出し元の責務のまま変えない。
 fn validate_oid_content(oid: &[u8]) -> Result<(), X509Error> {
-    if oid.is_empty() {
-        return Err(X509Error::Malformed);
+    if der::is_well_formed_oid(oid) {
+        Ok(())
+    } else {
+        Err(X509Error::Malformed)
     }
-    let mut at_subidentifier_start = true;
-    for byte in oid {
-        if at_subidentifier_start && *byte == 0x80 {
-            // サブ識別子の先頭バイトが 0x80 は非最小符号化（先行ゼロ）。
-            return Err(X509Error::Malformed);
-        }
-        at_subidentifier_start = byte & 0x80 == 0;
-    }
-    if !at_subidentifier_start {
-        // 最後のサブ識別子が継続ビット付きのまま終端している
-        // （切り詰められた OID）。
-        return Err(X509Error::Malformed);
-    }
-    Ok(())
 }
 
 /// `Name ::= CHOICE { rdnSequence RDNSequence }`・
@@ -421,35 +413,26 @@ fn set_of_elements_in_der_order(previous: &[u8], current: &[u8]) -> bool {
     previous <= current
 }
 
-/// `BIT STRING` の値部分（先頭 1 バイトが未使用ビット数、残りが内容）が
-/// DER として整形式であることを検査する（値が空でない・未使用ビット数は
-/// 0〜7・非ゼロなら最終オクテットの下位未使用ビットがすべて 0）。
-/// 証明書内の全 `BIT STRING`（`issuerUniqueID`／`subjectUniqueID`・
-/// `signatureValue`・SPKI の `subjectPublicKey`）が共有する形状検査で、
-/// 内容の存在まで要求するフィールドは [`validate_non_empty_bit_string`]
-/// を経由する。未使用ビット数が 0 の場合は内容が空（0 ビットの
-/// BIT STRING）でも構文上は正当なため、本関数単体では許容する。
+/// `BIT STRING` の値部分が DER の正規形であることを検査する（値が空で
+/// ない・未使用ビット数 0〜7・内容が空なら未使用ビット数 0・未使用ビットの
+/// 0 埋め）。判定本体は [`super::der::validate_bit_string`]（universal の
+/// `BIT STRING` を [`super::der::validate_structure`] が全階層で検査する際の
+/// 実装と同一）に一本化し、ここでは IMPLICIT タグで universal タグを失う
+/// `issuerUniqueID`／`subjectUniqueID` など、フィールド単位で読んだ値の
+/// 拒否理由を `Malformed` へ写像するだけにする。
 fn validate_bit_string_shape(value: &[u8]) -> Result<(), X509Error> {
-    let (&unused_bits, content) = value.split_first().ok_or(X509Error::Malformed)?;
-    if unused_bits > 7 {
-        return Err(X509Error::Malformed);
-    }
-    if unused_bits > 0 {
-        let last_byte = content.last().ok_or(X509Error::Malformed)?;
-        let unused_mask = (1u8 << unused_bits) - 1;
-        if last_byte & unused_mask != 0 {
-            return Err(X509Error::Malformed);
-        }
-    }
-    Ok(())
+    der::validate_bit_string(value).map_err(|_| X509Error::Malformed)
 }
 
 /// [`validate_bit_string_shape`] に加えて、未使用ビット数オクテットの後に
 /// 内容が 1 バイト以上あることを要求する。0 ビットの BIT STRING が構文上
 /// 正当でも意味を持たないフィールド（`signatureValue`・SPKI の
-/// `subjectPublicKey`）に使い、葉・中間を問わず全証明書へ同じ形状検査を
+/// `subjectPublicKey`）に使い、葉・中間を問わず全証明書へ同じ検査を
 /// 適用する単一の入口とする（PR #1036 codex-review P1 指摘: SPKI の
 /// BIT STRING は従来、葉だけが `check_leaf_public_key` で検査されていた）。
+/// DER 形状の部分は [`super::der::validate_bit_string`] と同一実装で、
+/// universal の `BIT STRING` であるこれらのフィールドでは手順 2 で既に
+/// 検査済みのため、ここでの再判定は防御的なものにとどまる。
 fn validate_non_empty_bit_string(value: &[u8]) -> Result<(), X509Error> {
     validate_bit_string_shape(value)?;
     // 先頭 1 バイトは未使用ビット数。内容が 1 バイト以上あれば全体は 2 以上。
@@ -544,8 +527,15 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     if der_bytes.len() > MAX_CERTIFICATE_DER_LEN {
         return Err(X509Error::CertificateTooLarge);
     }
-    der::validate_structure(der_bytes, der::MAX_DER_NESTING_DEPTH)
-        .map_err(|_| X509Error::Malformed)?;
+    // DER 構文・universal primitive 型ごとの正規形を全階層で検査する。
+    // 時刻型の形式・暦の違反だけは validity の既存契約に合わせて
+    // InvalidTime、それ以外の DER 違反は Malformed とする。
+    der::validate_structure(der_bytes, der::MAX_DER_NESTING_DEPTH).map_err(
+        |error| match error {
+            DerError::InvalidTime => X509Error::InvalidTime,
+            _ => X509Error::Malformed,
+        },
+    )?;
 
     let mut outer = DerReader::new(der_bytes);
     let cert_tlv = outer.read_any().map_err(|_| X509Error::Malformed)?;
@@ -668,12 +658,12 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
         .read_expected(TAG_BIT_STRING)
         .map_err(|_| X509Error::Malformed)?;
     spki_reader.expect_end().map_err(|_| X509Error::Malformed)?;
-    // subjectPublicKey BIT STRING の形状（値が空でない・未使用ビット数
-    // 0〜7・未使用ビットの 0 埋め・内容 1 バイト以上）を葉・中間を問わず
-    // 検査する。従来は葉だけが check_leaf_public_key で検査されており、
-    // 中間証明書では空・未使用ビット数 8 以上・非 0 パディングの BIT STRING
-    // が受理されていた（PR #1036 codex-review P1 指摘）。拒否理由は葉の
-    // 既存契約（鍵ビット列の不正は InvalidPublicKey）と揃える。
+    // subjectPublicKey BIT STRING の DER 形状（値が空でない・未使用ビット数
+    // 0〜7・未使用ビットの 0 埋め）は手順 2 の validate_structure が葉・中間を
+    // 問わず検査済みで、違反はそこで Malformed になる。ここでは DER としては
+    // 正当だが鍵として意味を持たない「内容 0 バイト」を葉・中間とも
+    // InvalidPublicKey として拒否する（PR #1036 codex-review P1 指摘: 従来は
+    // 葉だけが check_leaf_public_key で検査されていた）。
     validate_non_empty_bit_string(spki_key_bits).map_err(|_| X509Error::InvalidPublicKey)?;
 
     // 任意の issuerUniqueID [1]／subjectUniqueID [2]／extensions [3]。
@@ -765,45 +755,10 @@ fn check_leaf_public_key(
     Ok(())
 }
 
-fn ascii_digit(byte: u8) -> Result<i64, X509Error> {
-    if byte.is_ascii_digit() {
-        Ok(i64::from(byte - b'0'))
-    } else {
-        Err(X509Error::InvalidTime)
-    }
-}
-
-fn parse_two_digit(a: u8, b: u8) -> Result<i64, X509Error> {
-    Ok(ascii_digit(a)? * 10 + ascii_digit(b)?)
-}
-
-fn parse_four_digit(a: u8, b: u8, c: u8, d: u8) -> Result<i64, X509Error> {
-    Ok(ascii_digit(a)? * 1000 + ascii_digit(b)? * 100 + ascii_digit(c)? * 10 + ascii_digit(d)?)
-}
-
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(year) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
-}
-
 /// 1970-01-01 からの経過日数を求める（Howard Hinnant の
 /// `days_from_civil` アルゴリズム。グレゴリオ暦・`i64`）。呼び出し元
-/// （[`build_epoch_seconds`]）が month を 1〜12・day を暦上有効な範囲に
-/// 検証済みであることを前提とする。
+/// （[`epoch_seconds`]）が渡す [`DerTime`] は月 1〜12・日が暦上有効な範囲に
+/// [`super::der`] で検証済みであることを前提とする。
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
@@ -814,79 +769,39 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-/// 暦上の各フィールドを検査したうえでエポック秒（`i64`）へ変換する。
-/// うるう秒（60 秒）は受理しない。
-fn build_epoch_seconds(
-    year: i64,
-    month: i64,
-    day: i64,
-    hour: i64,
-    minute: i64,
-    second: i64,
-) -> Result<i64, X509Error> {
-    if !(1..=12).contains(&month) {
-        return Err(X509Error::InvalidTime);
-    }
-    let max_day = days_in_month(year, month);
-    if day < 1 || day > max_day {
-        return Err(X509Error::InvalidTime);
-    }
-    if hour > 23 || minute > 59 || second > 59 {
-        return Err(X509Error::InvalidTime);
-    }
-    let days = days_from_civil(year, month, day);
-    let seconds_of_day = hour
+/// 暦として検証済みの [`DerTime`] をエポック秒（`i64`）へ変換する。
+fn epoch_seconds(time: &DerTime) -> Result<i64, X509Error> {
+    let days = days_from_civil(time.year, time.month, time.day);
+    let seconds_of_day = time
+        .hour
         .checked_mul(3600)
-        .and_then(|v| minute.checked_mul(60).and_then(|m| v.checked_add(m)))
-        .and_then(|v| v.checked_add(second))
+        .and_then(|v| time.minute.checked_mul(60).and_then(|m| v.checked_add(m)))
+        .and_then(|v| v.checked_add(time.second))
         .ok_or(X509Error::InvalidTime)?;
     days.checked_mul(86_400)
         .and_then(|d| d.checked_add(seconds_of_day))
         .ok_or(X509Error::InvalidTime)
 }
 
-/// UTCTime（RFC 5280 §4.1.2.5.1）: `YYMMDDHHMMSSZ` の 13 バイト固定。
-/// `YY >= 50` は 19YY、`YY < 50` は 20YY と解釈する。
+/// UTCTime（RFC 5280 §4.1.2.5.1）。DER の正規形（`YYMMDDHHMMSSZ` の 13
+/// バイト固定）と暦の検査は [`super::der::parse_utc_time`]（`validate_structure`
+/// が validity 以外の場所の UTCTime にも使う実装）に一本化し、ここでは
+/// エポック秒へ変換する。`YY >= 50` は 19YY、`YY < 50` は 20YY と解釈する。
 fn parse_utc_time(value: &[u8]) -> Result<i64, X509Error> {
-    let bytes: [u8; 13] = value.try_into().map_err(|_| X509Error::InvalidTime)?;
-    let [y1, y2, mo1, mo2, d1, d2, h1, h2, mi1, mi2, s1, s2, z] = bytes;
-    if z != b'Z' {
-        return Err(X509Error::InvalidTime);
-    }
-    let two_digit_year = parse_two_digit(y1, y2)?;
-    let year = if two_digit_year >= 50 {
-        1900 + two_digit_year
-    } else {
-        2000 + two_digit_year
-    };
-    let month = parse_two_digit(mo1, mo2)?;
-    let day = parse_two_digit(d1, d2)?;
-    let hour = parse_two_digit(h1, h2)?;
-    let minute = parse_two_digit(mi1, mi2)?;
-    let second = parse_two_digit(s1, s2)?;
-    build_epoch_seconds(year, month, day, hour, minute, second)
+    let time = der::parse_utc_time(value).map_err(|_| X509Error::InvalidTime)?;
+    epoch_seconds(&time)
 }
 
-/// GeneralizedTime（RFC 5280 §4.1.2.5.2）: `YYYYMMDDHHMMSSZ` の 15 バイト
-/// 固定。RFC 5280 は 2050 年以降にのみ GeneralizedTime を使うことを
-/// 要求するため、2050 年未満は fail-closed で拒否する（小数秒・UTC 以外の
-/// タイムゾーンは本パーサの対応外で拒否）。
+/// GeneralizedTime（RFC 5280 §4.1.2.5.2）。DER の正規形と暦の検査は
+/// [`super::der::parse_generalized_time`] に一本化し、ここでは RFC 5280 が
+/// validity に課す追加制約——小数秒を含めない（MUST NOT）・2050 年以降に
+/// のみ使う——を fail-closed に検査してからエポック秒へ変換する。
 fn parse_generalized_time(value: &[u8]) -> Result<i64, X509Error> {
-    let bytes: [u8; 15] = value.try_into().map_err(|_| X509Error::InvalidTime)?;
-    let [y1, y2, y3, y4, mo1, mo2, d1, d2, h1, h2, mi1, mi2, s1, s2, z] = bytes;
-    if z != b'Z' {
+    let time = der::parse_generalized_time(value).map_err(|_| X509Error::InvalidTime)?;
+    if time.has_fraction || time.year < 2050 {
         return Err(X509Error::InvalidTime);
     }
-    let year = parse_four_digit(y1, y2, y3, y4)?;
-    if year < 2050 {
-        return Err(X509Error::InvalidTime);
-    }
-    let month = parse_two_digit(mo1, mo2)?;
-    let day = parse_two_digit(d1, d2)?;
-    let hour = parse_two_digit(h1, h2)?;
-    let minute = parse_two_digit(mi1, mi2)?;
-    let second = parse_two_digit(s1, s2)?;
-    build_epoch_seconds(year, month, day, hour, minute, second)
+    epoch_seconds(&time)
 }
 
 fn parse_time_tlv(reader: &mut DerReader<'_>) -> Result<i64, X509Error> {
@@ -1079,7 +994,7 @@ mod tests {
     #[test]
     fn parse_generalized_time_matches_known_epoch_seconds() {
         // 独立系統（`date -u -d '2050-12-31T23:59:59Z' +%s`）で確認した値
-        // との一致を固定する（本実装の `build_epoch_seconds` を期待値の
+        // との一致を固定する（本実装の `epoch_seconds` を期待値の
         // 算出にも使う循環参照を避けるため）。
         assert_eq!(
             parse_generalized_time(b"20501231235959Z").expect("valid GeneralizedTime"),
@@ -1098,8 +1013,16 @@ mod tests {
         // 2024 は閏年、2023・2100 は違う、2000 は閏年（400 で割り切れる）。
         assert!(parse_utc_time(b"240229000000Z").is_ok());
         assert!(parse_utc_time(b"230229000000Z").is_err());
-        assert!(build_epoch_seconds(2100, 2, 29, 0, 0, 0).is_err());
-        assert!(build_epoch_seconds(2000, 2, 29, 0, 0, 0).is_ok());
+        assert!(parse_generalized_time(b"21000229000000Z").is_err());
+        assert!(parse_generalized_time(b"24000229000000Z").is_ok());
+        assert!(der::parse_generalized_time(b"20000229000000Z").is_ok());
+        // DER として正当な小数秒付き GeneralizedTime も、RFC 5280 の validity
+        // では小数秒を禁じるため拒否する。
+        assert!(der::parse_generalized_time(b"20501231235959.5Z").is_ok());
+        assert_eq!(
+            parse_generalized_time(b"20501231235959.5Z").unwrap_err(),
+            X509Error::InvalidTime
+        );
     }
 
     /// `YYMMDDHHMMSSZ` の 13 バイトを各フィールドの 2 桁文字列から組み立てる

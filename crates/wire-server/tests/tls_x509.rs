@@ -892,9 +892,17 @@ fn spki_with_parameters_is_rejected() {
 
 #[test]
 fn spki_bit_string_unused_bits_nonzero_is_rejected() {
+    // 未使用ビット数 1 でも DER としては正当（最終オクテットの未使用ビットが
+    // 0）な BIT STRING にし、RFC 8410 §3 の「Ed25519 鍵の未使用ビット数は
+    // 0」という葉の SPKI 検査（InvalidPublicKey）だけを観測する。
+    // RFC 8410 §10.1 の鍵は最終オクテットが奇数のため、その最下位ビットを
+    // 落とす（非 0 パディングは DER 違反として Malformed になる。別テスト）。
     let signature_algorithm = ed25519_algorithm_identifier();
     let mut spki_bits = vec![0x01u8]; // unused bits != 0
     spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    if let Some(last) = spki_bits.last_mut() {
+        *last &= 0xfe;
+    }
     let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
     let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
     let tbs_certificate = sequence(&[
@@ -1647,15 +1655,33 @@ fn leaf_and_intermediate_result(
 fn intermediate_spki_bit_string_with_invalid_shape_is_rejected() {
     // 中間証明書（index 1）の SPKI BIT STRING の形状違反（PR #1036
     // codex-review P1 指摘: 従来は葉の check_leaf_public_key だけが検査して
-    // いたため、中間ではこれらが from_der_chain を通過していた）。
-    let cases: [(&str, Vec<u8>); 5] = [
-        ("empty value", Vec::new()),
-        ("unused bits octet only", vec![0x00]),
-        ("unused bits 8", [&[0x08u8][..], &[0u8; 32]].concat()),
-        ("unused bits 3 with nonzero padding", vec![0x03, 0xaa, 0xf9]),
-        ("unused bits without content", vec![0x05]),
+    // いたため、中間ではこれらが from_der_chain を通過していた）。DER 形状の
+    // 違反は構造検証（全階層の BIT STRING 正規形検査）で Malformed、DER と
+    // しては正当だが鍵の内容が 0 バイトのものは InvalidPublicKey になる。
+    let cases: [(&str, Vec<u8>, X509Error); 5] = [
+        ("empty value", Vec::new(), X509Error::Malformed),
+        (
+            "unused bits octet only",
+            vec![0x00],
+            X509Error::InvalidPublicKey,
+        ),
+        (
+            "unused bits 8",
+            [&[0x08u8][..], &[0u8; 32]].concat(),
+            X509Error::Malformed,
+        ),
+        (
+            "unused bits 3 with nonzero padding",
+            vec![0x03, 0xaa, 0xf9],
+            X509Error::Malformed,
+        ),
+        (
+            "unused bits without content",
+            vec![0x05],
+            X509Error::Malformed,
+        ),
     ];
-    for (label, value) in cases {
+    for (label, value, expected) in cases {
         let err =
             leaf_and_intermediate_result(build_x25519_intermediate_with_spki_bit_string(&value))
                 .expect_err(label);
@@ -1663,7 +1689,7 @@ fn intermediate_spki_bit_string_with_invalid_shape_is_rejected() {
             err,
             CertificateChainError::Certificate {
                 index: 1,
-                error: X509Error::InvalidPublicKey
+                error: expected
             },
             "{label}"
         );
@@ -1688,8 +1714,13 @@ fn intermediate_spki_bit_string_with_valid_shape_is_accepted() {
 
 #[test]
 fn leaf_spki_bit_string_with_invalid_shape_is_rejected_as_invalid_public_key() {
-    // 葉でも同じ共通検査を通り、既存契約どおり InvalidPublicKey になる。
-    for value in [vec![0x08u8, 0x00], vec![0x00], Vec::new()] {
+    // 葉でも中間と同じ共通検査を通る。DER 形状の違反は Malformed、DER として
+    // 正当だが内容 0 バイトの鍵は InvalidPublicKey。
+    for (value, expected) in [
+        (vec![0x08u8, 0x00], X509Error::Malformed),
+        (vec![0x00], X509Error::InvalidPublicKey),
+        (Vec::new(), X509Error::Malformed),
+    ] {
         let signature_algorithm = ed25519_algorithm_identifier();
         let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &value)]);
         let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
@@ -1719,7 +1750,7 @@ fn leaf_spki_bit_string_with_invalid_shape_is_rejected_as_invalid_public_key() {
             err,
             CertificateChainError::Certificate {
                 index: 0,
-                error: X509Error::InvalidPublicKey
+                error: expected
             },
             "{value:02x?}"
         );
@@ -1866,6 +1897,141 @@ fn non_canonical_integer_in_algorithm_parameters_is_rejected() {
     assert_leaf_accepted(build(&with_params(&[0x00, 0x80])));
     assert_leaf_rejected_as_malformed(build(&with_params(&[0x00, 0x7f])));
     assert_leaf_rejected_as_malformed(build(&with_params(&[])));
+}
+
+/// テスト専用: tbsCertificate.signature と外側 signatureAlgorithm の双方に
+/// 同じ AlgorithmIdentifier を置いた Ed25519 葉証明書の DER を手組みする。
+fn build_leaf_with_signature_algorithm(algorithm: &[u8]) -> Vec<u8> {
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        algorithm,
+        &issuer_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    sequence(&[&tbs_certificate, algorithm, &tlv(0x03, &signature_bits)])
+}
+
+#[test]
+fn non_canonical_bit_string_in_algorithm_parameters_is_rejected() {
+    // AlgorithmIdentifier の parameters（ANY。意味は解釈しない）に置いた
+    // BIT STRING も DER の正規形で検査する（PR #1036 codex-review P1 指摘:
+    // `03 02 08 00`〔未使用ビット数 8〕が受理されていた）。
+    let with_params = |parameters: &[u8]| sequence(&[&tlv(0x06, &OID_ED25519_BYTES), parameters]);
+    for rejected in [
+        tlv(0x03, &[0x08, 0x00]),
+        tlv(0x03, &[0x03, 0xf9]),
+        tlv(0x03, &[0x01]),
+        tlv(0x03, &[]),
+    ] {
+        assert_leaf_rejected_as_malformed(build_leaf_with_signature_algorithm(&with_params(
+            &rejected,
+        )));
+    }
+    for accepted in [
+        tlv(0x03, &[0x00]),
+        tlv(0x03, &[0x03, 0xf8]),
+        tlv(0x04, &[0x08, 0x00]),
+    ] {
+        assert_leaf_accepted(build_leaf_with_signature_algorithm(&with_params(&accepted)));
+    }
+}
+
+#[test]
+fn name_attribute_values_follow_der_primitive_constraints() {
+    // Name の属性値（ANY）に置いた文字列型・時刻型も、フィールドの意味を
+    // 解釈しないまま DER の正規形・文字集合で検査する。
+    let subject_with_value = |value: &[u8]| {
+        let atv = sequence(&[&tlv(0x06, &[0x55, 0x04, 0x03]), value]);
+        sequence(&[&tlv(0x31, &atv)])
+    };
+    let build = |value: &[u8]| {
+        build_ed25519_leaf_with_names_and_extensions(
+            &issuer_name(),
+            &subject_with_value(value),
+            None,
+        )
+    };
+    for accepted in [
+        tlv(0x0c, "caf\u{e9}".as_bytes()),
+        tlv(0x13, b"Example Org."),
+        tlv(0x16, b"user@example.com"),
+        tlv(0x1e, &[0x00, 0x41]),
+        tlv(0x18, b"20501231235959.5Z"),
+    ] {
+        assert_leaf_accepted(build(&accepted));
+    }
+    for rejected in [
+        tlv(0x0c, &[0x63, 0xc3]),
+        tlv(0x13, b"a*b"),
+        tlv(0x16, &[0x80]),
+        tlv(0x1e, &[0x41]),
+        tlv(0x09, &[]),
+    ] {
+        assert_leaf_rejected_as_malformed(build(&rejected));
+    }
+    // 時刻型の DER 違反は validity と同じ InvalidTime に写像される。
+    let err = ServerCertificateChain::from_der_chain(
+        vec![build(&tlv(0x18, b"20501231235959.50Z"))],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CertificateChainError::Certificate {
+            index: 0,
+            error: X509Error::InvalidTime
+        }
+    );
+}
+
+#[test]
+fn validity_with_der_valid_fractional_generalized_time_is_rejected() {
+    // DER としては正当な小数秒付き GeneralizedTime でも、RFC 5280 §4.1.2.5.2
+    // が validity に小数秒を禁じるため InvalidTime として拒否する。
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time("160801121924Z"), &tlv(0x18, b"20501231235959.5Z")]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &issuer_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    let der = sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ]);
+    let err = ServerCertificateChain::from_der_chain(
+        vec![der],
+        &RFC8410_10_1_ED25519_PUBLIC_KEY,
+        NOW_WITHIN_RFC8410_10_2_VALIDITY,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        CertificateChainError::Certificate {
+            index: 0,
+            error: X509Error::InvalidTime
+        }
+    );
 }
 
 #[test]

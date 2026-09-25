@@ -46,15 +46,21 @@ pub(crate) enum DerError {
     TrailingData,
     /// 期待したタグと異なるタグが現れた。
     UnexpectedTag,
-    /// universal クラスのタグ（`SEQUENCE`／`SET` を除く）が constructed
-    /// ビット付きで現れた（DER はこれらの型を常に primitive で符号化する
-    /// ことを要求する。BER の断片化 constructed 文字列は非該当）。
+    /// primitive 必須の universal 型（constructed 必須の 5 種以外。
+    /// [`universal_type_requires_constructed`] 参照）が constructed ビット
+    /// 付きで現れた（BER の断片化 constructed 文字列は DER では非該当）。
     ConstructedUniversalType,
-    /// universal primitive 型の値が DER の正規形に反する（`NULL` に値が
-    /// ある・`BOOLEAN` が 1 バイトかつ `0x00`／`0xFF` のいずれでもない・
-    /// `INTEGER`／`ENUMERATED` が空または非最小符号化・`OBJECT IDENTIFIER`／
-    /// `RELATIVE-OID` が空・非最小符号化・切り詰め、等）。
+    /// universal primitive 型の値が DER の正規形・値の制約に反する
+    /// （[`validate_universal_primitive`] が型ごとに判定する。時刻型は
+    /// [`DerError::InvalidTime`] を別に返す）。
     InvalidPrimitiveEncoding,
+    /// `UTCTime`／`GeneralizedTime` の値が DER の正規形（X.690 §11.7・
+    /// §11.8）または暦として不正。
+    InvalidTime,
+    /// DER 正規形の検査を本実装が持たない universal 型（`REAL`（9）・
+    /// `TIME`（14））または予約済みのタグ番号（15）。X.509 では使われない
+    /// ため、検査せずに受理するのではなく fail-closed に拒否する。
+    UnsupportedUniversalType,
     /// constructed でしか符号化できない universal 型（`EXTERNAL`（8）・
     /// `EMBEDDED PDV`（11）・`SEQUENCE`（16）・`SET`（17）・
     /// `CHARACTER STRING`（29））が primitive（constructed ビット無し）で
@@ -77,6 +83,8 @@ impl fmt::Display for DerError {
                 "DER universal type is not allowed to be constructed"
             }
             DerError::InvalidPrimitiveEncoding => "DER primitive value is not in canonical form",
+            DerError::InvalidTime => "DER time value is not in canonical form",
+            DerError::UnsupportedUniversalType => "DER universal type is not supported",
             DerError::PrimitiveConstructedOnlyType => {
                 "DER constructed-only universal type must not be encoded as primitive"
             }
@@ -265,7 +273,7 @@ fn is_minimal_integer(value: &[u8]) -> bool {
 /// `OBJECT IDENTIFIER`／`RELATIVE-OID` の値部分（base-128 可変長サブ
 /// 識別子列）が整形式か（X.690 §8.19.2・§8.20.2）。空・サブ識別子先頭の
 /// `0x80`（非最小符号化）・継続ビット付きのまま終端（切り詰め）を拒否する。
-fn is_well_formed_oid(value: &[u8]) -> bool {
+pub(crate) fn is_well_formed_oid(value: &[u8]) -> bool {
     if value.is_empty() {
         return false;
     }
@@ -279,17 +287,229 @@ fn is_well_formed_oid(value: &[u8]) -> bool {
     at_subidentifier_start
 }
 
+/// `BIT STRING` の値部分（先頭 1 バイトが未使用ビット数、残りが内容）が
+/// DER の正規形か（X.690 §8.6.2・§11.2）。値は 1 バイト以上・未使用ビット数
+/// 0〜7・内容が空なら未使用ビット数 0・未使用ビット数が非 0 なら最終
+/// オクテットの下位未使用ビットがすべて 0 であること。universal の
+/// `BIT STRING` は [`validate_universal_primitive`] から、IMPLICIT タグで
+/// universal タグを失う `issuerUniqueID`／`subjectUniqueID` 等は
+/// [`super::x509`] から、同じ本関数を呼んで検査する。
+pub(crate) fn validate_bit_string(value: &[u8]) -> Result<(), DerError> {
+    let (&unused_bits, content) = value
+        .split_first()
+        .ok_or(DerError::InvalidPrimitiveEncoding)?;
+    if unused_bits > 7 {
+        return Err(DerError::InvalidPrimitiveEncoding);
+    }
+    if unused_bits == 0 {
+        return Ok(());
+    }
+    let last_byte = content.last().ok_or(DerError::InvalidPrimitiveEncoding)?;
+    let unused_mask = (1u8 << unused_bits) - 1;
+    if last_byte & unused_mask != 0 {
+        return Err(DerError::InvalidPrimitiveEncoding);
+    }
+    Ok(())
+}
+
+/// DER の `UTCTime`／`GeneralizedTime` から取り出した暦フィールド。暦として
+/// 有効な範囲（月 1〜12・月と閏年に応じた日・時 0〜23・分/秒 0〜59）は
+/// 検査済み。年は `UTCTime` の 2 桁年を RFC 5280 §4.1.2.5.1 の規則
+/// （`YY >= 50` は 19YY、`< 50` は 20YY）で 4 桁へ展開した値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DerTime {
+    pub(crate) year: i64,
+    pub(crate) month: i64,
+    pub(crate) day: i64,
+    pub(crate) hour: i64,
+    pub(crate) minute: i64,
+    pub(crate) second: i64,
+    /// `GeneralizedTime` が小数秒を持っていたか（DER の正規形として
+    /// 末尾 0 なし・1 桁以上であることは検査済み）。
+    pub(crate) has_fraction: bool,
+}
+
+fn two_digits(pair: &[u8]) -> Option<i64> {
+    match pair {
+        [a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
+            Some(i64::from(a - b'0') * 10 + i64::from(b - b'0'))
+        }
+        _ => None,
+    }
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// `YYYY`（展開済み）と `MMDDHHMMSS` の 10 桁から暦として有効な
+/// [`DerTime`] を組み立てる。うるう秒（60 秒）は fail-closed に受理しない。
+fn build_der_time(year: i64, rest: &[u8], has_fraction: bool) -> Result<DerTime, DerError> {
+    let field = |start: usize| {
+        rest.get(start..start + 2)
+            .and_then(two_digits)
+            .ok_or(DerError::InvalidTime)
+    };
+    let time = DerTime {
+        year,
+        month: field(0)?,
+        day: field(2)?,
+        hour: field(4)?,
+        minute: field(6)?,
+        second: field(8)?,
+        has_fraction,
+    };
+    if !(1..=12).contains(&time.month)
+        || time.day < 1
+        || time.day > days_in_month(time.year, time.month)
+        || time.hour > 23
+        || time.minute > 59
+        || time.second > 59
+    {
+        return Err(DerError::InvalidTime);
+    }
+    Ok(time)
+}
+
+/// `UTCTime` の値部分を DER の正規形（X.690 §11.8: `YYMMDDHHMMSSZ` の
+/// 13 バイト固定。秒は省略不可・終端は `Z`・タイムゾーンオフセット不可）と
+/// して読み、暦として有効な [`DerTime`] を返す。
+pub(crate) fn parse_utc_time(value: &[u8]) -> Result<DerTime, DerError> {
+    let (body, terminator) = value.split_at_checked(12).ok_or(DerError::InvalidTime)?;
+    if terminator != b"Z" {
+        return Err(DerError::InvalidTime);
+    }
+    let two_digit_year = body
+        .get(0..2)
+        .and_then(two_digits)
+        .ok_or(DerError::InvalidTime)?;
+    let year = if two_digit_year >= 50 {
+        1900 + two_digit_year
+    } else {
+        2000 + two_digit_year
+    };
+    let rest = body.get(2..).ok_or(DerError::InvalidTime)?;
+    build_der_time(year, rest, false)
+}
+
+/// `GeneralizedTime` の値部分を DER の正規形（X.690 §11.7:
+/// `YYYYMMDDHHMMSS[.f+]Z`。秒は省略不可・小数秒の区切りは `.` で 1 桁以上・
+/// 末尾に `0` を置かない・終端は `Z`・タイムゾーンオフセット不可）として
+/// 読み、暦として有効な [`DerTime`] を返す。小数秒の有無は
+/// [`DerTime::has_fraction`] で呼び出し元に伝える（RFC 5280 の validity は
+/// 小数秒を禁じるため [`super::x509`] がそこで拒否する）。
+pub(crate) fn parse_generalized_time(value: &[u8]) -> Result<DerTime, DerError> {
+    let (body, terminator) = value
+        .split_last()
+        .ok_or(DerError::InvalidTime)
+        .map(|(last, body)| (body, *last))?;
+    if terminator != b'Z' {
+        return Err(DerError::InvalidTime);
+    }
+    let (date_time, fraction) = body.split_at_checked(14).ok_or(DerError::InvalidTime)?;
+    let has_fraction = match fraction.split_first() {
+        None => false,
+        Some((b'.', digits)) => {
+            let last = digits.last().ok_or(DerError::InvalidTime)?;
+            if !digits.iter().all(u8::is_ascii_digit) || *last == b'0' {
+                return Err(DerError::InvalidTime);
+            }
+            true
+        }
+        Some(_) => return Err(DerError::InvalidTime),
+    };
+    let year_digits = date_time.get(0..4).ok_or(DerError::InvalidTime)?;
+    let high = year_digits.get(0..2).and_then(two_digits);
+    let low = year_digits.get(2..4).and_then(two_digits);
+    let year = match (high, low) {
+        (Some(high), Some(low)) => high * 100 + low,
+        _ => return Err(DerError::InvalidTime),
+    };
+    let rest = date_time.get(4..).ok_or(DerError::InvalidTime)?;
+    build_der_time(year, rest, has_fraction)
+}
+
+/// `PrintableString` の文字集合（X.680 §41.4: 英大小文字・数字・空白・
+/// `' ( ) + , - . / : = ?`）。
+fn is_printable_string_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b" '()+,-./:=?".contains(&byte)
+}
+
+/// universal クラスの primitive な値を型ごとの DER の正規形・値の制約で
+/// 検査する（[`validate_structure`] が全階層で呼ぶ唯一の型別検査）。
+///
+/// - `BOOLEAN`（1）: 長さ 1 で `0x00`／`0xFF`
+/// - `INTEGER`（2）・`ENUMERATED`（10）: 空でなく最小符号化
+/// - `BIT STRING`（3）: [`validate_bit_string`]
+/// - `NULL`（5）: 長さ 0
+/// - `OBJECT IDENTIFIER`（6）・`RELATIVE-OID`（13）: 空でなく各サブ識別子が
+///   最小符号化で切り詰められていない
+/// - `UTF8String`（12）: 正しい UTF-8
+/// - `NumericString`（18）: 数字と空白
+/// - `PrintableString`（19）: [`is_printable_string_char`] の文字集合
+/// - `IA5String`（22）: 7 ビット（`0x00`〜`0x7F`）
+/// - `UTCTime`（23）・`GeneralizedTime`（24）: [`parse_utc_time`]／
+///   [`parse_generalized_time`]（違反は [`DerError::InvalidTime`]）
+/// - `VisibleString`（26）: `0x20`〜`0x7E`
+/// - `UniversalString`（28）: 長さが 4 の倍数
+/// - `BMPString`（30）: 長さが 2 の倍数
+/// - `REAL`（9）・`TIME`（14）・予約（15）: 検査を持たないため
+///   [`DerError::UnsupportedUniversalType`] で拒否
+///
+/// 意図的に制約を課さない型: `OCTET STRING`（4。任意のオクテット列）と、
+/// ISO 2022 のエスケープシーケンスで文字集合を切り替えるため本実装では
+/// 文字集合を検証できない `ObjectDescriptor`（7）・`TeletexString`（20）・
+/// `VideotexString`（21）・`GraphicString`（25）・`GeneralString`（27）。
+/// constructed 必須の型（8・11・16・17・29）はここへ来る前に
+/// [`DerError::PrimitiveConstructedOnlyType`] で拒否される。
+fn validate_universal_primitive(tag_number: u8, value: &[u8]) -> Result<(), DerError> {
+    let canonical = match tag_number {
+        0x01 => matches!(value, [0x00] | [0xff]),
+        0x02 | 0x0a => is_minimal_integer(value),
+        0x03 => return validate_bit_string(value),
+        0x05 => value.is_empty(),
+        0x06 | 0x0d => is_well_formed_oid(value),
+        0x09 | 0x0e | 0x0f => return Err(DerError::UnsupportedUniversalType),
+        0x0c => std::str::from_utf8(value).is_ok(),
+        0x12 => value.iter().all(|b| b.is_ascii_digit() || *b == b' '),
+        0x13 => value.iter().all(|b| is_printable_string_char(*b)),
+        0x16 => value.is_ascii(),
+        0x17 => return parse_utc_time(value).map(|_| ()),
+        0x18 => return parse_generalized_time(value).map(|_| ()),
+        0x1a => value.iter().all(|b| (0x20..=0x7e).contains(b)),
+        0x1c => value.len().is_multiple_of(4),
+        0x1e => value.len().is_multiple_of(2),
+        _ => true,
+    };
+    if canonical {
+        Ok(())
+    } else {
+        Err(DerError::InvalidPrimitiveEncoding)
+    }
+}
+
 /// 入力全体がちょうど 1 個のトップレベル TLV であり、かつ constructed な
 /// TLV の値部分が入れ子の TLV 列として整形式であることを、深さ上限
 /// `max_depth` 付きで検証する。あわせて、universal 型ごとの
 /// primitive/constructed の別（[`universal_type_requires_constructed`]。
 /// 違反は `ConstructedUniversalType`／`PrimitiveConstructedOnlyType`）と、
-/// `NULL`／`BOOLEAN`／`INTEGER`／`ENUMERATED`／`OBJECT IDENTIFIER`／
-/// `RELATIVE-OID` の正規形（`InvalidPrimitiveEncoding`）を、フィールドの
-/// 意味を問わず入れ子の深さ全体にわたって検証する。これ以外の primitive な
-/// 値（`OCTET STRING`・`BIT STRING`・文字列型等）の中身には潜らない
-/// （`BIT STRING` の形状はフィールドごとの拒否理由を保つため
-/// [`super::x509`] が検査する）。
+/// universal primitive 型ごとの DER 正規形・値の制約
+/// （[`validate_universal_primitive`]）を、フィールドの意味を問わず入れ子の
+/// 深さ全体にわたって検証する（PR #1036 codex-review P1 指摘: 当初は
+/// `BIT STRING` 等の primitive 値を検査せず、AlgorithmIdentifier の
+/// parameters のように意味を解釈しない値の中の非正規形を通していた）。
+/// context-specific 等 universal 以外のクラスの primitive 値は、IMPLICIT
+/// タグで元の型が分からないため呼び出し元のフィールド検査に委ねる。
 ///
 /// [`super::x509`] が本体パースの前段として呼び、構文が壊れた入力を
 /// フィールドごとの意味解釈に渡さないようにする。issuer/subject の
@@ -328,21 +548,7 @@ fn validate_tlv_contents(
             if universal_type_requires_constructed(tag_number) {
                 return Err(DerError::PrimitiveConstructedOnlyType);
             }
-            let canonical = match tag_number {
-                // BOOLEAN（0x01）: 値はちょうど 1 バイトで `0x00`（FALSE）
-                // または `0xFF`（TRUE。DER は TRUE を `0xFF` に限定する）。
-                0x01 => matches!(value, [0x00] | [0xff]),
-                // INTEGER（0x02）・ENUMERATED（0x0a）: 空でなく最小符号化。
-                0x02 | 0x0a => is_minimal_integer(value),
-                // NULL（0x05）: 値は常に空でなければならない。
-                0x05 => value.is_empty(),
-                // OBJECT IDENTIFIER（0x06）・RELATIVE-OID（0x0d）。
-                0x06 | 0x0d => is_well_formed_oid(value),
-                _ => true,
-            };
-            if !canonical {
-                return Err(DerError::InvalidPrimitiveEncoding);
-            }
+            validate_universal_primitive(tag_number, value)?;
         }
     }
 
@@ -671,6 +877,156 @@ mod tests {
                 "{bad:02x?}"
             );
         }
+    }
+
+    /// テスト専用: `SEQUENCE { <tag> <value> }` を組み立てて
+    /// `validate_structure` にかける（値は 127 バイト未満に限る）。
+    fn check_primitive(tag: u8, value: &[u8]) -> Result<(), DerError> {
+        let inner_len = u8::try_from(value.len()).expect("short test value");
+        let mut der = vec![0x30, inner_len + 2, tag, inner_len];
+        der.extend_from_slice(value);
+        validate_structure(&der, MAX_DER_NESTING_DEPTH)
+    }
+
+    fn assert_primitive_cases(tag: u8, accepted: &[&[u8]], rejected: &[&[u8]], error: DerError) {
+        for value in accepted {
+            assert_eq!(
+                check_primitive(tag, value),
+                Ok(()),
+                "tag {tag:#04x} value {value:02x?} must be accepted"
+            );
+        }
+        for value in rejected {
+            assert_eq!(
+                check_primitive(tag, value),
+                Err(error),
+                "tag {tag:#04x} value {value:02x?} must be rejected"
+            );
+        }
+    }
+
+    // BIT STRING（PR #1036 codex-review P1 指摘の回帰: 意味を解釈しない値の
+    // 中の BIT STRING も DER の正規形で検査する）。
+    #[test]
+    fn primitive_bit_string_follows_der_canonical_form() {
+        assert_primitive_cases(
+            0x03,
+            &[&[0x00], &[0x00, 0xff], &[0x03, 0xf8], &[0x07, 0x80]],
+            &[&[], &[0x08, 0x00], &[0x03, 0xf9], &[0x01], &[0x05]],
+            DerError::InvalidPrimitiveEncoding,
+        );
+    }
+
+    #[test]
+    fn primitive_utc_time_follows_der_canonical_form() {
+        assert_primitive_cases(
+            0x17,
+            &[b"160801121924Z", b"240229000000Z", b"500101000000Z"],
+            &[
+                b"1608011219Z",
+                b"160801121924",
+                b"160801121924+0900",
+                b"160801121924z",
+                b"161301121924Z",
+                b"230229000000Z",
+                b"160801241924Z",
+                b"160801121960Z",
+                b"16080112192.Z",
+            ],
+            DerError::InvalidTime,
+        );
+    }
+
+    #[test]
+    fn primitive_generalized_time_follows_der_canonical_form() {
+        assert_primitive_cases(
+            0x18,
+            &[
+                b"20501231235959Z",
+                b"20501231235959.5Z",
+                b"20501231235959.123Z",
+                b"20000229000000Z",
+            ],
+            &[
+                b"205012312359Z",
+                b"20501231235959",
+                b"20501231235959+0000",
+                b"20501231235959.50Z",
+                b"20501231235959.0Z",
+                b"20501231235959.Z",
+                b"20501231235959,5Z",
+                b"20501231235959.5aZ",
+                b"21000229000000Z",
+                b"20501232235959Z",
+            ],
+            DerError::InvalidTime,
+        );
+    }
+
+    #[test]
+    fn primitive_string_types_follow_their_character_constraints() {
+        let invalid = DerError::InvalidPrimitiveEncoding;
+        // UTF8String
+        assert_primitive_cases(
+            0x0c,
+            &[b"", b"abc", "\u{e9}\u{3042}".as_bytes()],
+            &[&[0xc3], &[0xff], &[0xed, 0xa0, 0x80]],
+            invalid,
+        );
+        // NumericString
+        assert_primitive_cases(0x12, &[b"0123 456"], &[b"12a", b"1-2"], invalid);
+        // PrintableString
+        assert_primitive_cases(
+            0x13,
+            &[b"Ab 09'()+,-./:=?"],
+            &[b"a*b", b"a@b", b"a_b", b"a&b", &[0x41, 0xc3, 0xa9]],
+            invalid,
+        );
+        // IA5String
+        assert_primitive_cases(
+            0x16,
+            &[b"user@example.com", &[0x00, 0x7f]],
+            &[&[0x80]],
+            invalid,
+        );
+        // VisibleString
+        assert_primitive_cases(0x1a, &[b" a~"], &[&[0x7f], &[0x0a]], invalid);
+        // UniversalString（4 の倍数）・BMPString（2 の倍数）
+        assert_primitive_cases(0x1c, &[&[0, 0, 0, 0x41]], &[&[0, 0, 0x41]], invalid);
+        assert_primitive_cases(0x1e, &[&[0, 0x41]], &[&[0x41], &[0, 0x41, 0]], invalid);
+    }
+
+    #[test]
+    fn unconstrained_primitive_types_accept_arbitrary_octets() {
+        // OCTET STRING と、ISO 2022 のエスケープで文字集合を切り替えるため
+        // 文字集合を検証しない型（ObjectDescriptor・Teletex・Videotex・
+        // Graphic・GeneralString）は任意のオクテット列を受理する。
+        for tag in [0x04u8, 0x07, 0x14, 0x15, 0x19, 0x1b] {
+            assert_eq!(
+                check_primitive(tag, &[0xff, 0x00, 0x1b]),
+                Ok(()),
+                "{tag:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_primitive_types_are_rejected() {
+        // REAL・TIME・予約済み（15）は正規形検査を持たないため fail-closed。
+        for tag in [0x09u8, 0x0e, 0x0f] {
+            assert_eq!(
+                check_primitive(tag, &[]),
+                Err(DerError::UnsupportedUniversalType),
+                "{tag:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_specific_primitive_values_are_left_to_field_checks() {
+        // IMPLICIT タグで universal タグを失った値（例: [1] の BIT STRING）は
+        // 型が分からないため構造検証では検査せず、x509 のフィールド検査に委ねる。
+        assert_eq!(check_primitive(0x81, &[0x08, 0x00]), Ok(()));
     }
 
     #[test]
