@@ -14,7 +14,9 @@
 //! 受信データ経路のため `unwrap`/`expect`/添字アクセスを用いず `get()`・
 //! `checked_*` で処理する（`.claude/rules/coding-rust.md` P0）。
 
+use std::cell::Cell;
 use std::io::{self, Read};
+use std::time::Instant;
 
 /// 1 メッセージあたりの長さフィールド（自身の 4 バイトを含む）の上限（WIRE-4）。
 /// これを超える宣言長は `TooLarge` として分類し、length 検証の時点で読み取りを
@@ -130,9 +132,84 @@ impl std::fmt::Display for FrameError {
     }
 }
 
+thread_local! {
+    /// 現在のスレッドで受信中のフレームを受け取り終えるべき期限
+    /// （[`FrameDeadlineGuard`] が設定する。`None` は期限なし）。
+    static FRAME_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// フレーム（長さフィールド・本文）の受信全体に期限を課すガード（SQL-31・
+/// TASK-221。PR #1041 レビュー指摘）。
+///
+/// `handshake::post_auth_loop` が、明示トランザクションが `Active`（単一ライタを
+/// 保持中）の間だけ、型バイトを受信した直後に「持続時間上限（と接続の読み取り
+/// タイムアウト）」までの期限で設定する。期限が設定されている間、本モジュールの
+/// 長さ・本文の読み取りは期限を過ぎた時点で `TimedOut` の I/O エラーを返す
+/// （呼び出し元は応答を送らずに接続を閉じ、`SessionTransaction` の drop で
+/// ライタを解放する）。本文を少しずつ送り続けて期限後もライタを保持させる
+/// 経路を塞ぐためのもので、読み取り 1 回あたりの待機はソケットの読み取り
+/// タイムアウト（呼び出し元が短く設定する）で区切られる。wire-server は
+/// 1 接続 1 スレッドのため、スレッドローカルで接続単位の期限になる。drop で
+/// 直前の値へ戻す。
+pub(crate) struct FrameDeadlineGuard {
+    previous: Option<Instant>,
+}
+
+impl FrameDeadlineGuard {
+    pub(crate) fn set(deadline: Instant) -> Self {
+        let previous = FRAME_DEADLINE.with(|d| d.replace(Some(deadline)));
+        Self { previous }
+    }
+}
+
+impl Drop for FrameDeadlineGuard {
+    fn drop(&mut self) {
+        FRAME_DEADLINE.with(|d| d.set(self.previous));
+    }
+}
+
+/// `buf` を満たすまで読む。[`FrameDeadlineGuard`] の期限が無ければ
+/// `read_exact` そのもの（既存経路とビット同一）。期限がある場合は読み取りの
+/// たびに期限を確認し、過ぎていれば `TimedOut` を返す。ソケットの読み取り
+/// タイムアウトによる `WouldBlock`／`TimedOut` は期限内なら待機を続ける。
+fn read_exact_within_deadline<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<()> {
+    let Some(deadline) = FRAME_DEADLINE.with(Cell::get) else {
+        return reader.read_exact(buf);
+    };
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "frame receive deadline exceeded",
+            ));
+        }
+        let dst = buf
+            .get_mut(filled..)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        match reader.read(dst) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(n) => {
+                filled = filled
+                    .checked_add(n)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 fn read_i32_be<R: Read>(reader: &mut R) -> Result<i32, FrameError> {
     let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
+    read_exact_within_deadline(reader, &mut buf)?;
     Ok(i32::from_be_bytes(buf))
 }
 
@@ -174,7 +251,7 @@ pub fn read_length_prefixed_body<R: Read>(
         .checked_sub(4)
         .ok_or(FrameError::Malformed("message length below header size"))?;
     let mut body = vec![0u8; body_len];
-    reader.read_exact(&mut body)?;
+    read_exact_within_deadline(reader, &mut body)?;
     Ok(body)
 }
 
@@ -226,6 +303,21 @@ pub fn validate_typed_message_length_prefix<R: Read>(
 /// PR #1013）。ここでは実コピー長を `len` と照合し、一致しなければ
 /// [`FrameError::Truncated`] へ fail-closed に写像する。
 pub fn discard_body<R: Read>(reader: &mut R, len: usize) -> Result<(), FrameError> {
+    // フレーム受信期限（[`FrameDeadlineGuard`]）の設定中は、期限を確認しながら
+    // 固定長のスタックバッファで読み捨てる（途中切断は `Truncated`）。
+    if FRAME_DEADLINE.with(Cell::get).is_some() {
+        let mut chunk = [0u8; 8192];
+        let mut remaining = len;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            let dst = chunk
+                .get_mut(..n)
+                .ok_or(FrameError::Malformed("discard chunk out of range"))?;
+            read_exact_within_deadline(reader, dst)?;
+            remaining = remaining.saturating_sub(n);
+        }
+        return Ok(());
+    }
     let mut limited = reader.take(len as u64);
     let copied = io::copy(&mut limited, &mut io::sink())?;
     if copied != len as u64 {
@@ -272,6 +364,50 @@ pub fn read_typed_frame_header<R: Read>(reader: &mut R) -> Result<Option<u8>, Fr
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// SQL-31・TASK-221: フレーム受信期限が過ぎていれば、長さ・本文の読み取りは
+    /// データの有無に関わらず `TimedOut` の I/O エラーになる（期限なしなら従来どおり）。
+    #[test]
+    fn frame_deadline_in_the_past_times_out_body_reads() {
+        let bytes = length_prefixed(9, b"hello");
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
+        {
+            let _guard = FrameDeadlineGuard::set(past);
+            let err = read_length_prefixed_body(&mut Cursor::new(bytes.clone()), 4, 64)
+                .expect_err("expired deadline must fail");
+            assert!(
+                matches!(&err, FrameError::Io(e) if e.kind() == io::ErrorKind::TimedOut),
+                "unexpected error: {err:?}"
+            );
+            let err = discard_body(&mut Cursor::new(bytes.clone()), 4)
+                .expect_err("expired deadline must fail");
+            assert!(matches!(&err, FrameError::Io(e) if e.kind() == io::ErrorKind::TimedOut));
+        }
+        // ガードの drop 後は期限なしに戻る。
+        let body = read_length_prefixed_body(&mut Cursor::new(bytes), 4, 64).expect("read");
+        assert_eq!(body, b"hello");
+    }
+
+    /// 期限内なら期限付きの読み取りも期限なしと同じ結果を返す（途中切断も同じ分類）。
+    #[test]
+    fn frame_deadline_in_the_future_matches_unbounded_reads() {
+        let future = Instant::now() + std::time::Duration::from_secs(60);
+        let _guard = FrameDeadlineGuard::set(future);
+        let body = read_length_prefixed_body(&mut Cursor::new(length_prefixed(9, b"hello")), 4, 64)
+            .expect("read");
+        assert_eq!(body, b"hello");
+        assert!(matches!(
+            read_length_prefixed_body(&mut Cursor::new(length_prefixed(9, b"he")), 4, 64),
+            Err(FrameError::Truncated)
+        ));
+        assert!(discard_body(&mut Cursor::new(vec![0u8; 20_000]), 20_000).is_ok());
+        assert!(matches!(
+            discard_body(&mut Cursor::new(vec![0u8; 10]), 20),
+            Err(FrameError::Truncated)
+        ));
+    }
 
     fn length_prefixed(total_len: i32, body: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();

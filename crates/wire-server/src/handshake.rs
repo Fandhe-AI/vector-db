@@ -504,6 +504,29 @@ fn post_auth_loop<'e>(
             }
         }
 
+        // SQL-31・TASK-221（PR #1041 レビュー指摘）: `Active` の間は、型バイトに
+        // 続く長さ・本文の受信全体にも持続時間上限（と接続の読み取りタイムアウト）
+        // までの期限を課す。本文を少しずつ送り続けて上限後もライタを保持させる
+        // 経路を塞ぐためで、期限を過ぎたら応答を送らずに接続を閉じ（I/O エラー）、
+        // `SessionTransaction` の drop でライタを解放する。読み取り 1 回あたりの
+        // 待機は短い読み取りタイムアウトで区切り、期限の確認を
+        // `framing::FrameDeadlineGuard` が行う。次の反復の
+        // [`read_next_frame_header`] が読み取りタイムアウトを戻す。
+        let _frame_deadline = match txn.as_ref().and_then(|t| t.remaining_duration()) {
+            Some(remaining) => {
+                let budget = base_timeout.map_or(remaining, |b| remaining.min(b));
+                let poll = budget.min(FRAME_DEADLINE_POLL).max(MIN_BOUNDED_READ_WAIT);
+                if applied_timeout != Some(poll) {
+                    stream.set_read_timeout(Some(poll))?;
+                    applied_timeout = Some(poll);
+                }
+                Instant::now()
+                    .checked_add(budget)
+                    .map(framing::FrameDeadlineGuard::set)
+            }
+            None => None,
+        };
+
         // WIRE-11 確定化（Issue #934）: 拡張クエリプロトコルのエラー後は
         // Sync（'S'）まで後続メッセージを破棄する「同期回復」モードに入る
         // （`extended_query` モジュールドキュメント「エラー後の同期回復」節）。
@@ -894,6 +917,11 @@ fn post_auth_loop<'e>(
 /// `Duration::ZERO` を受け付けないため、残り時間が 0 でもこの値で待つ）。
 const MIN_BOUNDED_READ_WAIT: Duration = Duration::from_millis(1);
 
+/// `Active` な明示トランザクション中にフレームの長さ・本文を受信する間の、
+/// 読み取り 1 回あたりの待機上限（この間隔で `framing::FrameDeadlineGuard` の
+/// 期限を確認する。期限超過の検出遅れの上限でもある）。
+const FRAME_DEADLINE_POLL: Duration = Duration::from_millis(100);
+
 /// [`post_auth_loop`] が次の要求の型バイトを待つ（SQL-31・TASK-221。PR #1041
 /// レビュー指摘）。
 ///
@@ -911,9 +939,10 @@ const MIN_BOUNDED_READ_WAIT: Duration = Duration::from_millis(1);
 /// - WIRE-5 の無通信上限は不変: 期限到達後の再待機は、この関数へ入った時点から
 ///   の経過時間を差し引いた `base_timeout` の残りで待ち、尽きたら通常の読み取り
 ///   タイムアウトと同じ I/O エラー（応答なしで切断）を返す。
-/// - 切り詰めるのは型バイト（1 バイト）の受信待ちだけで、受信できたら長さ・本文の
-///   読み取り前に `base_timeout` へ戻す（フレームの途中で打ち切ると以降の
-///   フレーミングが崩れるため）。`applied` は現在ソケットに設定中の値で、変更が
+/// - 型バイトを受信できたら `base_timeout` へ戻す（ここでの打ち切りはフレームの
+///   境界でだけ行う）。`Active` の間の長さ・本文の受信は、[`post_auth_loop`] が
+///   `framing::FrameDeadlineGuard` でフレーム全体の期限を課す（期限超過は接続を
+///   閉じてライタを解放する）。`applied` は現在ソケットに設定中の値で、変更が
 ///   必要なときだけ `set_read_timeout` を呼ぶ。
 fn read_next_frame_header(
     stream: &mut TcpStream,

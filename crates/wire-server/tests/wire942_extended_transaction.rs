@@ -597,6 +597,87 @@ fn completed_portal_is_rejected_after_transaction_expiry() {
     run_started_portal_after_expiry_case(true, "wire942-done-portal-expired");
 }
 
+/// BEGIN 後にクライアントが 1 つのフレームの本文を少しずつ送り続けても、持続
+/// 時間の上限でフレームの受信を打ち切り、接続を閉じてライタを解放すること
+/// （PR #1041 レビュー指摘: 以前は型バイト受信後に読み取りタイムアウトを戻して
+/// いたため、読み取りタイムアウト未満の間隔で送り続ければ上限後もライタを
+/// 保持できた）。
+#[test]
+fn expired_transaction_releases_writer_while_client_drips_a_frame_body() {
+    let path = temp_db::unique_db_path("wire942-expired-drip-transaction");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let max_duration = std::time::Duration::from_millis(300);
+    let storage = Storage::open(&path)
+        .expect("open storage")
+        .with_write_lock_wait(max_duration * 10);
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_transaction_limits(
+            engine::sql::transaction::TransactionLimits {
+                max_duration,
+                max_statements: 1_000,
+            },
+        ),
+    );
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    begin_and_insert_over_simple_query(&mut stream, 47, "op-942-47");
+
+    // 'Q' の型バイトと 1 KiB を宣言する長さだけ送り、本文は 1 バイトずつ送る。
+    let mut writer = stream.try_clone().expect("clone stream");
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        let mut header = vec![b'Q'];
+        header.extend_from_slice(&1028i32.to_be_bytes());
+        if writer.write_all(&header).is_err() {
+            return;
+        }
+        for _ in 0..1024 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if writer.write_all(b" ").is_err() {
+                return;
+            }
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let mut other = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    send_simple_query(&mut other, &insert_sql(48, "op-942-48"));
+    assert_eq!(read_command_complete(&mut other), "INSERT 0 1");
+    read_ready_for_query(&mut other);
+    assert!(
+        started.elapsed() < max_duration * 10,
+        "the writer must be released at the transaction deadline even while a frame is dripping"
+    );
+
+    // 元の接続は応答なしで閉じられる（途中まで送った書き込みは確定しない）。
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut buf = [0u8; 1];
+    let closed = match stream.read(&mut buf) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+    };
+    assert!(closed, "the connection must be closed without a response");
+    assert_eq!(visible_rows_with_id(&core, 47), 0);
+    assert_eq!(visible_rows_with_id(&core, 48), 1);
+}
+
 /// 拡張クエリの 1 メッセージを送り、ErrorResponse が返ったあと Sync で
 /// ReadyForQuery まで進める。
 fn send_expect_error_then_sync(stream: &mut std::net::TcpStream, type_byte: u8, body: &[u8]) {
