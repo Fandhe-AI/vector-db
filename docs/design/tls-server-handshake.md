@@ -67,9 +67,11 @@ fail-closed な poison 契約（一度 `Err` を返したら以後同じ理由�
   追加した（`#[non_exhaustive]` のため非破壊）
 - `alert::Alert::parse` は fragment がちょうど 2 バイト・level が 1/2 の
   いずれかでなければ `decode_error`
-- 受信 alert の分類（`alert::classify_received`）: `close_notify`／
-  `user_canceled` は正常終了、それ以外（未知の値を含む）は fatal として
-  `Err(ReceivedFatalAlert)`（応答は送らない）
+- 受信 alert の分類（`alert::classify_received`）: `close_notify` は
+  正常終了、`user_canceled` は後続の `close_notify` を待つ取り消し通知
+  （PR #1046 で見直し。下記「レビュー指摘の是正」7 参照）、それ以外
+  （未知の値を含む）は fatal として `Err(ReceivedFatalAlert)`（応答は
+  送らない）
 - fatal alert の送出は `fatal_alert_of(&ServerHandshakeError) ->
   Option<AlertDescription>` に集約し、各サブモジュールの既存
   `alert_description()` を再利用する（写像を再実装しない）
@@ -198,6 +200,31 @@ Issue #965 の PR（#1046）に対する codex・Bugbot の指摘（いずれも
    失敗時の両方向拒否（fail-closed）は変更していない。結合テスト
    `sent_close_notify_still_allows_receiving_peer_data_and_close_notify`・
    `received_close_notify_still_allows_sending_our_close_notify` を追加した。
+7. **`user_canceled` を終了通知として扱わない**（codex P1）:
+   `classify_received` が `user_canceled` を `close_notify` と同じ
+   `Closed` に分類していたため、ハンドシェイク driver は受信した時点で
+   `ClosedByPeer` として切断し、RFC 8446 §6.1 で後続に届く
+   `close_notify` を読んでいなかった。分類に `ReceivedAlert::UserCanceled`
+   を追加し、次のように扱う。
+   - ハンドシェイク中: ハンドシェイクを中断して新設状態 `Canceled` へ
+     移り（`Step::Continue` で空出力）、以後は closure alert 受信後の
+     データを無視する RFC 8446 §6.1 の要求に従って ClientHello 等を
+     解釈せずに読み捨て（ServerHello は送らない）、`close_notify` を
+     受けて `ClosedByPeer` で正常終了する。復号・alert の構造検証と
+     それ以外の alert の fatal 扱いは通常時と同じ fail-closed のまま。
+     `close_notify` 待ちは driver の絶対期限（上記 1 の
+     `DeadlineReader`）とレコード長上限で打ち切られ、読み捨てた
+     内容は保持しないため無期限待機・メモリ増加は起きない。期限切れは
+     通常の期限超過と同じ `Record` エラーであり、正常終了とは扱わない。
+   - ハンドシェイク完了後（`TlsSession::open_record`）:
+     `AppEvent::UserCanceled` を返して受信を続け、以後のアプリケーション
+     データは内容を返さず `AppEvent::Ignored` として読み捨て、後続の
+     `close_notify` で受信方向を終了する。
+   結合テスト `user_canceled_waits_for_close_notify_and_ignores_later_
+   records`・`driver_closes_on_close_notify_following_user_canceled`・
+   `driver_wait_for_close_notify_after_user_canceled_is_bounded`・
+   `user_canceled_after_handshake_ignores_data_until_close_notify` を
+   追加した。
 
 ## 対象外（後続 sub-issue の担当）
 

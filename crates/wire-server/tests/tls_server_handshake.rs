@@ -538,6 +538,141 @@ fn server_flight_write_is_bounded_by_absolute_deadline_when_peer_stops_reading()
     );
 }
 
+/// 平文 epoch の alert レコード（ハンドシェイク開始前後の平文 alert）。
+fn plaintext_alert_record(description: AlertDescription) -> Record {
+    Record {
+        content_type: ContentType::Alert,
+        legacy_version: record::LEGACY_RECORD_VERSION,
+        fragment: vec![1, description.as_u8()],
+    }
+}
+
+/// PR #1046 レビュー指摘の回帰: `user_canceled` は `close_notify` と同じ
+/// 終了通知ではない（RFC 8446 §6.1）。受信してもその時点では
+/// `ClosedByPeer` を返さずハンドシェイクを中断し、後続の ClientHello 等は
+/// 解釈せずに読み捨て（ServerHello を送らない）、`close_notify` を受けて
+/// 初めて正常終了する。
+#[test]
+fn user_canceled_waits_for_close_notify_and_ignores_later_records() {
+    let mut hs = ServerHandshake::new(test_config());
+
+    match hs
+        .handle_record(&plaintext_alert_record(AlertDescription::UserCanceled))
+        .expect("user_canceled must not be an error")
+    {
+        Step::Continue(output) => assert!(output.is_empty()),
+        other => panic!("user_canceled must not close the handshake yet, got {other:?}"),
+    }
+
+    let client_ephemeral = EphemeralSecret::from_bytes([0x33u8; 32]);
+    let (client_hello, _) = build_client_hello(*client_ephemeral.public_key().as_bytes());
+    match hs
+        .handle_record(&client_hello)
+        .expect("records after user_canceled are ignored, not rejected")
+    {
+        Step::Continue(output) => assert!(
+            output.is_empty(),
+            "the handshake must not progress (no ServerHello) after user_canceled"
+        ),
+        other => panic!("expected the ClientHello to be ignored, got {other:?}"),
+    }
+
+    match hs
+        .handle_record(&plaintext_alert_record(AlertDescription::CloseNotify))
+        .expect("close_notify after user_canceled closes normally")
+    {
+        Step::ClosedByPeer(output) => assert!(output.is_empty()),
+        other => panic!("expected ClosedByPeer after close_notify, got {other:?}"),
+    }
+}
+
+/// PR #1046 レビュー指摘の回帰（driver 経由）: `user_canceled` の後に
+/// `close_notify` が届けば `ClosedByPeer` で正常終了する。
+#[test]
+fn driver_closes_on_close_notify_following_user_canceled() {
+    use std::net::{TcpListener, TcpStream};
+    use wire_server::tls::server_handshake::ServerHandshakeDriverError;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept connection");
+        wire_server::tls::server_handshake::perform_server_handshake_with_timeout(
+            &mut socket,
+            test_config(),
+            Duration::from_secs(5),
+        )
+    });
+
+    let mut client = TcpStream::connect(addr).expect("connect to loopback listener");
+    let mut buf = Vec::new();
+    for description in [
+        AlertDescription::UserCanceled,
+        AlertDescription::CloseNotify,
+    ] {
+        plaintext_alert_record(description)
+            .serialize_into(&mut buf, RecordKind::Plaintext)
+            .expect("serialize alert record");
+    }
+    client.write_all(&buf).expect("write alerts");
+
+    let result = server_thread.join().expect("server thread must not panic");
+    assert!(
+        matches!(result, Err(ServerHandshakeDriverError::ClosedByPeer)),
+        "close_notify after user_canceled must close normally, got {result:?}"
+    );
+}
+
+/// PR #1046 レビュー指摘の回帰（driver 経由）: `user_canceled` の後に
+/// `close_notify` を送らず沈黙する相手に対しても、`close_notify` 待ちは
+/// ハンドシェイク全体の絶対期限で打ち切られ（無期限待機しない）、
+/// 正常終了（`ClosedByPeer`）とは扱わない。
+#[test]
+fn driver_wait_for_close_notify_after_user_canceled_is_bounded() {
+    use std::net::{TcpListener, TcpStream};
+    use wire_server::tls::server_handshake::ServerHandshakeDriverError;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let addr = listener.local_addr().expect("local addr");
+    let overall_timeout = Duration::from_millis(200);
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept connection");
+        let started = Instant::now();
+        let result = wire_server::tls::server_handshake::perform_server_handshake_with_timeout(
+            &mut socket,
+            test_config(),
+            overall_timeout,
+        );
+        (started.elapsed(), result)
+    });
+
+    let mut client = TcpStream::connect(addr).expect("connect to loopback listener");
+    let mut buf = Vec::new();
+    plaintext_alert_record(AlertDescription::UserCanceled)
+        .serialize_into(&mut buf, RecordKind::Plaintext)
+        .expect("serialize alert record");
+    client.write_all(&buf).expect("write user_canceled");
+    // close_notify を送らず、接続も閉じずに沈黙する。
+
+    let (elapsed, result) = server_thread.join().expect("server thread must not panic");
+    drop(client);
+    assert!(
+        result.is_err(),
+        "a peer that never sends close_notify must not complete the handshake"
+    );
+    assert!(
+        !matches!(result, Err(ServerHandshakeDriverError::ClosedByPeer)),
+        "user_canceled alone must not be treated as a normal close"
+    );
+    assert!(
+        elapsed < overall_timeout * 4,
+        "waiting for close_notify must be bounded by the absolute deadline, \
+         got {elapsed:?} for timeout {overall_timeout:?}"
+    );
+}
+
 // ---- 独立クライアントによる完全な往復（受け入れ条件 3 以外の全体結合）。
 // ----
 
@@ -899,9 +1034,7 @@ fn full_handshake_round_trip_over_pure_api() {
             wire_server::tls::server_handshake::AppEvent::ApplicationData(data) => {
                 assert_eq!(data, client_payload);
             }
-            wire_server::tls::server_handshake::AppEvent::CloseNotify => {
-                panic!("expected application data, got close_notify")
-            }
+            other => panic!("expected application data, got {other:?}"),
         }
     }
 
@@ -960,7 +1093,7 @@ fn receiving_close_notify_poisons_the_session_against_further_data() {
             .expect("valid close_notify record")
         {
             AppEvent::CloseNotify => saw_close_notify = true,
-            AppEvent::ApplicationData(_) => panic!("expected close_notify"),
+            other => panic!("expected close_notify, got {other:?}"),
         }
     }
     assert!(saw_close_notify, "close_notify must be observed");
@@ -1072,6 +1205,44 @@ fn received_close_notify_still_allows_sending_our_close_notify() {
     assert_eq!(session.close_notify(), Err(TlsSessionError::Poisoned));
 }
 
+/// PR #1046 レビュー指摘の回帰: ハンドシェイク完了後に受けた
+/// `user_canceled` は受信方向を終了させない。以後のアプリケーション
+/// データは RFC 8446 §6.1 により内容を返さずに読み捨て（`Ignored`）、
+/// 後続の `close_notify` で受信方向が終了する。
+#[test]
+fn user_canceled_after_handshake_ignores_data_until_close_notify() {
+    use wire_server::tls::server_handshake::{AppEvent, TlsSessionError};
+
+    let (mut client, mut session) = establish_session_for_tests();
+
+    let seal_one = |client: &mut TestClient, content_type: ContentType, payload: &[u8]| {
+        let records = client
+            .sealer
+            .seal_fragmented(content_type, payload)
+            .expect("valid seal");
+        assert_eq!(records.len(), 1, "small payloads fit in one record");
+        records
+    };
+
+    let user_canceled = Alert {
+        level: wire_server::tls::alert::AlertLevel::Warning,
+        description: AlertDescription::UserCanceled.as_u8(),
+    }
+    .to_bytes();
+    let records = seal_one(&mut client, ContentType::Alert, &user_canceled);
+    assert_eq!(session.open_record(&records[0]), Ok(AppEvent::UserCanceled));
+
+    let records = seal_one(&mut client, ContentType::ApplicationData, b"ignored");
+    assert_eq!(session.open_record(&records[0]), Ok(AppEvent::Ignored));
+
+    let records = seal_one(&mut client, ContentType::Alert, &Alert::close_notify());
+    assert_eq!(session.open_record(&records[0]), Ok(AppEvent::CloseNotify));
+    assert_eq!(
+        session.open_record(&records[0]),
+        Err(TlsSessionError::Poisoned)
+    );
+}
+
 /// #965 レビュー指摘の回帰: 復号（`bad_record_mac`）・alert 解析の失敗は
 /// いずれもこの接続を終端させ、以後の `seal_application_data` を含む
 /// すべての操作を拒否する（破損した TLS 接続での送受信継続を防ぐ）。
@@ -1176,9 +1347,7 @@ fn full_handshake_round_trip_over_driver_with_loopback_stream() {
                 .expect("valid application record");
             let received = match event {
                 wire_server::tls::server_handshake::AppEvent::ApplicationData(data) => data,
-                wire_server::tls::server_handshake::AppEvent::CloseNotify => {
-                    panic!("expected application data, got close_notify")
-                }
+                other => panic!("expected application data, got {other:?}"),
             };
             (
                 payload,

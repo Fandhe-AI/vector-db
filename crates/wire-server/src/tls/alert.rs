@@ -3,8 +3,8 @@
 //! 親 #941）。
 //!
 //! 責務は「alert レコードの 2 バイト本体（level・description）の
-//! parse／serialize」と「受信した alert が正常終了（`close_notify`／
-//! `user_canceled`）かエラーかの分類」のみに限定する。alert の実送出・
+//! parse／serialize」と「受信した alert が正常終了（`close_notify`）・
+//! 取り消し通知（`user_canceled`）・エラーのいずれかの分類」のみに限定する。alert の実送出・
 //! ハンドシェイク状態機械への統合は [`super::server_handshake`] が担う。
 //!
 //! RFC 8446 §5.1 は alert メッセージの分割・結合を禁止しており、
@@ -90,19 +90,26 @@ impl Alert {
 /// 受信した alert の分類（RFC 8446 §6.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceivedAlert {
-    /// `close_notify`／`user_canceled`。正常終了として扱う。
+    /// `close_notify`。相手の送信方向の正常終了として扱う。
     Closed,
+    /// `user_canceled`。RFC 8446 §6.1 により後続に `close_notify` が続く
+    /// 通知であり、この時点では接続を終了しない（PR #1046 レビュー指摘:
+    /// 従来は `close_notify` と同じ `Closed` に分類していたため、後続の
+    /// `close_notify` を読まずに切断していた）。受信側の扱いは
+    /// [`super::server_handshake`] が担う。
+    UserCanceled,
     /// 上記以外（未知の description を含む）。エラー alert として扱う。
     Fatal(u8),
 }
 
-/// 受信した alert を分類する（level は分類に用いない。RFC 8446 は
-/// すべての alert を fatal として扱うことを要求するため、warning として
-/// 届いた `close_notify` も正常終了として扱う契約）。
+/// 受信した alert を分類する（level は分類に用いない。RFC 8446 §6 は
+/// alert の重大度を description で決めることを要求するため、warning として
+/// 届いた `close_notify` も正常終了、fatal として届いた `user_canceled` も
+/// 取り消し通知として扱う契約）。
 pub fn classify_received(alert: Alert) -> ReceivedAlert {
     match alert.description {
         d if d == AlertDescription::CloseNotify.as_u8() => ReceivedAlert::Closed,
-        d if d == AlertDescription::UserCanceled.as_u8() => ReceivedAlert::Closed,
+        d if d == AlertDescription::UserCanceled.as_u8() => ReceivedAlert::UserCanceled,
         other => ReceivedAlert::Fatal(other),
     }
 }
@@ -143,15 +150,26 @@ mod tests {
     }
 
     #[test]
-    fn classifies_close_notify_and_user_canceled_as_closed() {
+    fn classifies_close_notify_as_closed() {
         let close = Alert::parse(&Alert::close_notify()).expect("valid alert");
         assert_eq!(classify_received(close), ReceivedAlert::Closed);
+    }
 
-        let user_canceled = Alert {
-            level: AlertLevel::Warning,
-            description: AlertDescription::UserCanceled.as_u8(),
-        };
-        assert_eq!(classify_received(user_canceled), ReceivedAlert::Closed);
+    /// PR #1046 レビュー指摘の回帰: `user_canceled` は `close_notify` と
+    /// 同じ終了通知ではなく、後続の `close_notify` を待つ取り消し通知として
+    /// 分類する（level に依らない）。
+    #[test]
+    fn classifies_user_canceled_as_notification_not_closure() {
+        for level in [AlertLevel::Warning, AlertLevel::Fatal] {
+            let user_canceled = Alert {
+                level,
+                description: AlertDescription::UserCanceled.as_u8(),
+            };
+            assert_eq!(
+                classify_received(user_canceled),
+                ReceivedAlert::UserCanceled
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@
 //! [`super::finished`]・[`super::certificate_verify`]・[`super::x509`]を
 //! つなぎ、ClientHello 受信から client Finished 検証までを進める。
 //! [`super::alert`] と組み合わせて fatal alert の送出・受信 alert の
-//! 分類（close_notify／その他）を担う。
+//! 分類（close_notify／user_canceled／その他）を担う。
 //!
 //! **意図的なモジュール配置の逸脱**: 親 Issue の記述は「`tls/handshake.rs`
 //! の状態機械」だが、`handshake.rs`（Issue #953）は「鍵・状態を持たない
@@ -258,19 +258,29 @@ enum HandshakeState {
     /// fatal alert を送出済み（またはこれから送出を試みる）。以後の
     /// `handle_record` は同じ理由の `Err` を返し続ける。
     Failed(ServerHandshakeError),
-    /// `close_notify`／`user_canceled` を受けて正常終了した。
+    /// `close_notify` を受けて正常終了した。
     Closed,
+    /// ハンドシェイク中に `user_canceled` を受けた（PR #1046 レビュー指摘）。
+    /// RFC 8446 §6.1 によりこの alert の後には `close_notify` が続き、
+    /// closure alert 受信後に届いたデータは無視しなければならないため、
+    /// ハンドシェイクはもう進めず、`close_notify` が届くまで後続レコードを
+    /// 読み捨てる（[`ServerHandshake::step_after_user_canceled`]）。
+    /// 待機の有界性は driver の絶対期限（[`DeadlineReader`]）と
+    /// レコード長上限（[`record::read_record`]）が保証する。
+    Canceled,
 }
 
 /// [`ServerHandshake::handle_record`] の戻り値。
 #[derive(Debug)]
 pub enum Step {
     /// ハンドシェイク継続中。`0` 件のこともある（次のレコードを待つ、
-    /// またはダミー CCS を読み捨てただけ）。
+    /// ダミー CCS を読み捨てただけ、または `user_canceled` を受けて
+    /// `close_notify` を待っている）。
     Continue(Vec<Record>),
     /// client Finished の検証まで完了した。
     Complete(Vec<Record>, Box<TlsSession>),
-    /// 相手から `close_notify`／`user_canceled` を受けた（正常終了）。
+    /// 相手から `close_notify` を受けた（正常終了。`user_canceled` の後に
+    /// 続く `close_notify` を含む）。
     ClosedByPeer(Vec<Record>),
 }
 
@@ -411,6 +421,9 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
     }
 
     fn step_inner(&mut self, record: &Record) -> Result<Step, ServerHandshakeError> {
+        if matches!(self.state, HandshakeState::Canceled) {
+            return self.step_after_user_canceled(record);
+        }
         // ダミー CCS（middlebox 互換。RFC 8446 §5・付録 D.4）は Opener を
         // 経由せず、ClientHello 受信後から client Finished 受信前までに
         // 限り読み捨てる。RFC 8446 §5 は「最初の ClientHello を送信／受信
@@ -462,6 +475,45 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
                 self.state = HandshakeState::Closed;
                 Ok(Step::ClosedByPeer(Vec::new()))
             }
+            // `user_canceled` は終了通知ではなく、後続の `close_notify` を
+            // 待つ取り消し通知（RFC 8446 §6.1。PR #1046 レビュー指摘: 従来は
+            // この時点で `ClosedByPeer` を返し、後続の `close_notify` を
+            // 読まずに切断していた）。ハンドシェイクは中断して `Canceled`
+            // へ移り、`close_notify` を待つ。
+            ReceivedAlert::UserCanceled => {
+                self.state = HandshakeState::Canceled;
+                Ok(Step::Continue(Vec::new()))
+            }
+            ReceivedAlert::Fatal(code) => Err(ServerHandshakeError::ReceivedFatalAlert(code)),
+        }
+    }
+
+    /// `user_canceled` 受信後（[`HandshakeState::Canceled`]）の 1 レコード
+    /// 処理。RFC 8446 §6.1 は closure alert 受信後に届いたデータを無視する
+    /// ことを要求するため、ハンドシェイクメッセージ・ダミー CCS・再度の
+    /// `user_canceled` は解釈せずに読み捨て、`close_notify` で正常終了、
+    /// それ以外の alert は従来どおり fatal として扱う。レコード保護
+    /// （復号）と alert の構造検証は通常時と同じく fail-closed で行う。
+    /// 読み捨ては内容を保持しないためメモリは増えず、待機時間は driver の
+    /// 絶対期限（[`DeadlineReader`]）で打ち切られる。
+    fn step_after_user_canceled(&mut self, record: &Record) -> Result<Step, ServerHandshakeError> {
+        if record.content_type == ContentType::ChangeCipherSpec {
+            return Ok(Step::Continue(Vec::new()));
+        }
+        let inner = self
+            .opener
+            .open(record)
+            .map_err(ServerHandshakeError::Protection)?;
+        if inner.content_type != ContentType::Alert {
+            return Ok(Step::Continue(Vec::new()));
+        }
+        let alert = Alert::parse(&inner.content).map_err(ServerHandshakeError::AlertDecode)?;
+        match alert::classify_received(alert) {
+            ReceivedAlert::Closed => {
+                self.state = HandshakeState::Closed;
+                Ok(Step::ClosedByPeer(Vec::new()))
+            }
+            ReceivedAlert::UserCanceled => Ok(Step::Continue(Vec::new())),
             ReceivedAlert::Fatal(code) => Err(ServerHandshakeError::ReceivedFatalAlert(code)),
         }
     }
@@ -484,9 +536,10 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
                 self.handle_client_hello(raw, after_hrr)
             }
             HandshakeState::ExpectClientFinished => self.handle_client_finished(raw),
-            HandshakeState::Complete | HandshakeState::Failed(_) | HandshakeState::Closed => {
-                Err(ServerHandshakeError::AlreadyFailed)
-            }
+            HandshakeState::Complete
+            | HandshakeState::Failed(_)
+            | HandshakeState::Closed
+            | HandshakeState::Canceled => Err(ServerHandshakeError::AlreadyFailed),
         }
     }
 
@@ -801,6 +854,7 @@ impl<E: HandshakeEntropy> ServerHandshake<E> {
                 poisoned: false,
                 sent_close_notify: false,
                 received_close_notify: false,
+                received_user_canceled: false,
             }),
         ))
     }
@@ -858,6 +912,12 @@ pub struct TlsSession {
     /// （RFC 8446 §6.1: 書き込み側を閉じる前に `close_notify` を送る）、
     /// アプリケーションデータの送信は fail-closed 側に倒して拒否する。
     received_close_notify: bool,
+    /// 相手の `user_canceled` を受信した（PR #1046 レビュー指摘）。
+    /// RFC 8446 §6.1 により closure alert 受信後に届いたアプリケーション
+    /// データは無視しなければならないため、以後の `ApplicationData` は
+    /// [`AppEvent::Ignored`] として内容を返さずに読み捨てる。後続の
+    /// `close_notify` は通常どおり [`AppEvent::CloseNotify`] になる。
+    received_user_canceled: bool,
 }
 
 /// [`TlsSession::open_record`] の戻り値。
@@ -865,6 +925,12 @@ pub struct TlsSession {
 pub enum AppEvent {
     ApplicationData(Vec<u8>),
     CloseNotify,
+    /// 相手が `user_canceled` を送った（RFC 8446 §6.1。後続に
+    /// `close_notify` が続く通知であり、この時点では受信方向を終了しない）。
+    UserCanceled,
+    /// `user_canceled` 受信後に届いたアプリケーションデータを読み捨てた
+    /// （内容は返さない）。
+    Ignored,
 }
 
 /// [`TlsSession`] の操作が起こしうる失敗。
@@ -910,9 +976,11 @@ impl TlsSession {
             .map_err(TlsSessionError::Protection)
     }
 
-    /// 受信した 1 レコードを open する。alert（`close_notify`／
-    /// `user_canceled`）は [`AppEvent::CloseNotify`] へ写像し、それ以外の
-    /// alert は `Err(ReceivedFatalAlert)`。
+    /// 受信した 1 レコードを open する。`close_notify` は
+    /// [`AppEvent::CloseNotify`]、`user_canceled` は [`AppEvent::UserCanceled`]
+    /// （受信は継続し、以後のアプリケーションデータは [`AppEvent::Ignored`]
+    /// として読み捨てる）へ写像し、それ以外の alert は
+    /// `Err(ReceivedFatalAlert)`。
     ///
     /// 復号失敗・alert 解析失敗・fatal alert の受信はこの接続を両方向とも
     /// 終端させ、以後の呼び出しはすべて `Err(Poisoned)` になる（#965
@@ -933,6 +1001,7 @@ impl TlsSession {
             }
         };
         match inner.content_type {
+            ContentType::ApplicationData if self.received_user_canceled => Ok(AppEvent::Ignored),
             ContentType::ApplicationData => Ok(AppEvent::ApplicationData(inner.content)),
             ContentType::Alert => {
                 let alert = match Alert::parse(&inner.content) {
@@ -946,6 +1015,10 @@ impl TlsSession {
                     ReceivedAlert::Closed => {
                         self.received_close_notify = true;
                         Ok(AppEvent::CloseNotify)
+                    }
+                    ReceivedAlert::UserCanceled => {
+                        self.received_user_canceled = true;
+                        Ok(AppEvent::UserCanceled)
                     }
                     ReceivedAlert::Fatal(code) => {
                         self.poisoned = true;
@@ -1086,7 +1159,8 @@ impl<S: HandshakeTransport> Write for DeadlineWriter<'_, S> {
 pub enum ServerHandshakeDriverError {
     Handshake(ServerHandshakeError),
     Record(record::RecordError),
-    /// 接続が `close_notify`／`user_canceled` で正常終了した。
+    /// 接続が `close_notify`（`user_canceled` の後に続くものを含む）で
+    /// 正常終了した。
     ClosedByPeer,
 }
 
