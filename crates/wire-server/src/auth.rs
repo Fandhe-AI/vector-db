@@ -12,8 +12,7 @@ pub mod blake2b;
 pub mod hmac_sha256;
 pub mod scram;
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -104,12 +103,13 @@ pub struct UserStore {
     /// `None`（このフィールドを参照する `authenticate_scram` は
     /// `ScramSha256` のときにしか呼ばれない）。
     scram_mock_key: Option<[u8; scram::KEY_LEN]>,
-    /// DDL 実行権限を持つ username 集合（Issue #902・SQL-23・TASK-203。
-    /// `--ddl-allowed-users` からのみ設定する）。`users` に実在しない
-    /// username は [`UserStore::with_ddl_allowed_users`] が起動時エラーとして
-    /// 拒否するため、本フィールドの要素は必ず `users` のキーの部分集合になる。
-    /// 既定は空集合（全 DDL 文が `42501` で拒否される。`sql::ddl::
-    /// require_ddl_permission` ドキュメント参照）。
+    /// DDL（`CREATE TABLE`・`DROP TABLE` 等）実行権限を持つ username 集合
+    /// （SQL-23・TASK-202・TASK-203、Issue #899・#902。`--ddl-allowed-users`
+    /// からのみ設定する）。`users` に実在しない username は
+    /// [`UserStore::with_ddl_allowed_users`] が起動時エラーとして拒否するため、
+    /// 本フィールドの要素は必ず `users` のキーの部分集合になる。既定は空集合
+    /// （全 DDL 文が `42501` で拒否される。`sql::ddl::require_ddl_permission`
+    /// ドキュメント参照）。
     ddl_allowed: HashSet<String>,
 }
 
