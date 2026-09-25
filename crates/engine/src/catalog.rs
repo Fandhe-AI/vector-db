@@ -1593,8 +1593,12 @@ impl Storage {
     ///
     /// 安全性: `create_table`／`alter_table_add_column` と同じく
     /// [`crate::policy::PolicyContext`] を取らない生の DDL であり、全テナントの行を
-    /// 不可逆に削除する。DDL 認可の設計を経ないまま untrusted 経路（SQL 表層・
-    /// wire-server）へ配線しない（`DROP TABLE` 文は引き続き許可リスト外で `42601`）。
+    /// 不可逆に削除する。SQL 表層（`DROP TABLE <table>`。SQL-23・TASK-203、
+    /// Issue #902）は `crate::sql::ddl::require_ddl_permission`（接続単位の
+    /// DDL 実行権限ゲート。既定拒否・`42501`）を通過したセッションに限り
+    /// `crate::sql::ddl::execute_drop_table` 経由で本メソッドへ到達する
+    /// （wire-server 側の付与経路は `crate::sql::mode::SessionState::allow_ddl`
+    /// ドキュメント参照）。
     ///
     /// 存在しないテーブル名は `Err(CatalogError::TableNotFound)`、識別子として不正な
     /// 名前は `Err(CatalogError::Invalid)`（fail-closed。冪等に `Ok` へ丸めない）。
