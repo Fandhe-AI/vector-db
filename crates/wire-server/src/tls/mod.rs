@@ -47,6 +47,9 @@
 //!   （Issue #962）。[`pem`] が返す DER から 32 バイトの seed を取り出し、
 //!   RSA・ECDSA・v2（OneAsymmetricKey）等は起動時に明示的に拒否する。
 //!   鍵導出・署名は #961 の担当
+//! - [`sha512`]: SHA-512（FIPS 180-4）。Ed25519 署名生成・検証（Issue #961）の
+//!   秘密鍵展開・署名計算が使う（Issue #960）。トランスクリプトハッシュ・
+//!   HKDF は引き続き SHA-256（[`hkdf`]）のまま
 //!
 //! alert の実送出やハンドシェイク状態機械（#965）・接続への結線
 //! （#966 以降）はいずれも後続 sub-issue の担当であり、本モジュールは
@@ -64,4 +67,5 @@ pub mod pem;
 pub mod pkcs8;
 pub mod record;
 pub mod record_protection;
+pub mod sha512;
 pub mod x25519;
