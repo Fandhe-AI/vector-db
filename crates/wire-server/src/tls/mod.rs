@@ -53,6 +53,9 @@
 //!   （Ed25519）と秘密鍵側の公開鍵の照合、`Certificate` メッセージの
 //!   組み立て（Issue #963）。証明書署名の検証・extensions の意味解釈は
 //!   対象外のまま（[`x509`] のドキュメンテーションコメントを参照）
+//! - [`sha512`]: SHA-512（FIPS 180-4）。Ed25519 署名生成・検証（Issue #961）の
+//!   秘密鍵展開・署名計算が使う（Issue #960）。トランスクリプトハッシュ・
+//!   HKDF は引き続き SHA-256（[`hkdf`]）のまま
 //!
 //! alert の実送出やハンドシェイク状態機械（#965）・接続への結線
 //! （#966 以降）はいずれも後続 sub-issue の担当であり、本モジュールは
@@ -71,5 +74,6 @@ pub mod pem;
 pub mod pkcs8;
 pub mod record;
 pub mod record_protection;
+pub mod sha512;
 pub mod x25519;
 pub mod x509;
