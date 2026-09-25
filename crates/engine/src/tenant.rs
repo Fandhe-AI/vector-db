@@ -334,6 +334,14 @@ pub enum TenantWriteError {
     /// commit せず破棄する（行・台帳とも痕跡ゼロ）ため `54000`
     /// （`PayloadTooLarge`）へ写像する。
     TooManyRowsScanned,
+    /// `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）宣言テーブルへの書き込みが
+    /// テナント内一意性制約に違反した（`constraint::enforce_primary_key_in_txn`）。
+    /// 行キー衝突（[`TenantWriteError::IdConflict`]。物理キー `(tenant_id, id)`
+    /// の衝突）とは原因が異なる別 variant だが、`ErrorClass::UniqueViolation`
+    /// （`23505`）は共有する。`Display`／`Debug` はいずれもキー値・行 id・
+    /// テナント名・テーブル名を含まない固定文言（security.md P0「エラー・ログ
+    /// 経由で他テナントのデータ・存在情報を漏らさない」）。
+    UniqueViolation,
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得（[`Storage::begin_write_txn`]）がロック待ちの上限を
     /// 超過した（`55P03`）。`Storage(StorageError::WriteLockTimeout)` へ一般化せず
@@ -444,6 +452,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::ReturningProjectionTooLarge(_) => ErrorClass::PayloadTooLarge,
             TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
             TenantWriteError::TooManyRowsScanned => ErrorClass::PayloadTooLarge,
+            TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
             TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
         }
     }
@@ -491,6 +500,7 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::TooManyRowsScanned => {
                 write!(f, "too many rows scanned: limit={MAX_SCANNED_ROWS}")
             }
+            TenantWriteError::UniqueViolation => write!(f, "unique constraint violation"),
             TenantWriteError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
@@ -525,6 +535,7 @@ impl std::fmt::Debug for TenantWriteError {
                 f.write_str("CapturedRowDecodeFailed(<redacted>)")
             }
             TenantWriteError::TooManyRowsScanned => f.write_str("TooManyRowsScanned"),
+            TenantWriteError::UniqueViolation => f.write_str("UniqueViolation"),
             TenantWriteError::WriteLockTimeout => f.write_str("WriteLockTimeout"),
         }
     }
@@ -547,6 +558,18 @@ impl From<CatalogError> for TenantWriteError {
 impl From<StorageError> for TenantWriteError {
     fn from(e: StorageError) -> Self {
         TenantWriteError::Storage(e)
+    }
+}
+
+/// `row_codec` の構造検証エラーを `TenantWriteError` へ写像する
+/// （`constraint::enforce_primary_key_in_txn` が `row_codec::scan_scalar_columns_masked`
+/// の失敗を `?` で自然に変換できるようにする）。既存の
+/// `crate::row_codec::RowCodecError -> CatalogError::Invalid -> TenantWriteError::Catalog`
+/// という手動変換パターン（`upsert_typed_rows_unchecked` 等）と最終的に
+/// 同じ分類（`22000`）へ落ちる。
+impl From<crate::row_codec::RowCodecError> for TenantWriteError {
+    fn from(e: crate::row_codec::RowCodecError) -> Self {
+        TenantWriteError::Catalog(CatalogError::Invalid(e.to_string()))
     }
 }
 
@@ -706,7 +729,19 @@ pub(crate) fn insert_row_unchecked(
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = (ctx.tenant_id(), id);
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約は、
+        // 台帳照合（上記 `ledger::record_in_txn`）と行の書き込み（`insert_unique_row`）が
+        // 済んだ後・テーブル世代 bump／commit の前に検査する（RECOVER-12。判定順序の
+        // 詳細は `constraint.rs` モジュールドキュメント参照）。検査前に `row_table`
+        // ハンドルを drop し、同一 `write_txn` 内で読み取り専用の検査を行う。
         drop(row_table);
+        crate::constraint::enforce_primary_key_in_txn(
+            write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            &[id],
+        )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
     })
@@ -883,6 +918,17 @@ pub(crate) fn insert_rows_unchecked(
             insert_unique_row(&mut row_table, key, encoded)?;
         }
         drop(row_table);
+        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約検査
+        // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
+        // ドキュメント参照）。
+        let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+        crate::constraint::enforce_primary_key_in_txn(
+            write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            &ids,
+        )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
     })
@@ -1041,6 +1087,16 @@ pub(crate) fn insert_typed_row_unchecked(
         let encoded = encode_row(&row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         drop(row_table);
+        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約検査
+        // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
+        // ドキュメント参照）。
+        crate::constraint::enforce_primary_key_in_txn(
+            write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            &[id],
+        )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
     })
@@ -1200,6 +1256,20 @@ pub(crate) fn insert_typed_rows_unchecked(
             let encoded = encode_row(&row)?;
             insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         }
+    }
+    // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約検査
+    // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
+    // ドキュメント参照）。
+    {
+        let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+        let schema_for_pk = require_table_schema_write(&write_txn, table)?;
+        crate::constraint::enforce_primary_key_in_txn(
+            &write_txn,
+            table,
+            &schema_for_pk,
+            ctx.tenant_id(),
+            &ids,
+        )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
@@ -1432,6 +1502,10 @@ pub(crate) fn upsert_typed_rows_unchecked(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
 
+        // 主キー制約検査（下記ブロック終端）の対象 id。`DO NOTHING` で実際には
+        // 書かなかった行は含めない（TABLE-16・TASK-204、Issue #903。
+        // `constraint.rs` モジュールドキュメント参照）。
+        let mut written_ids: Vec<u64> = Vec::new();
         for (id, values) in rows {
             let key = (ctx.tenant_id(), *id);
             // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用
@@ -1549,6 +1623,7 @@ pub(crate) fn upsert_typed_rows_unchecked(
                                 "upsert updated row counter overflow".to_string(),
                             ))
                         })?;
+                        written_ids.push(*id);
                     }
                 }
             } else {
@@ -1580,7 +1655,24 @@ pub(crate) fn upsert_typed_rows_unchecked(
                         "upsert inserted row counter overflow".to_string(),
                     ))
                 })?;
+                written_ids.push(*id);
             }
+        }
+        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約
+        // 検査。行ストアの `mut row_table` ハンドルはこのブロックを抜けた
+        // 時点で解放されるため、その直前（同一ブロック内の最後）で読み取り
+        // ハンドルとして再度開く（`insert_row_unchecked` と異なり、ここは
+        // `row_table` を drop する前にまだブロック内にいるため、别途スコープを
+        // 切って再オープンする）。
+        if !written_ids.is_empty() {
+            drop(row_table);
+            crate::constraint::enforce_primary_key_in_txn(
+                &write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                &written_ids,
+            )?;
         }
     }
     if inserted > 0 || updated > 0 {
@@ -1685,6 +1777,19 @@ pub(crate) fn update_row_unchecked(
         row_table
             .insert(key, encoded.as_slice())
             .map_err(CatalogError::from)?;
+    }
+    // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約検査
+    // （[`insert_row_unchecked`] と同じ判定順序。`constraint.rs` モジュール
+    // ドキュメント参照）。
+    {
+        let schema_for_pk = require_table_schema_write(&write_txn, table)?;
+        crate::constraint::enforce_primary_key_in_txn(
+            &write_txn,
+            table,
+            &schema_for_pk,
+            ctx.tenant_id(),
+            &[id],
+        )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
@@ -2442,6 +2547,21 @@ pub(crate) fn update_row_columns_unchecked(
             // `UPDATE 0`（内容には一切触れない。RLS-9・RLS-10）。
             None => 0,
         };
+        // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約
+        // 検査。実際に書き込んだ場合（`rows_affected == 1`）のみ検査する
+        // （`UPDATE 0` は行に一切触れていないため対象外。`row_table` の `mut`
+        // ハンドルはこのブロックを抜けた時点で解放されるため、それより前に
+        // 明示的に drop してから読み取りハンドルとして再度開く）。
+        if rows_affected > 0 {
+            drop(row_table);
+            crate::constraint::enforce_primary_key_in_txn(
+                &write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                &[id],
+            )?;
+        }
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
@@ -3224,6 +3344,20 @@ pub(crate) fn update_rows_where_unchecked<E>(
         }
     }
 
+    // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約検査。
+    // 一致行が 0 件（何も書き込んでいない）場合は呼ばない（`constraint.rs`
+    // モジュールドキュメント参照）。
+    if !candidate_ids.is_empty() {
+        crate::constraint::enforce_primary_key_in_txn(
+            &write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            &candidate_ids,
+        )
+        .map_err(dml_write_err)?;
+    }
+
     let rows_affected = candidate_ids.len();
     if rows_affected > 0 {
         crate::catalog::bump_table_generation_in_txn(&write_txn, table).map_err(dml_write_err)?;
@@ -3567,6 +3701,27 @@ pub(crate) fn replace_typed_rows_by_text_key(
     if outcome.removed == 0 && outcome.inserted == 0 {
         drop(write_txn);
         return Ok(outcome);
+    }
+    // `PRIMARY KEY`（TABLE-16・TASK-204、Issue #903）のテナント内一意性制約検査。
+    // このファイル形 `INSERT`（同一パス置換）は採番 id が `first_id` から連番で
+    // 割り当てられる（上記クロージャの `next_id` 採番規則）ため、書き込んだ id
+    // 集合は `first_id..first_id + inserted` の連続範囲として再構築できる。
+    // `removed` のみで `inserted == 0` の場合（`rows` が空で既存行を削除しただけ）
+    // は新規に書き込んだ行がないため検査不要（削除は一意性制約に違反し得ない）。
+    if outcome.inserted > 0 {
+        if let Some(first_id) = outcome.first_id {
+            let ids: Vec<u64> = (0..outcome.inserted as u64)
+                .filter_map(|offset| first_id.checked_add(offset))
+                .collect();
+            let schema_for_pk = require_table_schema_write(&write_txn, table)?;
+            crate::constraint::enforce_primary_key_in_txn(
+                &write_txn,
+                table,
+                &schema_for_pk,
+                ctx.tenant_id(),
+                &ids,
+            )?;
+        }
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
