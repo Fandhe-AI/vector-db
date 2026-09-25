@@ -24,6 +24,7 @@
 //! を増やさないため、この判定には現れない（残余述語にはならない）。
 
 use crate::declarative_filter::MetadataFilter;
+use crate::sql::scalar_index::TypedKey;
 use crate::sql::udf_call::{BinOp, BoundExpr};
 
 /// [`classify_scalar_plan`] の分類結果。閉じた語彙（`sql::explain` の
@@ -256,6 +257,34 @@ pub(crate) fn id_bounds(
         // しない。
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => return None,
     })
+}
+
+/// 数値・日時・`NUMERIC`・`UUID` 列（Issue #893）に対する範囲述語（等価・単純
+/// 比較）を、[`crate::sql::scalar_index::ScalarIndex::candidates_typed_range`]
+/// が直接消費できる形へ正規化した表現。[`IdPredicate`]／[`id_bounds`] の
+/// typed 版に相当するが、`BoundExpr`（`sql::udf_call`）からこの型への変換
+/// アダプタは、新スカラー型の `WHERE` 述語表現がまだ確定していない
+/// （ビヘイビア INDEX-5・INDEX-6・TASK-199 のポインタ先——本モジュールの
+/// `id_predicate_from_expr` に相当する変換関数——は前提となる述語表現の
+/// 実装完了後に接続する）ため未実装（この Issue のスコープ外）。
+///
+/// `sql::scalar_index::ScalarIndex::resolve_candidates` は本型のスライスを
+/// 受け取る形へ既に拡張済みで、SQL 表層の 3 呼び出し元
+/// （`sql::exec`・`sql::aggregate`・`sql::group_by`）は現時点では常に空
+/// スライスを渡す（アダプタ未接続のため実質的に到達しない no-op）。
+/// アダプタ接続後もフィールド構成自体は変わらない想定のため、消費側の配線を
+/// 先に用意しておく。`#[cfg_attr(not(test), allow(dead_code))]` は、
+/// アダプタ接続までの間は本モジュールの単体テストからのみ実際に構築される
+/// （production 経路は常に空スライスを渡すのみで本型の値を構築しない）
+/// ことによる `dead_code` 検出を抑制する（`sql::scalar_index` の
+/// `TextColumnIndex` が同種のテスト専用メソッドに使っている、この
+/// コードベース既存のパターン）。
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TypedRangePredicate {
+    pub(crate) column_index: usize,
+    pub(crate) lower: std::ops::Bound<TypedKey>,
+    pub(crate) upper: std::ops::Bound<TypedKey>,
 }
 
 #[cfg(test)]

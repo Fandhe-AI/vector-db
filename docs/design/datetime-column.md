@@ -116,6 +116,17 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
   の `SET` を受理する。`http/status.rs`・`err4_http_projection.rs`・
   `docs/nosql-api.md` のエラー射影表・分類数を 16 → 17 へ更新。
 
+## Issue #893 追記: スカラー二次索引
+
+`ScalarIndex::build` は `DATE`／`TIMESTAMP` 列を `i64` へ昇格した順序索引
+（`sql::scalar_index::OrderedColumnIndex::I64`）で索引化するよう実装した
+（`DATE` は日数、`TIMESTAMP` はマイクロ秒。`TIMESTAMP` の絶対値が `2^53`
+を超える値を 1 件でも含む列は列単位で索引対象外へ縮退する。`DATE` は値域が
+`i32` のため構造的にこの上限に収まる）。ただし WHERE 句・式が `DATE`／
+`TIMESTAMP` 列をまだ参照できない（下記「WHERE の比較・等価述語と式評価
+（#891）」が未接続）ため、SQL 表層からは未到達のまま。詳細は
+`docs/design/scalar-index-prune.md`「Issue #893」節参照。
+
 ## 対象外（申し送り）
 
 - WHERE の比較・等価述語と式評価（#891・TASK-199）。本 Issue の時点では
@@ -123,8 +134,6 @@ PG のバイナリ表現を返す場合はオフセット変換が必要にな�
   参照できず、既存の TEXT 限定チェック（`declarative_filter::bind`）へ
   自然に `22000` で落ちる。
 - `MIN`／`MAX` などの集計拡張（#892）。`COUNT` のみ受理。
-- スカラー二次索引（#893）。`ScalarIndex::build` は DATE／TIMESTAMP 列を
-  索引化しない（`per_column.push(None)`）。
 - 3 段階デコード tier の最適化（#894）。
 - RowDescription の OID `1082`（date）／`1114`（timestamp）の公告（#895・
   WIRE-13）。現状は他の非 VECTOR 列と同じ既定 OID のまま。

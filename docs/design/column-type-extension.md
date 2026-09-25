@@ -175,7 +175,9 @@ TABLE-13・TASK-196（Issue #883）で `ColumnType::Boolean` を追加した。�
 - 対象外（申し送り）: RowDescription の OID 16 公告（#895）、NoSQL JSON
   束縛の完全対応（#896）、`22P02` の新設、`NOT`/`IS [NOT] NULL`/`IS TRUE`/
   `<>`/式中の bool 列参照、SQL `CREATE TABLE` 構文での `BOOLEAN` 宣言
-  （SQL-23 は未実装）、BOOLEAN 列のスカラー二次索引化。
+  （SQL-23 は未実装）。BOOLEAN 列のスカラー二次索引化は値域が 2 値で
+  索引化コストに見合わないとして #893 で対象外のまま据え置く判断を
+  確定した（`docs/design/scalar-index-prune.md`「Issue #893」節参照）。
 
 ## #884 追記: DATE／TIMESTAMP
 
@@ -218,7 +220,9 @@ REAL/DOUBLE・DATE/TIMESTAMP は未マージ）だったため、要素型は `A
 - 対象外（申し送り）: 配列列への等価（`=`／`IN`）・`IS NULL` 述語、要素/パス
   演算子、NoSQL の JSON 配列束縛（#896）、`22P02` の新設、SQL `CREATE TABLE`
   構文での `<型>[]` 宣言（#899）、数値・日時要素型（兄弟 PR マージ後）、NULL
-  要素対応、配列列のスカラー二次索引化。
+  要素対応。配列列のスカラー二次索引化は等価・前方一致・範囲いずれの述語も
+  持たないとして #893 で対象外のまま据え置く判断を確定した
+  （`docs/design/scalar-index-prune.md`「Issue #893」節参照）。
 
 ## #886 追記: BYTEA 列型
 
@@ -284,9 +288,11 @@ TABLE-13・TASK-197（Issue #886。関連: WIRE-13・NOSQL-17）で `ColumnType:
     `22P02` 導入時に再分類する）。長さ超過は表層を問わず `54000`。
 - 対象外（申し送り）: RowDescription の OID 拡張（既存の `WireType::Text`
   〔OID 25〕のまま。#895）、NoSQL の既存型統一・`columns[].type`（#896）、
-  `22P02` の新設（#897・TASK-227）、`WHERE` 述語・二次索引への `BYTEA` 対応
-  （#891・#893）、SQL `CREATE TABLE` 構文での `BYTEA` 宣言（SQL-23 は未実装。
-  宣言は Rust API の `TableSchema` 経由）。
+  `22P02` の新設（#897・TASK-227）、`WHERE` 述語対応（#891）、SQL
+  `CREATE TABLE` 構文での `BYTEA` 宣言（SQL-23 は未実装。宣言は Rust API の
+  `TableSchema` 経由）。二次索引（#893）は等価・前方一致・範囲いずれの
+  述語も持たない型として索引対象外のまま据え置く判断を確定した
+  （`docs/design/scalar-index-prune.md`「Issue #893」節参照）。
 
 ## #889 追記: JSON / JSONB 列型
 
@@ -368,7 +374,9 @@ TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType:
 - `WHERE` 述語・スカラー二次索引・UDF/式評価・hybrid 本文列・`USING PLAN`・
   scoring_boost・バイナリ結果形式（WIRE-14）への `JSON`/`JSONB` 列の露出は
   すべて BYTEA と同じ既存拒否パターンを踏襲し `22000`／`0A000` で拒否する
-  （索引は `per_column.push(None)`。二次索引拡張は #893 へ申し送り）。
+  （二次索引は等価・前方一致・範囲いずれの述語も持たない型として索引対象外
+  のまま据え置く判断を #893 で確定した。`typed_columns[i] = None`。
+  `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
 - **決定 D5（パス参照の範囲。Issue 本文からの逸脱）**: spec TABLE-14 は
   JSON パス演算子（`->`／`->>`／`@>` 等）による述語を対象外（`42601`）と
   している。式評価器（`sql::udf_call`）は TEXT 列参照すら `22000` で拒否し
@@ -405,9 +413,9 @@ TABLE-14・TASK-198（Issue #889。関連: NOSQL-8・NOSQL-17）で `ColumnType:
 - 対象外（申し送り）: RowDescription の OID 拡張（`json` 114／`jsonb` 3802。
   既存の `WireType::Text`〔OID 25〕のまま。#895）、NoSQL の既存型統一・
   `columns[].type`（#896）、`22P02` の新設（#897・TASK-227）、`WHERE` 述語
-  （等価・`IS NULL`）・二次索引への `JSON`/`JSONB` 対応（#891・#893）、SQL
-  `CREATE TABLE` 構文での `JSON`/`JSONB` 宣言（SQL-23 は未実装。宣言は
-  Rust API の `TableSchema` 経由）、パス参照 API の SQL/NoSQL 表層への構文
+  （等価・`IS NULL`）対応（#891）、SQL `CREATE TABLE` 構文での
+  `JSON`/`JSONB` 宣言（SQL-23 は未実装。宣言は Rust API の `TableSchema`
+  経由）、パス参照 API の SQL/NoSQL 表層への構文
   露出（spec ID 付与後の別 Issue）、`JSONB` の真のバイナリ格納表現
   （現状は正規化テキスト表現を実装既定値とする）。
 
@@ -602,8 +610,11 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   （ARRAY・JSON/JSONB 列型）で当該判定が許可型を列挙する明示的な `match` へ
   変わっていたため、`ColumnType::Numeric { .. }` の明示的な拒否腕を追加した
   （網羅性はコンパイラが強制）。式中の列参照（`sql::udf_call`）・
-  `sql::scalar_index`（索引対象外）・`sql::scan`（DecodeTier 分類）・
-  `sql::using_plan`（本文列規約）はいずれも明示的な拒否・除外腕を追加した。
+  `sql::scan`（DecodeTier 分類）・`sql::using_plan`（本文列規約）は
+  いずれも明示的な拒否・除外腕を追加した。`sql::scalar_index` は本 Issue
+  時点では索引対象外だったが、#893 で `OrderedColumnIndex::I128` として
+  索引化した（`WHERE` 述語からの到達経路は #891 未接続のまま。詳細は
+  `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
 - **wire-server**: `result_encoder.rs::cell_to_text`・`http/query/response.rs`
   の JSON 出力に `Cell::Numeric` を追加。NoSQL `update` op の JSON `SET`
   束縛（`http/query/update.rs`）は NUMERIC 列を対象外として明示的に拒否し
@@ -619,13 +630,17 @@ scale }` を追加した。`DECIMAL` は別名として扱うだけで、カタ�
   `column_binary_support` が fail-closed に非対応とし、対応拡大は #895 の
   担当のまま。
 - 対象外（申し送り）: `22P02` の新設、WHERE 述語・式評価での NUMERIC 列
-  参照の受理（#891）、`SUM`/`AVG`/`MIN`/`MAX`（#892）、スカラー二次索引化
-  （#893）、`DecodeTier` の精査（#894）、NUMERIC 列のバイナリ形式対応
-  （#895）、NoSQL `insert`/`update` op での JSON 数値の完全な束縛対応
-  （#896）、回帰テストの集約（#897）、`ALTER COLUMN TYPE` による `p` の
-  拡大（#901）、SQL `CREATE TABLE` 構文での `NUMERIC`/`DECIMAL` 列宣言
-  （SQL-23 は未実装）、ファイル形 `INSERT`（`path`/`body` 列規約専用のため
-  NUMERIC 列は明示的に拒否）。
+  参照の受理（#891）、`SUM`/`AVG`/`MIN`/`MAX`（#892）、`DecodeTier` の精査
+  （#894）、NUMERIC 列のバイナリ形式対応（#895）、NoSQL `insert`/`update`
+  op での JSON 数値の完全な束縛対応（#896）、回帰テストの集約（#897）、
+  `ALTER COLUMN TYPE` による `p` の拡大（#901）、SQL `CREATE TABLE` 構文
+  での `NUMERIC`/`DECIMAL` 列宣言（SQL-23 は未実装）、ファイル形 `INSERT`
+  （`path`/`body` 列規約専用のため NUMERIC 列は明示的に拒否）。スカラー
+  二次索引化（#893。`unscaled` の `i128` をキーとする順序索引
+  `sql::scalar_index::OrderedColumnIndex::I128` として実装済み。ただし
+  `WHERE` 述語がまだ NUMERIC 列を bind 時点で拒否している〔#891 未接続〕
+  ため SQL 表層からは未到達。詳細は `docs/design/scalar-index-prune.md`
+  「Issue #893」節参照）。
 
 ## #887 追記: UUID 列型
 
@@ -642,7 +657,12 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   一致することを単体テストで機械的に固定した（`uuid.rs::tests::
   byte_order_matches_canonical_text_order`）。WHERE 比較・二次索引・
   ORDER BY がこの順序を共有する唯一の定義とするが、本 Issue ではいずれへも
-  未結線（#891・#893 へ申し送り）。
+  未結線（WHERE 比較・ORDER BY は #891 へ、二次索引は #893 で
+  `sql::scalar_index::OrderedColumnIndex::U128`〔ネットワークバイトオーダーの
+  バイト列を `u128` ビッグエンディアンとして扱う。この `Ord` 導出と同じ大小
+  関係になる〕として実装済み。ただし `WHERE` 述語がまだ UUID 列を bind
+  時点で拒否している〔#891 未接続〕ため SQL 表層からは未到達。詳細は
+  `docs/design/scalar-index-prune.md`「Issue #893」節参照）。
 - **カタログ**: 型タグ `"uuid"`・`param` は常に `"-"`（他のパラメータなし
   スカラー型と同じ）。
 - **行バイト表現**: presence タグに続く 16 バイト生値固定
@@ -675,9 +695,11 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   キー列は既存のとおり TEXT 限定のため UUID 列は構造的に拒否される
   （変更不要）。
 - **WHERE・式・二次索引**: `declarative_filter::MetadataFilter::bind`・
-  `scoring_boost`・式中の列参照（`sql::udf_call`）・`sql::scalar_index`
-  （索引対象外）・`sql::using_plan`（本文列規約）はいずれも明示的な拒否腕を
-  追加した（網羅性はコンパイラが強制。ワイルドカード腕は使わない）。
+  `scoring_boost`・式中の列参照（`sql::udf_call`）・`sql::using_plan`
+  （本文列規約）はいずれも明示的な拒否腕を追加した（網羅性はコンパイラが
+  強制。ワイルドカード腕は使わない）。`sql::scalar_index` は本 Issue
+  時点では索引対象外だったが、#893 で `OrderedColumnIndex::U128` として
+  索引化した（`WHERE` 述語からの到達経路は #891 未接続のまま）。
   `sql::scan`（DecodeTier 分類・投影）は UUID 列を他のスカラー型と同じ
   `DimAndScalar` tier で扱う。
 - **wire-server**: `result_encoder.rs::cell_to_text`・`http/query/response.rs`
@@ -692,7 +714,8 @@ TABLE-13〔検討中〕・TASK-197（Issue #887）で `ColumnType::Uuid`（128bi
   まま（#896 へ申し送り。insert/update の非対称は BOOLEAN／DATE と同じ
   既知の制約）。
 - 対象外（申し送り）: WHERE 述語・式評価での UUID 列参照の受理（#891）、
-  `SUM`/`AVG`/`MIN`/`MAX`（#892）、スカラー二次索引化（#893）、`DecodeTier`
-  の精査（#894）、UUID 列のバイナリ形式・OID 2950 対応（#895）、NoSQL
-  `insert` op での JSON 束縛（#896）、SQL `CREATE TABLE` 構文での `UUID`
-  列宣言（SQL-23 は未実装）。
+  `SUM`/`AVG`/`MIN`/`MAX`（#892）、`DecodeTier` の精査（#894）、UUID 列の
+  バイナリ形式・OID 2950 対応（#895）、NoSQL `insert` op での JSON 束縛
+  （#896）、SQL `CREATE TABLE` 構文での `UUID` 列宣言（SQL-23 は未実装）。
+  スカラー二次索引化（#893）は `OrderedColumnIndex::U128` として実装済み
+  （詳細は `docs/design/scalar-index-prune.md`「Issue #893」節参照）。

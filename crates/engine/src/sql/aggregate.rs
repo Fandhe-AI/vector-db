@@ -1200,7 +1200,9 @@ fn try_scalar_index_aggregate(
         .iter()
         .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
         .collect();
-    let slots = match index.resolve_candidates(&bound.metadata_filters, &id_preds) {
+    // Issue #893: `TypedRangePredicate`（数値・日時・`NUMERIC`・`UUID` 列の
+    // 範囲述語）は述語表現アダプタ未接続のため常に空スライス（no-op）。
+    let slots = match index.resolve_candidates(&bound.metadata_filters, &id_preds, &[]) {
         crate::sql::scalar_index::CandidateResolution::Use(slots) => slots,
         crate::sql::scalar_index::CandidateResolution::FallbackNoIndex
         | crate::sql::scalar_index::CandidateResolution::FallbackSelectivity => {

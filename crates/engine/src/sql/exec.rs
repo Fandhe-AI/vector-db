@@ -1183,9 +1183,14 @@ pub(crate) fn execute_statement_with_cache(
                                         .iter()
                                         .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
                                         .collect();
+                                    // Issue #893: 数値・日時・`NUMERIC`・`UUID`
+                                    // 列の範囲述語（`TypedRangePredicate`）は、
+                                    // 新スカラー型の `WHERE` 述語表現アダプタ
+                                    // 未接続のため常に空スライス（no-op）。
                                     match index.resolve_candidates(
                                         &bound.metadata_filters,
                                         &id_preds,
+                                        &[],
                                     ) {
                                         crate::sql::scalar_index::CandidateResolution::Use(
                                             slots,

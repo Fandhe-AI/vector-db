@@ -924,8 +924,11 @@ pub(crate) fn execute_grouped_aggregate(
                             .iter()
                             .filter_map(crate::sql::scalar_plan::id_predicate_from_expr)
                             .collect();
+                        // Issue #893: `TypedRangePredicate`（数値・日時・
+                        // `NUMERIC`・`UUID` 列の範囲述語）は述語表現アダプタ
+                        // 未接続のため常に空スライス（no-op）。
                         if let crate::sql::scalar_index::CandidateResolution::Use(slots) =
-                            index.resolve_candidates(&bound.metadata_filters, &id_preds)
+                            index.resolve_candidates(&bound.metadata_filters, &id_preds, &[])
                         {
                             used_index_path = observe_candidate_slots_grouped(
                                 &snapshot,

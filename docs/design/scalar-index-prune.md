@@ -209,3 +209,96 @@ build_from_cached_rls_rows_subset_with_all_slots_matches_full_scan`）。非昇�
 ### 検証
 
 `crates/engine/tests/scalar_index_mask_search.rs`（5 述語形状で plain-scan オラクル〔`AND id + 0 > 0` で索引を無効化〕と結果一致・他テナント private 行の非漏えい・世代 bump 後の不使用）・`tests/scalar_index_aggregate.rs`（NULL グループ・TABLE-12 重複 id を含む）。A/B 実測は `docs/design/crossdb-loss-analysis-20260918.md` §4.4。
+
+## Issue #893: 新スカラー型（INTEGER/BIGINT/REAL/DOUBLE/DATE/TIMESTAMP/NUMERIC/UUID）のスカラー列二次索引対応
+
+Phase 2（Issue #881〜#890）で追加した新スカラー型は、`ScalarIndex::build` が
+一律 `per_column.push(None)`（未索引）へ縮退させたままだった。本 Issue で
+`sql::scalar_index::OrderedColumnIndex`（`TextColumnIndex` の順序キー版）と、
+`ScalarIndex::typed_columns`（`columns` と排他な並行フィールド）・
+`ScalarIndex::candidates_typed_range` を追加し、これらの型を等価・範囲述語で
+候補削減できる索引データ構造・照会 API を実装した。
+
+### データ構造とキー導出
+
+- `INTEGER`／`BIGINT`／`DATE`／`TIMESTAMP` → `i64` へ昇格した `OrderedColumnIndex::I64`
+- `REAL`／`DOUBLE` → `f64_to_sortable_bits`（IEEE 754 ビットパターンを全順序
+  比較可能な `u64` へ写像する標準変換）による `OrderedColumnIndex::F64Sortable`
+- `NUMERIC(p, s)` → 列固定の `scale` のもとで `unscaled`（`i128`）の大小が
+  そのまま値の大小になることを利用した `OrderedColumnIndex::I128`
+- `UUID` → ネットワークバイトオーダーのバイト列を `u128`（ビッグエンディアン）
+  として扱う `OrderedColumnIndex::U128`（`crate::uuid::Uuid` の `Ord` 導出
+  ——バイト列辞書順——と同じ大小関係）
+
+`BOOLEAN`・`BYTEA`・`JSON`・`JSONB`・`ARRAY`・`VECTOR` 列は引き続き索引対象外
+（`typed_columns[i] = None`）。値域が 2 値（`BOOLEAN`）・等価/前方一致/範囲
+述語を持たない（他）という Issue #883・#886・#888・#889 時点の判断を維持する。
+
+`NULL` はいずれの typed 列索引にもエントリを作らない（`TextColumnIndex` と
+同じ契約）。予算計上（`typed_column_reservation_bytes`）は固定長キーのため
+`row_count` 件分の一括確保をアロケーション前に検証するだけでよく、`TEXT` 列の
+ような重複排除後の再確保・`equality` テーブルは不要。
+
+### `BIGINT`／`TIMESTAMP` の `2^53` ゲート
+
+`#891`（新スカラー型の `WHERE` 述語・式評価対応）の評価器がリテラル比較を
+f64 経由（損失あり）で行う可能性に備え、絶対値が `2^53`（`f64` の仮数部が
+整数値を正確に表現できる上限。`id_index`・`sql::scalar_plan::MAX_EXACT_ID`
+と同じ基準）を超える値を 1 件でも含む列は、列単位で `None`（索引対象外）へ
+fail-closed に縮退する（`INTEGER`・`DATE` は値域が構造的にこの上限に収まる
+ため対象外にしない）。ちょうど `2^53`（絶対値）は境界として索引に残る。
+
+### `#891` 依存によるスコープ限定
+
+本 Issue 着手時点（2026-09-25）で `#891`（新スカラー型の `WHERE` 述語・式
+評価表現）は未マージだった。新スカラー型の列は `sql::udf_call::bind_expr_in`
+がまだ列参照そのものを `22000` で拒否しており、`declarative_filter::FilterOp`
+にも数値・日時型の範囲比較 variant が存在しないため、**SQL 表層（`WHERE`
+句）から本索引の typed 経路へ到達する構文が現時点で存在しない**。
+
+このため本 Issue は次のスコープに限定した:
+
+- 索引データ構造・照会 API（`OrderedColumnIndex`・`candidates_typed_range`）は
+  完全実装し、brute-force オラクル対照の単体テストで正しさを固定した。
+- `sql::scalar_plan::TypedRangePredicate`（`#891` の述語表現から
+  `candidates_typed_range` の引数形へ正規化した表現。`IdPredicate`／
+  `id_bounds` の typed 版に相当）は型定義のみ用意し、`BoundExpr` から本型への
+  変換アダプタ（`id_predicate_from_expr` の typed 版に相当）は実装していない
+  （`#891` の述語表現が確定していないため実装すると `#891` と重複・競合する）。
+- `ScalarIndex::resolve_candidates` は `typed_preds: &[TypedRangePredicate]`
+  引数を追加済みで、`sql::exec`・`sql::aggregate`・`sql::group_by` の 3 呼び
+  出し元はすべて配線済みだが、アダプタ未接続のため常に空スライス（no-op）を
+  渡す。
+- `sql::scalar_plan::ScalarPlan`（`classify_scalar_plan` の分類結果）・
+  `EXPLAIN` の `scalar_plan:` トークンはいずれも無変更——typed 述語を分類する
+  `IndexRange` 相当の variant は、それを実際に返す経路（`#891` アダプタ）が
+  無い状態で追加すると「一度も構築されない enum variant」になり、
+  `-D warnings` 下の `dead_code` 検出（`clippy --all-targets`）に抵触する
+  ため見送った。
+
+`#891` 接続後の残作業（別 Issue の担当）:
+
+1. `BoundExpr`／`declarative_filter::WherePredicate` 側に新スカラー型の
+   範囲比較表現が確定した時点で、`typed_predicate_from_expr`（`id_predicate_from_expr`
+   に相当）を実装し `TypedRangePredicate` へ正規化する。
+2. `classify_scalar_plan` を `typed_preds` を受け取る形へ拡張し
+   （既存 `classify_scalar_plan` は空スライスで委譲する後方互換シグネチャを
+   維持できる）、`ScalarPlan::IndexRange`（もしくは `IndexConjunction` への
+   合流）を追加する。
+3. `EXPLAIN` の `scalar_plan:` トークンへ `index_range` を追記する。
+4. 索引で完全被覆された typed 述語の信頼マスク（Issue #844 の `mask_trusted_defer`
+   等）への昇格は、索引と評価器の同値性を性質テストで固定したうえで別途判断する
+   （本 Issue 時点では意図的に対象外のまま——`resolve_candidates` は typed
+   述語の候補も従来どおり `on_visible_row` の多層防御を経由する）。
+
+### 対象ファイル（本 Issue 分）
+
+| パス | 変更 |
+| --- | --- |
+| `crates/engine/src/sql/scalar_index.rs` | `OrderedColumnIndex`・`TypedKey`・`typed_columns`・`push_typed_value`・`candidates_typed_range`・`resolve_candidates` の `typed_preds` 引数・予算計上関数・単体テスト |
+| `crates/engine/src/sql/scalar_plan.rs` | `TypedRangePredicate`（アダプタ未実装。`#[cfg_attr(not(test), allow(dead_code))]`） |
+| `crates/engine/src/sql/exec.rs`・`aggregate.rs`・`group_by.rs` | `resolve_candidates` 呼び出しへ `&[]` を追加（配線のみ・挙動不変） |
+
+依存追加なし・`unsafe` なし・spec 本文転記なし。既存クエリの挙動・`EXPLAIN`
+出力・Recall ゲートはいずれも本 Issue の前後で完全に不変（typed 述語が実際に
+発生する経路が無いため）。
