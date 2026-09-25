@@ -449,7 +449,7 @@ impl RecordBuffer {
     /// 全部を取り込むとは限らない**。取り込み切れなかった残りは呼び出し元が
     /// 保持し、[`RecordBuffer::next_record`] でバッファを空けてから再度渡す。
     pub fn feed(&mut self, input: &[u8]) -> usize {
-        let capacity_left = MAX_RECORD_WIRE_LEN.saturating_sub(self.buf.len());
+        let capacity_left = self.remaining_capacity();
         let take = input.len().min(capacity_left);
         match input.get(..take) {
             Some(chunk) => {
@@ -458,6 +458,18 @@ impl RecordBuffer {
             }
             None => 0,
         }
+    }
+
+    /// [`Self::feed`] が次に取り込める残り容量（[`MAX_RECORD_WIRE_LEN`]
+    /// 上限からバッファ使用量を差し引いた値）。呼び出し元（[`super::
+    /// stream::TlsStream`]。Issue #966）がこの値を超える生バイト列を
+    /// 一度に読んでしまうと、`feed` が取り込み切れなかった超過分を
+    /// 呼び出し元が保持せずに捨てた場合、次のレコードの先頭バイト列を
+    /// 欠落させてしまう（"feed" のドキュメント参照）。読み取りバッファの
+    /// 上限をこの値で絞ることで、そもそも取り込み切れない量を読まない
+    /// ようにする。
+    pub fn remaining_capacity(&self) -> usize {
+        MAX_RECORD_WIRE_LEN.saturating_sub(self.buf.len())
     }
 
     /// バッファから 1 レコードを取り出す。

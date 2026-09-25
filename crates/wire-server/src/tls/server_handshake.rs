@@ -1125,7 +1125,12 @@ impl TlsSession {
         &mut self,
         desc: AlertDescription,
     ) -> Result<Vec<Record>, TlsSessionError> {
-        if self.fatal_alert_sent {
+        // RFC 8446 §6.1: `close_notify` を送出した後はこの接続でこれ以上
+        // データを送ってはならない（`seal_application_data`／`close_notify`
+        // と同じ送信方向の終了契約。#966 レビュー指摘: `shutdown_write` で
+        // `close_notify` を送った直後に受信側の復号失敗が起きた場合でも
+        // fatal alert を送ってしまう経路があった）。
+        if self.fatal_alert_sent || self.sent_close_notify {
             return Err(TlsSessionError::Poisoned);
         }
         let records = self

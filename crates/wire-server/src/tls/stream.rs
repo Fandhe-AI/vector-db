@@ -105,16 +105,23 @@ impl<S: WireStream> TlsStream<S> {
     /// そのまま呼び出し元へ返す（`handshake::read_next_frame_header` が
     /// 同じストリームで読み直せるよう、内部状態は変更しない）。
     fn fill_from_inner(&mut self) -> io::Result<usize> {
+        // 読み取り量を `rx` の残り容量（`RecordBuffer::remaining_capacity`）
+        // に絞る。固定 4096 バイトのまま読むと、相手が 1 レコードぶんの
+        // 本文を境界をまたいで連続送信してきた場合に `feed` が取り込み
+        // 切れない超過分（次のレコードの先頭バイト列）が生まれ、それを
+        // 捨てると次のレコードが破損する（レビュー指摘・#966）。
+        // `fill_from_inner` は `next_record` が `Ok(None)`（レコード未完成）
+        // の場合にのみ呼ばれ、その時点で `rx` の使用量は必ず
+        // `MAX_RECORD_WIRE_LEN` 未満のため、残り容量は常に 1 以上になる。
         let mut buf = [0u8; 4096];
-        let n = self.inner.read(&mut buf)?;
+        let capacity = self.rx.remaining_capacity().min(buf.len());
+        let n = self.inner.read(&mut buf[..capacity])?;
         if n > 0 {
             let taken = self.rx.feed(buf.get(..n).unwrap_or(&[]));
-            // `feed` は空き容量に収まる分だけ取り込む契約（`MAX_RECORD_WIRE_LEN`
-            // 上限）。1 レコード分を大きく超える生バイト列を一度に送ってくる
-            // 相手は次の `next_record` が `TooLarge` 等の `Err` を返すため、
-            // ここで取り込み切れなかった残り（`n - taken`）は意図的に捨てる
-            // （fail-closed: 上限超過の入力を無制限に保持しない）。
-            let _ = taken;
+            debug_assert_eq!(
+                taken, n,
+                "read was bounded by remaining_capacity, feed must take all of it"
+            );
         }
         Ok(n)
     }
@@ -415,24 +422,62 @@ mod tests {
     /// `docs/design/tls-wire-connection.md` 参照）。
     #[test]
     fn read_recovers_after_would_block_mid_record() {
-        let (server_sock, client_sock) = loopback_pair();
-        let (server_session, client_session) = test_session_pair();
-        let mut server = TlsStream::new(server_sock, server_session);
+        let (mut server_sock, client_sock) = loopback_pair();
+        let (mut server_session, client_session) = test_session_pair();
         let mut client = TlsStream::new(client_sock, client_session);
 
-        server.write_all(b"across two reads").expect("write");
+        // レコードの生バイト列を書き手側で組み立て、意図的に前半・後半へ
+        // 分割して間に sleep を挟む（`TlsStream::write` を使うと 1 回の
+        // `write_all` で送られてしまい、受け手側が必ず 1 回の `read` で
+        // レコード全体を受け取れてしまうため、`WouldBlock` を意図的に
+        // 起こせない＝レビュー指摘: 元のテストは vacuous だった）。
+        let records = server_session
+            .seal_application_data(b"across two reads")
+            .expect("seal");
+        let mut wire = Vec::new();
+        for record in &records {
+            record
+                .serialize_into(&mut wire, RecordKind::Ciphertext)
+                .expect("serialize");
+        }
+        assert!(
+            wire.len() > 4,
+            "need at least a few bytes to split meaningfully"
+        );
+        let split_at = wire.len() / 2;
 
-        // クライアント側の生ソケットに極短い読み取りタイムアウトを設定し、
-        // レコードが全部届く前に `WouldBlock`/`TimedOut` を意図的に起こす。
+        let writer = std::thread::spawn(move || {
+            server_sock
+                .write_all(&wire[..split_at])
+                .expect("write first half");
+            std::thread::sleep(Duration::from_millis(50));
+            server_sock
+                .write_all(&wire[split_at..])
+                .expect("write second half");
+        });
+
+        // クライアント側の生ソケットに極短い読み取りタイムアウトを設定する。
+        // 前半しか届いていない間の `read` は必ず `WouldBlock`/`TimedOut` に
+        // なることを検証してから、後半到着後に読み直して完成させる。
         client
             .set_read_timeout(Some(Duration::from_millis(1)))
             .expect("set timeout");
         let mut buf = [0u8; 64];
-        let mut last_err_was_timeout = false;
-        for _ in 0..2000 {
+        let first = client.read(&mut buf);
+        assert!(
+            matches!(
+                &first,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut
+            ),
+            "expected the first read (before the second half arrives) to time out, got {first:?}"
+        );
+
+        let mut last_err_was_timeout = true;
+        for _ in 0..5000 {
             match client.read(&mut buf) {
                 Ok(n) => {
                     assert_eq!(&buf[..n], b"across two reads");
+                    writer.join().expect("writer thread must not panic");
                     return;
                 }
                 Err(e)
@@ -447,6 +492,60 @@ mod tests {
         }
         assert!(last_err_was_timeout, "expected at least one timeout");
         panic!("read never completed despite repeated retries");
+    }
+
+    /// レビュー指摘の回帰確認（Issue #966）: 1 レコードぶんの本文が複数回の
+    /// `read` にまたがって届き、かつその区切りが `RecordBuffer` の残り容量
+    /// ちょうどに来る場合でも、次のレコードの先頭バイト列を取りこぼさない
+    /// こと（`fill_from_inner` を固定長 4096 バイトのまま読んでいた旧実装
+    /// では、1 回の `read` が複数レコードにまたがった際に `feed` が
+    /// 取り込み切れなかった超過分を捨てており、次のレコードが破損した）。
+    #[test]
+    fn read_does_not_drop_bytes_when_two_records_arrive_in_one_chunk_at_capacity_boundary() {
+        let (mut server_sock, client_sock) = loopback_pair();
+        let (mut server_session, client_session) = test_session_pair();
+        let mut client = TlsStream::new(client_sock, client_session);
+
+        // 1 レコードの平文上限（`MAX_PLAINTEXT_LEN` = 16384 バイト）ぴったりの
+        // メッセージに続けて短いメッセージを送る。`seal_application_data` は
+        // `MAX_PLAINTEXT_LEN` ごとに分割するため、大きい方は複数レコードに
+        // 分かれず 1 レコードで済む。
+        let big_payload = vec![0xABu8; MAX_PLAINTEXT_LEN];
+        let small_payload = b"tail".to_vec();
+
+        let mut wire = Vec::new();
+        for record in server_session
+            .seal_application_data(&big_payload)
+            .expect("seal big")
+        {
+            record
+                .serialize_into(&mut wire, RecordKind::Ciphertext)
+                .expect("serialize big");
+        }
+        for record in server_session
+            .seal_application_data(&small_payload)
+            .expect("seal small")
+        {
+            record
+                .serialize_into(&mut wire, RecordKind::Ciphertext)
+                .expect("serialize small");
+        }
+
+        let writer = std::thread::spawn(move || {
+            server_sock.write_all(&wire).expect("write combined wire");
+        });
+
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        while received.len() < big_payload.len() + small_payload.len() {
+            let n = client.read(&mut buf).expect("read");
+            assert!(n > 0, "must not observe premature EOF");
+            received.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(&received[..big_payload.len()], big_payload.as_slice());
+        assert_eq!(&received[big_payload.len()..], small_payload.as_slice());
+
+        writer.join().expect("writer thread must not panic");
     }
 
     #[test]
@@ -471,5 +570,60 @@ mod tests {
         assert!(server.write(b"y").is_err(), "must stay fail-closed");
         let mut buf = [0u8; 1];
         assert!(server.read(&mut buf).is_err(), "must stay fail-closed");
+    }
+
+    /// `fail_with_alert` の経路（`TlsSessionError::Protection` を受けた際
+    /// fatal alert を best-effort 送出してから `failed` に固定する）を、
+    /// 改ざんした暗号文を実際に読ませて固定する。読み手は `InvalidData` を
+    /// 返し、送り手側の生ソケットには fatal alert（レコードヘッダの先頭
+    /// バイトは `ContentType::Alert` = 0x15）が届く。
+    #[test]
+    fn corrupted_ciphertext_sends_fatal_alert_and_fails_closed() {
+        let (mut server_sock, client_sock) = loopback_pair();
+        let (server_session, client_session) = test_session_pair();
+        let mut client = TlsStream::new(client_sock, client_session);
+
+        let mut server_session = server_session;
+        let records = server_session
+            .seal_application_data(b"tampered")
+            .expect("seal");
+        let mut wire = Vec::new();
+        for record in &records {
+            record
+                .serialize_into(&mut wire, RecordKind::Ciphertext)
+                .expect("serialize");
+        }
+        // レコードヘッダ（5 バイト）より後ろの暗号文本体を 1 バイト反転し、
+        // AEAD タグ検証が必ず失敗するようにする。
+        if let Some(byte) = wire.get_mut(5) {
+            *byte ^= 0xFF;
+        }
+        server_sock.write_all(&wire).expect("write tampered record");
+
+        let mut buf = [0u8; 64];
+        let err = client
+            .read(&mut buf)
+            .expect_err("must reject bad_record_mac");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // 送り手側の生ソケットに fatal alert レコードが届くことを確認する。
+        // TLS 1.3 のハンドシェイク完了後は全レコードの外側 content type が
+        // `ApplicationData`（RFC 8446 §5.2）に固定されるため、実際の種別
+        // （alert かどうか）は復号しないと分からない。`server_session`
+        // （送信側と鍵材料が対応する opener）で開き、fatal alert の受信
+        // として分類されることを確認する。
+        server_sock
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let alert_record = record::read_record(&mut server_sock, RecordKind::Ciphertext)
+            .expect("read alert record")
+            .expect("alert record present");
+        let open_err = server_session
+            .open_record(&alert_record)
+            .expect_err("must be a fatal alert, not application data");
+        assert!(
+            matches!(open_err, TlsSessionError::ReceivedFatalAlert(_)),
+            "expected ReceivedFatalAlert, got {open_err:?}"
+        );
     }
 }
