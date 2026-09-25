@@ -412,6 +412,27 @@ impl<'e> SessionTransaction<'e> {
         }
         SqlSurfaceError::InFailedSqlTransaction
     }
+
+    /// `Active` なトランザクションが持続時間の上限に達するまでの残り時間
+    /// （`Active` 以外は `None`。上限を過ぎていれば `Some(Duration::ZERO)`）。
+    ///
+    /// wire 層（`wire-server::handshake::post_auth_loop`）が、次の要求を待つ
+    /// 読み取りタイムアウトをこの残り時間で切り詰めるために使う（PR #1041
+    /// レビュー指摘: 無通信のまま上限を過ぎてもライタを占有し続けないよう、
+    /// 期限到達時点で [`Self::release_if_expired`] を呼べるようにする）。
+    /// `Failed` は [`Self::fail`]／[`Self::release_if_expired`] の時点で共有
+    /// 書き込みトランザクション（書き込みゲートの permit を内包）を既に drop
+    /// 済みでライタを保持しないため、対象外（`None`）とする。
+    pub fn remaining_duration(&self) -> Option<Duration> {
+        match &self.state {
+            TxnState::Active(active) => Some(
+                self.limits
+                    .max_duration
+                    .saturating_sub(active.started_at.elapsed()),
+            ),
+            _ => None,
+        }
+    }
 }
 
 /// [`crate::storage::StorageError::WriteLockTimeout`]／
