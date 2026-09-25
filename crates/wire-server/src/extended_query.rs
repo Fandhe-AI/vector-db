@@ -1449,6 +1449,22 @@ fn execute_portal<'e>(
         PortalState::Ready
     );
 
+    // 明示トランザクションが `Failed`（エラーによる abort・持続時間上限による
+    // 解放後）の間は、実行を開始済みの portal（`Suspended`・`Done`・`Failed`）の
+    // 残り行の送出・`CommandComplete` の再送も行わず、`25P02`（期限切れの未報告分が
+    // あれば 1 回だけ `54000`）で拒否する（SQL-31・TASK-221。PR #1041 レビュー
+    // 指摘: `Ready` の portal だけが `execute_parsed_in_txn` を通るため、ここで
+    // 判定しないと abort 後の最初の要求が成功に見え、期限切れも報告されない）。
+    // PostgreSQL がトランザクション終了時に portal を破棄するのに合わせ、拒否した
+    // portal は終端状態 `Failed` へ倒し、`ROLLBACK` 後も再開させない。`Ready` の
+    // portal は `execute_parsed_in_txn` が同じ判定（`ROLLBACK` のみ受理）を行う。
+    if !needs_execution && txn.status() == engine::sql::transaction::TransactionStatus::Failed {
+        if let Some(portal) = state.portals.get_mut(portal_name) {
+            portal.state = PortalState::Failed;
+        }
+        return Err(HandlerError::Sql(txn.take_failed_error()));
+    }
+
     if needs_execution {
         let (parsed, expected_columns, result_formats) = {
             let portal = state

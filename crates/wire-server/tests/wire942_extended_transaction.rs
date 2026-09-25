@@ -508,6 +508,95 @@ fn expired_transaction_releases_writer_while_client_is_silent() {
     assert_eq!(visible_rows_with_id(&core, 40), 1);
 }
 
+/// 持続時間の上限で `Failed` へ遷移した後は、実行を開始済みの portal
+/// （`Suspended`：残り行あり／`Done`：完了済み）への Execute も成功に見せず、
+/// 期限切れの `54000` を返すこと（PR #1041 レビュー指摘: 以前は `Ready` 以外の
+/// portal が `execute_parsed_in_txn` を通らず、abort 後も残り行の送出や
+/// `CommandComplete` の再送を続けていた）。
+fn run_started_portal_after_expiry_case(fully_consume_first: bool, label: &str) {
+    let path = temp_db::unique_db_path(label);
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let max_duration = std::time::Duration::from_millis(200);
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_transaction_limits(
+            engine::sql::transaction::TransactionLimits {
+                max_duration,
+                max_statements: 1_000,
+            },
+        ),
+    );
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (id, op) in [(41, "op-942-41"), (42, "op-942-42")] {
+        send_simple_query(&mut stream, &insert_sql(id, op));
+        assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+        read_ready_for_query(&mut stream);
+    }
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+
+    parse_and_bind(&mut stream, "s1", "p1", "SELECT id FROM documents LIMIT 10");
+    if fully_consume_first {
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+        loop {
+            let (kind, _) = read_message(&mut stream);
+            if kind == b'C' {
+                break;
+            }
+            assert_eq!(kind, b'D', "expected DataRow or CommandComplete");
+        }
+    } else {
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 1));
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(kind, b'D', "expected DataRow");
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(kind, b's', "expected PortalSuspended");
+    }
+
+    // 上限を超えるまで無通信のまま待つ（受信待ちの打ち切りで Failed へ遷移する）。
+    std::thread::sleep(max_duration * 2);
+
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 1));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(
+        kind, b'E',
+        "a started portal must not run after the transaction expired"
+    );
+    assert!(
+        body.windows(6).any(|w| w == b"C54000"),
+        "the first request after expiry must report 54000"
+    );
+    send_sync(&mut stream);
+    assert_ready_for_query_status(&mut stream, b'E');
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+}
+
+#[test]
+fn suspended_portal_is_rejected_after_transaction_expiry() {
+    run_started_portal_after_expiry_case(false, "wire942-suspended-portal-expired");
+}
+
+#[test]
+fn completed_portal_is_rejected_after_transaction_expiry() {
+    run_started_portal_after_expiry_case(true, "wire942-done-portal-expired");
+}
+
 /// 拡張クエリの 1 メッセージを送り、ErrorResponse が返ったあと Sync で
 /// ReadyForQuery まで進める。
 fn send_expect_error_then_sync(stream: &mut std::net::TcpStream, type_byte: u8, body: &[u8]) {
