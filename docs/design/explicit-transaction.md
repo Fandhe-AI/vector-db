@@ -109,6 +109,12 @@ Failed { session_at_begin: SessionState } }`）。`ActiveTxn` は
   し permit を解放して `Failed`（ロックは保持しない）へ遷移し、元のエラーを
   そのまま返す。Failed 状態から `COMMIT` はできないため、失敗した文が残した
   部分書き込みが永続化されることはない。**redb の savepoint は不要**。
+  構文・許可リスト検証のエラー（`execute_sql_in_txn` の `parse_sql` 失敗）、
+  簡易クエリの複数文分割・位置検証のエラー、拡張クエリプロトコルの
+  Parse／Bind／Describe／Execute のエラー応答も同じく `Failed` へ遷移させる
+  （PostgreSQL と同じく、エラーの種類を問わない。PR #1041 レビュー指摘）。
+  `SessionTransaction::fail` は `Active` 以外では状態を変えない（冪等）ため、
+  wire 層はエラー応答のたびに状態を問わず呼べる。
 - **同一トランザクション内での `operation_id` の再利用**: 台帳照合より前に
   `seen_operation_ids` と照合し、一致すれば `25000`
   （`InvalidTransactionState`）で `Failed` へ遷移する。台帳は自トランザクションの
@@ -161,7 +167,9 @@ TransactionStatus` の照会 API を公開するまでとし、wire-server の `
   `TransactionControl` 遷移を模擬し、`BEGIN` を含む複数文メッセージでは書き込み
   文の位置制約を緩和する（詳細は `wire-multi-statement.md` 参照）。
 - 明示トランザクション中の `COPY` は `0A000` で拒否し、トランザクションを
-  `Failed` へ遷移させる（`crate::copy::run` へは委譲しない）。
+  `Failed` へ遷移させる（`crate::copy::run` へは委譲しない）。`Failed` 中の
+  `COPY` も autocommit として実行せず `25P02` で拒否する（`Idle` のときだけ
+  `crate::copy::run` へ委譲する。PR #1041 レビュー指摘）。
 
 ## 検証
 
