@@ -50,14 +50,16 @@ pub(crate) enum DerError {
     /// ビット付きで現れた（DER はこれらの型を常に primitive で符号化する
     /// ことを要求する。BER の断片化 constructed 文字列は非該当）。
     ConstructedUniversalType,
-    /// `NULL`／`BOOLEAN` 等、値の形状が固定された universal primitive 型が
-    /// DER の正規形に反する（`NULL` に値がある・`BOOLEAN` が 1 バイトかつ
-    /// `0x00`／`0xFF` のいずれでもない、等）。
+    /// universal primitive 型の値が DER の正規形に反する（`NULL` に値が
+    /// ある・`BOOLEAN` が 1 バイトかつ `0x00`／`0xFF` のいずれでもない・
+    /// `INTEGER`／`ENUMERATED` が空または非最小符号化・`OBJECT IDENTIFIER`／
+    /// `RELATIVE-OID` が空・非最小符号化・切り詰め、等）。
     InvalidPrimitiveEncoding,
-    /// `SEQUENCE`（0x10）・`SET`（0x11）が primitive（constructed ビット
-    /// 無し）で符号化されている（DER はこれらを常に constructed で
-    /// 符号化することを要求する。X.690 §8.9.1／§8.11.1）。
-    PrimitiveSequenceOrSet,
+    /// constructed でしか符号化できない universal 型（`EXTERNAL`（8）・
+    /// `EMBEDDED PDV`（11）・`SEQUENCE`（16）・`SET`（17）・
+    /// `CHARACTER STRING`（29））が primitive（constructed ビット無し）で
+    /// 符号化されている（X.690 §8.18・§8.19・§8.9・§8.11・§8.21）。
+    PrimitiveConstructedOnlyType,
 }
 
 impl fmt::Display for DerError {
@@ -75,8 +77,8 @@ impl fmt::Display for DerError {
                 "DER universal type is not allowed to be constructed"
             }
             DerError::InvalidPrimitiveEncoding => "DER primitive value is not in canonical form",
-            DerError::PrimitiveSequenceOrSet => {
-                "DER SEQUENCE or SET must not be encoded as primitive"
+            DerError::PrimitiveConstructedOnlyType => {
+                "DER constructed-only universal type must not be encoded as primitive"
             }
         };
         write!(f, "{msg}")
@@ -229,26 +231,65 @@ impl<'a> DerReader<'a> {
     }
 }
 
-/// universal クラス（タグ上位 2 ビットが `00`）の `SEQUENCE`（0x10）・
-/// `SET`（0x11）以外のタグ番号。DER はこれら以外の universal 型
-/// （`BOOLEAN`・`INTEGER`・`NULL`・`OBJECT IDENTIFIER`・`BIT STRING`・
-/// `OCTET STRING`・各種文字列型・`UTCTime`／`GeneralizedTime` 等）を
-/// 常に primitive で符号化することを要求する（X.690 §8.1.2.5・§10）。
-/// BER はこれらの一部（文字列型）に constructed（断片化）形を許すが、
-/// DER では非該当。フィールドの意味は問わないため、universal クラス
-/// である限りタグ番号だけで判定できる。
-fn universal_type_allows_constructed(tag_number: u8) -> bool {
-    matches!(tag_number, 0x10 | 0x11)
+/// universal クラス（タグ上位 2 ビットが `00`）のうち、X.690 が常に
+/// constructed での符号化を要求する型のタグ番号か（`EXTERNAL`（8。
+/// §8.18）・`EMBEDDED PDV`（11。§8.19）・`SEQUENCE`（16。§8.9）・
+/// `SET`（17。§8.11）・`CHARACTER STRING`（29。§8.21））。
+///
+/// DER ではこの 5 種は constructed が必須で primitive は不正、それ以外の
+/// universal 型（`BOOLEAN`・`INTEGER`・`NULL`・`OBJECT IDENTIFIER`・
+/// `BIT STRING`・`OCTET STRING`・各種文字列型・`UTCTime`／
+/// `GeneralizedTime` 等）は primitive が必須で constructed は不正となる
+/// （X.690 §10.2。BER が文字列型等に許す断片化 constructed 形は DER では
+/// 非該当）。予約済み・未定義の universal タグ番号も fail-closed に後者
+/// （primitive のみ）へ倒す。フィールドの意味は問わないため、universal
+/// クラスである限りタグ番号だけで判定できる（PR #1036 codex-review P2
+/// 指摘: 当初は SEQUENCE／SET のみを constructed 型として扱っていた）。
+fn universal_type_requires_constructed(tag_number: u8) -> bool {
+    matches!(tag_number, 0x08 | 0x0b | 0x10 | 0x11 | 0x1d)
+}
+
+/// `INTEGER`／`ENUMERATED` の値部分が DER の正規形（X.690 §8.3.2・§8.4）
+/// か。値は 1 バイト以上で、先頭 9 ビットがすべて 0 またはすべて 1 に
+/// なる冗長な先頭オクテットを持たないこと。
+fn is_minimal_integer(value: &[u8]) -> bool {
+    match value {
+        [] => false,
+        [first, second, ..] => {
+            !((*first == 0x00 && second & 0x80 == 0) || (*first == 0xff && second & 0x80 != 0))
+        }
+        [_] => true,
+    }
+}
+
+/// `OBJECT IDENTIFIER`／`RELATIVE-OID` の値部分（base-128 可変長サブ
+/// 識別子列）が整形式か（X.690 §8.19.2・§8.20.2）。空・サブ識別子先頭の
+/// `0x80`（非最小符号化）・継続ビット付きのまま終端（切り詰め）を拒否する。
+fn is_well_formed_oid(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let mut at_subidentifier_start = true;
+    for byte in value {
+        if at_subidentifier_start && *byte == 0x80 {
+            return false;
+        }
+        at_subidentifier_start = byte & 0x80 == 0;
+    }
+    at_subidentifier_start
 }
 
 /// 入力全体がちょうど 1 個のトップレベル TLV であり、かつ constructed な
 /// TLV の値部分が入れ子の TLV 列として整形式であることを、深さ上限
-/// `max_depth` 付きで検証する。あわせて、universal クラスのタグは
-/// `SEQUENCE`／`SET` を除き primitive でなければならないという DER の
-/// 制約（`ConstructedUniversalType`）と、`NULL`／`BOOLEAN` の正規形
-/// （`InvalidPrimitiveEncoding`）を、フィールドの意味を問わず入れ子の
-/// 深さ全体にわたって検証する。これ以外の primitive な値（`OCTET STRING`・
-/// `BIT STRING`・`INTEGER` 等）の中身の意味解釈には潜らない。
+/// `max_depth` 付きで検証する。あわせて、universal 型ごとの
+/// primitive/constructed の別（[`universal_type_requires_constructed`]。
+/// 違反は `ConstructedUniversalType`／`PrimitiveConstructedOnlyType`）と、
+/// `NULL`／`BOOLEAN`／`INTEGER`／`ENUMERATED`／`OBJECT IDENTIFIER`／
+/// `RELATIVE-OID` の正規形（`InvalidPrimitiveEncoding`）を、フィールドの
+/// 意味を問わず入れ子の深さ全体にわたって検証する。これ以外の primitive な
+/// 値（`OCTET STRING`・`BIT STRING`・文字列型等）の中身には潜らない
+/// （`BIT STRING` の形状はフィールドごとの拒否理由を保つため
+/// [`super::x509`] が検査する）。
 ///
 /// [`super::x509`] が本体パースの前段として呼び、構文が壊れた入力を
 /// フィールドごとの意味解釈に渡さないようにする。issuer/subject の
@@ -275,28 +316,32 @@ fn validate_tlv_contents(
 
     if is_universal_class {
         if is_constructed {
-            if !universal_type_allows_constructed(tag_number) {
+            if !universal_type_requires_constructed(tag_number) {
                 return Err(DerError::ConstructedUniversalType);
             }
         } else {
-            // 逆方向の制約: SEQUENCE（0x10）・SET（0x11）は常に constructed
-            // でなければならない。`universal_type_allows_constructed` が
-            // true を返すのはこの 2 種類のみなので、ここで primitive の
-            // まま現れていれば DER 違反として拒否する（例えば issuer/subject
-            // の RDN を表す SET を primitive の 0x11 に置き換えた不正 DER。
+            // 逆方向の制約: constructed 必須の型（SEQUENCE・SET・EXTERNAL・
+            // EMBEDDED PDV・CHARACTER STRING）が primitive のまま現れて
+            // いれば DER 違反として拒否する（例えば issuer/subject の RDN を
+            // 表す SET を primitive の 0x11 に置き換えた不正 DER。
             // PR #1036 codex-review P1 指摘）。
-            if universal_type_allows_constructed(tag_number) {
-                return Err(DerError::PrimitiveSequenceOrSet);
+            if universal_type_requires_constructed(tag_number) {
+                return Err(DerError::PrimitiveConstructedOnlyType);
             }
-            match tag_number {
-                // NULL（0x05）: 値は常に空でなければならない。
-                0x05 if !value.is_empty() => return Err(DerError::InvalidPrimitiveEncoding),
+            let canonical = match tag_number {
                 // BOOLEAN（0x01）: 値はちょうど 1 バイトで `0x00`（FALSE）
                 // または `0xFF`（TRUE。DER は TRUE を `0xFF` に限定する）。
-                0x01 if !matches!(value, [0x00] | [0xff]) => {
-                    return Err(DerError::InvalidPrimitiveEncoding);
-                }
-                _ => {}
+                0x01 => matches!(value, [0x00] | [0xff]),
+                // INTEGER（0x02）・ENUMERATED（0x0a）: 空でなく最小符号化。
+                0x02 | 0x0a => is_minimal_integer(value),
+                // NULL（0x05）: 値は常に空でなければならない。
+                0x05 => value.is_empty(),
+                // OBJECT IDENTIFIER（0x06）・RELATIVE-OID（0x0d）。
+                0x06 | 0x0d => is_well_formed_oid(value),
+                _ => true,
+            };
+            if !canonical {
+                return Err(DerError::InvalidPrimitiveEncoding);
             }
         }
     }
@@ -505,7 +550,7 @@ mod tests {
     fn validate_structure_accepts_constructed_sequence_and_set() {
         // SEQUENCE（0x30）・SET（0x31）はいずれも universal クラスだが
         // constructed が正しい表現であり拒否されない。
-        let der = [0x31, 0x02, 0x02, 0x00];
+        let der = [0x31, 0x03, 0x02, 0x01, 0x00];
         validate_structure(&der, MAX_DER_NESTING_DEPTH).expect("SET must remain constructed-ok");
     }
 
@@ -542,7 +587,7 @@ mod tests {
         // 符号化した不正 DER。
         let der = [0x30, 0x02, 0x10, 0x00];
         let err = validate_structure(&der, MAX_DER_NESTING_DEPTH).unwrap_err();
-        assert_eq!(err, DerError::PrimitiveSequenceOrSet);
+        assert_eq!(err, DerError::PrimitiveConstructedOnlyType);
     }
 
     #[test]
@@ -552,7 +597,80 @@ mod tests {
         // 想定。PR #1036 codex-review P1 指摘）。
         let der = [0x30, 0x02, 0x11, 0x00];
         let err = validate_structure(&der, MAX_DER_NESTING_DEPTH).unwrap_err();
-        assert_eq!(err, DerError::PrimitiveSequenceOrSet);
+        assert_eq!(err, DerError::PrimitiveConstructedOnlyType);
+    }
+
+    // X.690 が constructed を必須とする universal 型（EXTERNAL・EMBEDDED PDV・
+    // CHARACTER STRING）は constructed で受理し primitive で拒否する
+    // （PR #1036 codex-review P2 指摘の回帰）。
+    #[test]
+    fn validate_structure_accepts_constructed_only_types_and_rejects_their_primitive_form() {
+        for tag_number in [0x08u8, 0x0b, 0x1d] {
+            let constructed = [0x30, 0x05, 0x20 | tag_number, 0x03, 0x02, 0x01, 0x00];
+            validate_structure(&constructed, MAX_DER_NESTING_DEPTH)
+                .unwrap_or_else(|e| panic!("constructed tag {tag_number:#x} rejected: {e:?}"));
+            let primitive = [0x30, 0x02, tag_number, 0x00];
+            assert_eq!(
+                validate_structure(&primitive, MAX_DER_NESTING_DEPTH).unwrap_err(),
+                DerError::PrimitiveConstructedOnlyType,
+                "primitive tag {tag_number:#x}"
+            );
+        }
+        // constructed 必須型の内側にも DER 制約が及ぶ（非正規 BOOLEAN）。
+        let nested_invalid = [0x30, 0x05, 0x28, 0x03, 0x01, 0x01, 0x01];
+        assert_eq!(
+            validate_structure(&nested_invalid, MAX_DER_NESTING_DEPTH).unwrap_err(),
+            DerError::InvalidPrimitiveEncoding
+        );
+    }
+
+    #[test]
+    fn validate_structure_rejects_constructed_primitive_only_types() {
+        // 文字列型・BIT STRING・OCTET STRING・INTEGER 等と、予約済みの
+        // universal タグ番号（0x0e・0x0f）は constructed を拒否する。
+        for tag_number in [
+            0x01u8, 0x02, 0x03, 0x04, 0x06, 0x0c, 0x0e, 0x0f, 0x13, 0x16, 0x17,
+        ] {
+            let der = [0x30, 0x02, 0x20 | tag_number, 0x00];
+            assert_eq!(
+                validate_structure(&der, MAX_DER_NESTING_DEPTH).unwrap_err(),
+                DerError::ConstructedUniversalType,
+                "constructed tag {tag_number:#x}"
+            );
+        }
+    }
+
+    // INTEGER／ENUMERATED の最小符号化・OID／RELATIVE-OID の整形式性を、
+    // フィールドの意味を問わず全階層で検査する。
+    #[test]
+    fn validate_structure_checks_integer_and_oid_canonical_form() {
+        for ok in [
+            &[0x30, 0x03, 0x02, 0x01, 0x00][..],
+            &[0x30, 0x04, 0x02, 0x02, 0x00, 0x80],
+            &[0x30, 0x04, 0x02, 0x02, 0xff, 0x7f],
+            &[0x30, 0x03, 0x0a, 0x01, 0x05],
+            &[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70],
+            &[0x30, 0x04, 0x0d, 0x02, 0x81, 0x00],
+        ] {
+            validate_structure(ok, MAX_DER_NESTING_DEPTH)
+                .unwrap_or_else(|e| panic!("{ok:02x?} rejected: {e:?}"));
+        }
+        for bad in [
+            &[0x30, 0x02, 0x02, 0x00][..],
+            &[0x30, 0x04, 0x02, 0x02, 0x00, 0x7f],
+            &[0x30, 0x04, 0x02, 0x02, 0xff, 0x80],
+            &[0x30, 0x04, 0x0a, 0x02, 0x00, 0x01],
+            &[0x30, 0x02, 0x06, 0x00],
+            &[0x30, 0x04, 0x06, 0x02, 0x80, 0x01],
+            &[0x30, 0x04, 0x06, 0x02, 0x2b, 0x81],
+            &[0x30, 0x03, 0x0d, 0x01, 0x80],
+        ] {
+            assert_eq!(
+                validate_structure(bad, MAX_DER_NESTING_DEPTH).unwrap_err(),
+                DerError::InvalidPrimitiveEncoding,
+                "{bad:02x?}"
+            );
+        }
     }
 
     #[test]

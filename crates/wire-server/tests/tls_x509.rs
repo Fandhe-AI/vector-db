@@ -104,8 +104,17 @@ fn utc_time(text: &str) -> Vec<u8> {
 }
 
 fn empty_name() -> Vec<u8> {
-    // RDNSequence ::= SEQUENCE OF RelativeDistinguishedName（0 個も許容）。
+    // RDNSequence ::= SEQUENCE OF RelativeDistinguishedName（0 個）。
+    // subject では許容される（RFC 5280 §4.1.2.6）が、issuer では拒否される
+    // （RFC 5280 §4.1.2.4）ため subject 位置専用。
     sequence(&[])
+}
+
+/// テスト専用: issuer 用の空でない Name（`CN=test-issuer` の 1 RDN）。
+/// RFC 5280 §4.1.2.4 は issuer に空でない DN を要求する。
+fn issuer_name() -> Vec<u8> {
+    let common_name = sequence(&[&tlv(0x06, &[0x55, 0x04, 0x03]), &tlv(0x0c, b"test-issuer")]);
+    sequence(&[&tlv(0x31, &common_name)])
 }
 
 /// テスト専用: `version [0] EXPLICIT INTEGER 2` を組み立てる。
@@ -133,7 +142,7 @@ fn build_ed25519_leaf_certificate_der(
         &version_v3(),
         &tlv(0x02, &[0x01]), // serialNumber = 1
         &signature_algorithm,
-        &empty_name(), // issuer
+        &issuer_name(), // issuer
         &validity,
         &empty_name(), // subject
         &spki,
@@ -170,7 +179,7 @@ fn build_ed25519_leaf_certificate_der_with_serial(
         &version_v3(),
         &tlv(0x02, serial),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -484,7 +493,7 @@ fn version_v1_without_explicit_tag_is_rejected() {
         // version を省略（v1）。
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -523,7 +532,7 @@ fn version_v2_integer_1_is_rejected() {
         &version_v2,
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -565,7 +574,7 @@ fn tbs_signature_mismatch_with_outer_signature_algorithm_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &tbs_signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -609,7 +618,7 @@ fn empty_algorithm_identifier_matching_on_both_sides_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &empty_algorithm_identifier,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -655,7 +664,7 @@ fn algorithm_identifier_with_trailing_excess_element_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &algorithm_identifier_with_excess,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -695,7 +704,7 @@ fn signature_value_with_no_signature_data_after_unused_bits_octet_is_rejected() 
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -735,7 +744,7 @@ fn signature_value_with_nonzero_unused_bits_and_nonzero_padding_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -777,7 +786,7 @@ fn signature_value_with_nonzero_unused_bits_and_zero_padding_is_accepted() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -814,7 +823,7 @@ fn algorithm_identifier_with_malformed_oid_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &malformed_oid_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -854,7 +863,7 @@ fn spki_with_parameters_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -892,7 +901,7 @@ fn spki_bit_string_unused_bits_nonzero_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -931,7 +940,7 @@ fn spki_key_length_31_and_33_are_rejected() {
             &version_v3(),
             &tlv(0x02, &[0x01]),
             &signature_algorithm,
-            &empty_name(),
+            &issuer_name(),
             &validity,
             &empty_name(),
             &spki,
@@ -1124,7 +1133,7 @@ fn intermediate_spki_algorithm_identifier_with_trailing_excess_element_is_reject
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -1171,7 +1180,7 @@ fn intermediate_spki_algorithm_identifier_with_truncated_oid_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -1260,7 +1269,7 @@ fn subject_name_with_rdn_encoded_as_sequence_instead_of_set_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &subject_with_rdn_as_sequence,
         &spki,
@@ -1306,7 +1315,7 @@ fn extensions_wrapper_with_trailing_data_is_rejected() {
         &version_v3(),
         &tlv(0x02, &[0x01]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -1432,8 +1441,8 @@ fn extensions_with_valid_extension_syntax_are_accepted() {
     ]
     .concat();
     assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
-        &empty_name(),
-        &empty_name(),
+        &issuer_name(),
+        &issuer_name(),
         Some(&extensions_field_from_bodies(&[&omitted, &critical_true])),
     ));
 
@@ -1444,8 +1453,8 @@ fn extensions_with_valid_extension_syntax_are_accepted() {
     ]
     .concat();
     assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
-        &empty_name(),
-        &empty_name(),
+        &issuer_name(),
+        &issuer_name(),
         Some(&extensions_field_from_bodies(&[&critical_false])),
     ));
 }
@@ -1499,8 +1508,8 @@ fn extension_with_invalid_internal_syntax_is_rejected() {
         // 不正な Extension が単独でも、正当な Extension の後ろに続いても拒否される。
         for bodies in [vec![body.as_slice()], vec![valid_first.as_slice(), &body]] {
             let der = build_ed25519_leaf_with_names_and_extensions(
-                &empty_name(),
-                &empty_name(),
+                &issuer_name(),
+                &issuer_name(),
                 Some(&extensions_field_from_bodies(&bodies)),
             );
             let err = ServerCertificateChain::from_der_chain(
@@ -1564,7 +1573,7 @@ fn multi_valued_rdn_in_descending_order_is_rejected() {
         None,
     ));
     assert_leaf_rejected_as_malformed(build_ed25519_leaf_with_names_and_extensions(
-        &empty_name(),
+        &issuer_name(),
         &reversed,
         None,
     ));
@@ -1605,7 +1614,7 @@ fn build_x25519_intermediate_with_spki_bit_string(spki_bit_string_value: &[u8]) 
         &version_v3(),
         &tlv(0x02, &[0x02]),
         &signature_algorithm,
-        &empty_name(),
+        &issuer_name(),
         &validity,
         &empty_name(),
         &spki,
@@ -1688,7 +1697,7 @@ fn leaf_spki_bit_string_with_invalid_shape_is_rejected_as_invalid_public_key() {
             &version_v3(),
             &tlv(0x02, &[0x01]),
             &signature_algorithm,
-            &empty_name(),
+            &issuer_name(),
             &validity,
             &empty_name(),
             &spki,
@@ -1715,6 +1724,148 @@ fn leaf_spki_bit_string_with_invalid_shape_is_rejected_as_invalid_public_key() {
             "{value:02x?}"
         );
     }
+}
+
+#[test]
+fn empty_issuer_name_is_rejected_and_empty_subject_is_accepted() {
+    // RFC 5280 §4.1.2.4: issuer は空でない DN を含まなければならない
+    // （PR #1036 codex-review P1 指摘: 従来は RDN 0 個の issuer を受理していた）。
+    assert_leaf_rejected_as_malformed(build_ed25519_leaf_with_names_and_extensions(
+        &empty_name(),
+        &empty_name(),
+        None,
+    ));
+    // 中間証明書（index 1）でも同じく拒否される。
+    let intermediate_with_empty_issuer = {
+        let signature_algorithm = ed25519_algorithm_identifier();
+        let mut spki_bits = vec![0x00u8];
+        spki_bits.extend_from_slice(&[0x5a; 32]);
+        let spki = sequence(&[
+            &sequence(&[&tlv(0x06, &OID_X25519_BYTES)]),
+            &tlv(0x03, &spki_bits),
+        ]);
+        let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+        let tbs_certificate = sequence(&[
+            &version_v3(),
+            &tlv(0x02, &[0x02]),
+            &signature_algorithm,
+            &empty_name(), // issuer（空）
+            &validity,
+            &issuer_name(), // subject
+            &spki,
+        ]);
+        let mut signature_bits = vec![0x00u8];
+        signature_bits.extend_from_slice(&[0u8; 64]);
+        sequence(&[
+            &tbs_certificate,
+            &signature_algorithm,
+            &tlv(0x03, &signature_bits),
+        ])
+    };
+    let err = leaf_and_intermediate_result(intermediate_with_empty_issuer).unwrap_err();
+    assert_eq!(
+        err,
+        CertificateChainError::Certificate {
+            index: 1,
+            error: X509Error::Malformed
+        }
+    );
+    // subject は SAN のみで主体を表す場合に空を許される（RFC 5280 §4.1.2.6）
+    // ため、空の subject と空でない issuer の組は受理する。
+    assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
+        &issuer_name(),
+        &empty_name(),
+        None,
+    ));
+}
+
+#[test]
+fn duplicate_extension_ids_are_rejected() {
+    // RFC 5280 §4.2: 同一 extnID の拡張を複数含めてはならない。critical の
+    // 有無・extnValue が異なっても extnID が同じなら重複として拒否する。
+    let first = [OID_KEY_USAGE_TLV.as_slice(), &octet_string_extn_value()].concat();
+    let second = [
+        OID_KEY_USAGE_TLV.as_slice(),
+        &CRITICAL_TRUE_TLV,
+        &tlv(0x04, &[0x05, 0x00]),
+    ]
+    .concat();
+    let other = [
+        OID_BASIC_CONSTRAINTS_TLV.as_slice(),
+        &tlv(0x04, &sequence(&[])),
+    ]
+    .concat();
+    assert_leaf_rejected_as_malformed(build_ed25519_leaf_with_names_and_extensions(
+        &issuer_name(),
+        &empty_name(),
+        Some(&extensions_field_from_bodies(&[&first, &other, &second])),
+    ));
+    // 異なる extnID の組は受理する。
+    assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
+        &issuer_name(),
+        &empty_name(),
+        Some(&extensions_field_from_bodies(&[&first, &other])),
+    ));
+}
+
+#[test]
+fn constructed_only_universal_type_in_name_value_follows_x690() {
+    // AttributeTypeAndValue の value（ANY）に EXTERNAL（tag 8）を置く。
+    // X.690 上 EXTERNAL は constructed 必須のため、constructed（0x28）は
+    // 受理し primitive（0x08）は拒否する（PR #1036 codex-review P2 指摘）。
+    let name_with_value = |value: &[u8]| {
+        let atv = sequence(&[&tlv(0x06, &[0x55, 0x04, 0x03]), value]);
+        sequence(&[&tlv(0x31, &atv)])
+    };
+    let constructed_external = tlv(0x28, &tlv(0x02, &[0x01]));
+    assert_leaf_accepted(build_ed25519_leaf_with_names_and_extensions(
+        &issuer_name(),
+        &name_with_value(&constructed_external),
+        None,
+    ));
+    let primitive_external = tlv(0x08, &[0x02, 0x01, 0x01]);
+    assert_leaf_rejected_as_malformed(build_ed25519_leaf_with_names_and_extensions(
+        &issuer_name(),
+        &name_with_value(&primitive_external),
+        None,
+    ));
+    // 文字列型の constructed（BER の断片化形）は引き続き拒否する。
+    let constructed_utf8 = tlv(0x2c, &tlv(0x0c, b"a"));
+    assert_leaf_rejected_as_malformed(build_ed25519_leaf_with_names_and_extensions(
+        &issuer_name(),
+        &name_with_value(&constructed_utf8),
+        None,
+    ));
+}
+
+#[test]
+fn non_canonical_integer_in_algorithm_parameters_is_rejected() {
+    // AlgorithmIdentifier の parameters（ANY）内の INTEGER も DER の最小
+    // 符号化を満たさなければならない（意味を解釈しない値の内側にも DER
+    // 制約を及ぼす）。ここでは外側・tbs 両方の signature に同じ値を置く。
+    let with_params =
+        |integer: &[u8]| sequence(&[&tlv(0x06, &OID_ED25519_BYTES), &tlv(0x02, integer)]);
+    let build = |algorithm: &[u8]| {
+        let mut spki_bits = vec![0x00u8];
+        spki_bits.extend_from_slice(&RFC8410_10_1_ED25519_PUBLIC_KEY);
+        let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+        let validity = sequence(&[&utc_time("160801121924Z"), &utc_time("401231235959Z")]);
+        let tbs_certificate = sequence(&[
+            &version_v3(),
+            &tlv(0x02, &[0x01]),
+            algorithm,
+            &issuer_name(),
+            &validity,
+            &empty_name(),
+            &spki,
+        ]);
+        let mut signature_bits = vec![0x00u8];
+        signature_bits.extend_from_slice(&[0u8; 64]);
+        sequence(&[&tbs_certificate, algorithm, &tlv(0x03, &signature_bits)])
+    };
+    assert_leaf_accepted(build(&with_params(&[0x00, 0x80])));
+    assert_leaf_rejected_as_malformed(build(&with_params(&[0x00, 0x7f])));
+    assert_leaf_rejected_as_malformed(build(&with_params(&[])));
 }
 
 #[test]

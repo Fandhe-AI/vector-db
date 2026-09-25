@@ -24,8 +24,9 @@
 //!   本サーバーが自己整合性チェックとして検証するのは #961 の
 //!   `CertificateVerify` 用の鍵一致のみ）
 //! - SAN・ホスト名・keyUsage・basicConstraints 等 extensions の意味解釈
-//!   （各 `Extension` の `extnID`／`critical`／`extnValue` の構文までは
-//!   検査するが、`extnValue` の中身は解釈しない）
+//!   （各 `Extension` の `extnID`／`critical`／`extnValue` の構文と
+//!   `extnID` の重複までは検査するが、`extnValue` の中身は解釈しない。
+//!   空の subject と subjectAltName の整合も検査しない）
 //! - issuer/subject `Name` の属性値の意味解釈（`RDNSequence`・`SET OF`
 //!   の DER 順序・`AttributeTypeAndValue` の構文までは検査する）
 //! - 中間証明書どうしの issuer/subject 連結検査・パス構築（RFC 8446
@@ -44,10 +45,11 @@
 //!    signature → issuer → validity → subject → subjectPublicKeyInfo →
 //!    任意の unique ID／extensions）。version は v3 のみ、serialNumber は
 //!    正の整数・20 オクテット以下・最小符号化、issuer/subject は
-//!    `RDNSequence` の構文と `SET OF` の DER 順序、SPKI は
-//!    AlgorithmIdentifier の構造（OID の整形式性・parameters 高々 1 個）、
-//!    unique ID は BIT STRING の形状、extensions は wrapper と各
-//!    `Extension` の構文を検査する
+//!    `RDNSequence` の構文と `SET OF` の DER 順序（issuer は空を拒否）、
+//!    SPKI は AlgorithmIdentifier の構造（OID の整形式性・parameters
+//!    高々 1 個）と subjectPublicKey BIT STRING の形状、unique ID は
+//!    BIT STRING の形状、extensions は wrapper と各 `Extension` の構文・
+//!    `extnID` の重複を検査する
 //! 5. `tbsCertificate.signature` の AlgorithmIdentifier 構造検査と、外側
 //!    `signatureAlgorithm` との DER バイト列一致（RFC 5280 §4.1.1.2）
 //! 6. `signatureValue` BIT STRING の形状検査（未使用ビット数 0〜7・
@@ -358,9 +360,10 @@ fn validate_oid_content(oid: &[u8]) -> Result<(), X509Error> {
 /// 値だけに置き換えた不正 DER が issuer/subject Name として受理されて
 /// しまっていた（PR #1036 codex-review P1 指摘）。値（`value ANY`）の
 /// 意味・文字列型としての妥当性は解釈しない（モジュール doc
-/// 「スコープ外」参照）。RDNSequence が 0 個の RelativeDistinguishedName
-/// を持つこと（空の Name。本モジュールのテストフィクスチャが使う形）は
-/// RFC 5280 上も許容されるため受理する。
+/// 「スコープ外」参照）。本関数は RDNSequence が 0 個の
+/// RelativeDistinguishedName を持つこと（空の Name）を構文上は受理し、
+/// 空を許すかどうかはフィールドごとに呼び出し元が判定する（issuer は
+/// [`parse_certificate`] で空を拒否し、subject は空を許容する）。
 ///
 /// あわせて、`RelativeDistinguishedName` は `SET OF` であるため、DER
 /// （X.690 §11.6）が要求する「各要素の符号化バイト列の昇順」も検査し、
@@ -483,11 +486,20 @@ fn validate_extensions_wrapper(wrapper_value: &[u8]) -> Result<(), X509Error> {
         // （extensions フィールド自体を省略すべきケース）。
         return Err(X509Error::Malformed);
     }
+    let mut extn_ids: Vec<&[u8]> = Vec::new();
     while !extensions_reader.is_empty() {
         let extension_value = extensions_reader
             .read_expected(TAG_SEQUENCE)
             .map_err(|_| X509Error::Malformed)?;
-        validate_extension_syntax(extension_value)?;
+        extn_ids.push(validate_extension_syntax(extension_value)?);
+    }
+    // RFC 5280 §4.2: 同一 extnID の拡張を 2 個以上含めてはならない（MUST
+    // NOT）。意味は解釈しないが、重複は OID のバイト列一致だけで判定できる
+    // ため fail-closed に拒否する。要素数は証明書 DER 長の上限
+    // （MAX_CERTIFICATE_DER_LEN）で有界であり、整列による判定で足りる。
+    extn_ids.sort_unstable();
+    if extn_ids.windows(2).any(|pair| pair.first() == pair.get(1)) {
+        return Err(X509Error::Malformed);
     }
     Ok(())
 }
@@ -507,8 +519,9 @@ fn validate_extensions_wrapper(wrapper_value: &[u8]) -> Result<(), X509Error> {
 /// 公開テストベクタである RFC 8410 §10.2 の証明書自身が `critical`
 /// FALSE を明示符号化しており、主要な TLS 実装もこの形を受理するため、
 /// ここで拒否すると正当な中間証明書を起動時に弾いてしまう。`extnValue`
-/// の中身（各拡張固有の構造）は解釈しない。
-fn validate_extension_syntax(extension_value: &[u8]) -> Result<(), X509Error> {
+/// の中身（各拡張固有の構造）は解釈しない。検査に通れば、呼び出し元の
+/// 重複検査のために `extnID` の値部分を返す。
+fn validate_extension_syntax(extension_value: &[u8]) -> Result<&[u8], X509Error> {
     let mut reader = DerReader::new(extension_value);
     let extn_id = reader
         .read_expected(TAG_OID)
@@ -522,7 +535,8 @@ fn validate_extension_syntax(extension_value: &[u8]) -> Result<(), X509Error> {
     reader
         .read_expected(TAG_OCTET_STRING)
         .map_err(|_| X509Error::Malformed)?;
-    reader.expect_end().map_err(|_| X509Error::Malformed)
+    reader.expect_end().map_err(|_| X509Error::Malformed)?;
+    Ok(extn_id)
 }
 
 /// パース手順（モジュール doc 参照）に従い 1 個の証明書 DER を検査する。
@@ -594,6 +608,12 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
         .read_expected(TAG_SEQUENCE)
         .map_err(|_| X509Error::Malformed)?;
     validate_name_structure(issuer_value)?;
+    // RFC 5280 §4.1.2.4: issuer は空でない DN を含まなければならない
+    // （MUST）。RDN が 0 個の空の issuer は fail-closed に拒否する
+    // （PR #1036 codex-review P1 指摘）。
+    if issuer_value.is_empty() {
+        return Err(X509Error::Malformed);
+    }
 
     // validity SEQUENCE { notBefore Time, notAfter Time }。
     let validity_body = tbs
@@ -614,6 +634,12 @@ fn parse_certificate(der_bytes: &[u8]) -> Result<ParsedCertificate, X509Error> {
     let subject_value = tbs
         .read_expected(TAG_SEQUENCE)
         .map_err(|_| X509Error::Malformed)?;
+    // subject は issuer と異なり空（RDN 0 個）を拒否しない。RFC 5280
+    // §4.1.2.6 は、主体の識別名を subjectAltName 拡張だけで表す場合に
+    // subject を空の SEQUENCE とすることを認めている（その場合 SAN は
+    // critical でなければならない）。本モジュールは extensions の意味を
+    // 解釈しない（モジュール doc「スコープ外」）ため、SAN の有無・critical
+    // との整合は検査せず、構文として正当な空の subject をそのまま受理する。
     validate_name_structure(subject_value)?;
 
     // subjectPublicKeyInfo SEQUENCE { AlgorithmIdentifier, BIT STRING }。
