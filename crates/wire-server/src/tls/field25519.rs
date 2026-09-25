@@ -217,16 +217,14 @@ impl Fe {
         r
     }
 
-    /// `self^(p-2) ≡ self^-1`（mod p。フェルマーの小定理）。
-    ///
-    /// 254 回の平方・11 回の乗算からなる固定長の加算連鎖（curve25519 系
-    /// 実装で公知の手法）で計算し、`self` の値に依存する分岐・ループ回数
-    /// を一切持たない。`self == 0` の場合は数学的に逆元が存在しないが、
-    /// 本関数は `0^(p-2) mod p == 0` を返す（分岐なし）。呼び出し元
-    /// （[`super::x25519`] の ladder 最終段）は Z 座標が 0 になり得る
-    /// 入力（低次点）を別途 all-zero 判定で拒否するため、ここでの `0`
-    /// 出力自体が安全性を損なうことはない。
-    pub(crate) fn invert(&self) -> Fe {
+    /// `self^(2^250-1)` と、その途中で得られる `self^11` を返す共有の
+    /// 固定長加算連鎖（curve25519 系実装で公知の手法。254 回中 244 回分の
+    /// 平方・11 回の乗算はここに集約する）。[`Fe::invert`]（`^(p-2)`）と
+    /// [`Fe::pow_p58`]（`^((p-5)/8) = ^(2^252-3)`）はいずれも
+    /// `2^252-3 = (2^250-1)*4+1`・`p-2 = (2^250-1)*32+11` という関係で
+    /// この連鎖の続きから導けるため重複させない。`self` の値に依存する
+    /// 分岐・ループ回数を一切持たない。
+    fn pow_2_250_minus_1_and_11(&self) -> (Fe, Fe) {
         let z1 = *self;
         let z2 = z1.square();
         let z8 = z2.square().square();
@@ -240,9 +238,37 @@ impl Fe {
         let z_50_10 = z_40_20.pow2k(10).mul(&z_10_5);
         let z_100_50 = z_50_10.pow2k(50).mul(&z_50_10);
         let z_200_100 = z_100_50.pow2k(100).mul(&z_100_50);
-        let z_250_50 = z_200_100.pow2k(50).mul(&z_50_10);
-        let z_255_5 = z_250_50.pow2k(5);
-        z_255_5.mul(&z11)
+        let z_250_0 = z_200_100.pow2k(50).mul(&z_50_10);
+        (z_250_0, z11)
+    }
+
+    /// `self^(p-2) ≡ self^-1`（mod p。フェルマーの小定理）。
+    ///
+    /// [`Fe::pow_2_250_minus_1_and_11`] の連鎖の続き（5 回の平方＋1 回の
+    /// 乗算）だけを追加する。`self` の値に依存する分岐・ループ回数を
+    /// 一切持たない。`self == 0` の場合は数学的に逆元が存在しないが、
+    /// 本関数は `0^(p-2) mod p == 0` を返す（分岐なし）。呼び出し元
+    /// （[`super::x25519`] の ladder 最終段）は Z 座標が 0 になり得る
+    /// 入力（低次点）を別途 all-zero 判定で拒否するため、ここでの `0`
+    /// 出力自体が安全性を損なうことはない。
+    pub(crate) fn invert(&self) -> Fe {
+        let (z_250_0, z11) = self.pow_2_250_minus_1_and_11();
+        z_250_0.pow2k(5).mul(&z11)
+    }
+
+    /// `self^((p-5)/8) = self^(2^252-3)`（Ed25519 の点復元（RFC 8032
+    /// §5.1.3）が平方根候補の算出に使う指数）。[`Fe::pow_2_250_minus_1_and_11`]
+    /// の連鎖の続き（2 回の平方＋1 回の乗算）だけを追加し、`invert` と
+    /// 同じく `self` の値に依存する分岐を持たない。`self == 0` の場合は
+    /// `0` を返す（分岐なし。呼び出し元の [`super::ed25519`] は復元結果を
+    /// 平方判定で必ず検証するため、ここでの `0` 出力自体が安全性を
+    /// 損なうことはない）。
+    ///
+    /// 自己整合性: `x != 0` のとき `pow_p58(x).pow2k(3).mul(&x.mul(&x.square().square()))
+    /// == x`（フェルマーの小定理 `x^p ≡ x`。単体テストで固定）。
+    pub(crate) fn pow_p58(&self) -> Fe {
+        let (z_250_0, _) = self.pow_2_250_minus_1_and_11();
+        z_250_0.pow2k(2).mul(self)
     }
 
     /// `choice`（0 または 1）に応じて `a` と `b` を定数時間で入れ替える。
@@ -256,6 +282,48 @@ impl Fe {
             *ai ^= t;
             *bi ^= t;
         }
+    }
+
+    /// `0 - self`（加法逆元。mod p）。
+    pub(crate) fn neg(&self) -> Fe {
+        Fe::ZERO.sub(self)
+    }
+
+    /// `choice`（0 または 1）に応じて `a`（0）または `b`（1）を定数時間で
+    /// 選ぶ。[`Fe::cswap`] と同じマスク方式（[`super::ed25519`] の
+    /// 256 回固定 double-and-add-always ladder が使う）。
+    pub(crate) fn select(a: &Fe, b: &Fe, choice: u64) -> Fe {
+        let mask = 0u64.wrapping_sub(choice);
+        let mut out = [0u64; 5];
+        for ((o, ai), bi) in out.iter_mut().zip(a.0.iter()).zip(b.0.iter()) {
+            *o = ai ^ (mask & (ai ^ bi));
+        }
+        Fe(out)
+    }
+
+    /// 完全正準化した表現どうしのバイト列比較（`self == other`）。
+    /// 呼び出し元（[`super::ed25519`] の点復元・検証）はいずれも公開値
+    /// （圧縮点のデコード結果）に対してのみ使うため、定数時間性は要求
+    /// しない（[`super::hkdf::ct_eq`] は秘密値専用に別途ある）。
+    pub(crate) fn equals(&self, other: &Fe) -> bool {
+        self.to_bytes() == other.to_bytes()
+    }
+
+    /// 完全正準化した表現の最下位ビット（RFC 8032 §5.1.2 の圧縮エンコード
+    /// が使う x 座標の偶奇）。公開値専用。
+    pub(crate) fn is_negative(&self) -> u8 {
+        self.to_bytes()[0] & 1
+    }
+
+    /// 内部 limb を best-effort でゼロ化する（`unsafe` を使わないため
+    /// 最適化による消去省略の保証はない。[`super::hkdf::zeroize`] と
+    /// 同じ限界。[`super::ed25519`] のスカラー乗算中間点・鍵展開の
+    /// 一時値が使う）。
+    pub(crate) fn zeroize(&mut self) {
+        for limb in self.0.iter_mut() {
+            *limb = 0;
+        }
+        std::hint::black_box(&self.0);
     }
 
     /// limb を 2^51 未満（＋わずかな繰り上がり余地）へ 1 回だけ畳み込む。
@@ -278,6 +346,45 @@ impl Fe {
         c = self.0[4] >> LIMB_BITS;
         self.0[4] &= MASK51;
         self.0[0] += c * REDUCE19;
+    }
+}
+
+/// Ed25519 の Edwards 曲線パラメータ `d = -121665/121666 mod p`（RFC 8032
+/// §5.1）の 32 バイトリトルエンディアン表現。[`super::ed25519`] の点演算が
+/// 使う。値は `d*121666+121665 ≡ 0 (mod p)` を単体テストで確認する（公開
+/// 定数であり計算過程は秘密に依存しない）。
+const D_BYTES: [u8; 32] = [
+    0xa3, 0x78, 0x59, 0x13, 0xca, 0x4d, 0xeb, 0x75, 0xab, 0xd8, 0x41, 0x41, 0x4d, 0x0a, 0x70, 0x00,
+    0x98, 0xe8, 0x79, 0x77, 0x79, 0x40, 0xc7, 0x8c, 0x73, 0xfe, 0x6f, 0x2b, 0xee, 0x6c, 0x03, 0x52,
+];
+
+/// `2*d mod p`。統一加算式（[`super::ed25519`]）が使う。
+const D2_BYTES: [u8; 32] = [
+    0x59, 0xf1, 0xb2, 0x26, 0x94, 0x9b, 0xd6, 0xeb, 0x56, 0xb1, 0x83, 0x82, 0x9a, 0x14, 0xe0, 0x00,
+    0x30, 0xd1, 0xf3, 0xee, 0xf2, 0x80, 0x8e, 0x19, 0xe7, 0xfc, 0xdf, 0x56, 0xdc, 0xd9, 0x06, 0x24,
+];
+
+/// `sqrt(-1) mod p`（`p ≡ 5 (mod 8)` のため存在する）。点復元
+/// （RFC 8032 §5.1.3）が平方根の 2 通りの候補を切り替えるのに使う。
+const SQRT_M1_BYTES: [u8; 32] = [
+    0xb0, 0xa0, 0x0e, 0x4a, 0x27, 0x1b, 0xee, 0xc4, 0x78, 0xe4, 0x2f, 0xad, 0x06, 0x18, 0x43, 0x2f,
+    0xa7, 0xd7, 0xfb, 0x3d, 0x99, 0x00, 0x4d, 0x2b, 0x0b, 0xdf, 0xc1, 0x4f, 0x80, 0x24, 0x83, 0x2b,
+];
+
+impl Fe {
+    /// Edwards 曲線パラメータ `d`。
+    pub(crate) fn d() -> Fe {
+        Fe::from_bytes(&D_BYTES)
+    }
+
+    /// `2d`。
+    pub(crate) fn d2() -> Fe {
+        Fe::from_bytes(&D2_BYTES)
+    }
+
+    /// `sqrt(-1) mod p`。
+    pub(crate) fn sqrt_m1() -> Fe {
+        Fe::from_bytes(&SQRT_M1_BYTES)
     }
 }
 
@@ -432,5 +539,69 @@ mod tests {
         Fe::cswap(&mut a, &mut b, 1);
         assert_eq!(a.to_bytes(), Fe::from_u64(2).to_bytes());
         assert_eq!(b.to_bytes(), Fe::from_u64(1).to_bytes());
+    }
+
+    #[test]
+    fn neg_is_additive_inverse() {
+        let a = Fe::from_u64(12345);
+        let sum = a.add(&a.neg());
+        assert_eq!(sum.to_bytes(), Fe::ZERO.to_bytes());
+    }
+
+    #[test]
+    fn select_picks_a_or_b_by_choice() {
+        let a = Fe::from_u64(7);
+        let b = Fe::from_u64(9);
+        assert_eq!(Fe::select(&a, &b, 0).to_bytes(), a.to_bytes());
+        assert_eq!(Fe::select(&a, &b, 1).to_bytes(), b.to_bytes());
+    }
+
+    #[test]
+    fn equals_matches_only_identical_values() {
+        assert!(Fe::from_u64(3).equals(&Fe::from_u64(3)));
+        assert!(!Fe::from_u64(3).equals(&Fe::from_u64(4)));
+    }
+
+    #[test]
+    fn zeroize_clears_all_limbs() {
+        let mut a = Fe::from_u64(0xdead_beef);
+        a.zeroize();
+        assert_eq!(a.to_bytes(), [0u8; 32]);
+    }
+
+    // 転記ミスの検出用: d が Ed25519 の定義式 d = -121665/121666 mod p を
+    // 満たすこと（d*121666 + 121665 ≡ 0）、d2 == d+d、sqrt(-1)^2 == -1 を
+    // 独立に確認する（RFC 8032 §5.1 は公開情報。値の導出方法自体は転記せず、
+    // 満たすべき代数的関係のみを検証する）。
+    #[test]
+    fn curve_constants_satisfy_their_defining_relations() {
+        let d = Fe::d();
+        let lhs = d.mul(&Fe::from_u64(121666)).add(&Fe::from_u64(121665));
+        assert_eq!(lhs.to_bytes(), Fe::ZERO.to_bytes());
+
+        assert_eq!(Fe::d2().to_bytes(), d.add(&d).to_bytes());
+
+        let sqrt_m1 = Fe::sqrt_m1();
+        let neg_one = Fe::ZERO.sub(&Fe::ONE);
+        assert_eq!(sqrt_m1.square().to_bytes(), neg_one.to_bytes());
+    }
+
+    #[test]
+    fn pow_p58_matches_invert_derived_identity() {
+        // x^p ≡ x (mod p)（フェルマーの小定理。x != 0）であり、
+        // p = 8*(2^252-3) + 24 - 19 = 8*pow_p58指数 + 5 なので
+        // pow_p58(x)^8 * x^5 == x になる。
+        for seed in [9u64, 2, 12345, 999999937] {
+            let x = Fe::from_u64(seed);
+            let p58 = x.pow_p58();
+            let x5 = x.square().square().mul(&x);
+            let lhs = p58.pow2k(3).mul(&x5);
+            assert_eq!(lhs.to_bytes(), x.to_bytes(), "seed={seed}");
+        }
+    }
+
+    #[test]
+    fn pow_p58_of_zero_is_zero() {
+        assert_eq!(Fe::ZERO.pow_p58().to_bytes(), [0u8; 32]);
     }
 }
