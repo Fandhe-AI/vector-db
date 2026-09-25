@@ -68,6 +68,15 @@ const ENUM_TYPES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("enu
 /// （`docs/design/column-type-extension.md` 参照）。
 const CATALOG_FORMAT_VERSION_LINE: &str = "v2";
 
+/// カタログ v3（TABLE-19・TASK-203、Issue #901）: `ALTER TABLE ... DROP COLUMN`
+/// により削除された列（墓標。[`DroppedSlot`]）を 1 つ以上持つスキーマ専用の
+/// フォーマット。墓標を持たないスキーマは従来どおり v2 で書き（バイト列不変。
+/// 既存のゴールデンテストに影響しない）、墓標が 1 つでもあるスキーマだけが
+/// このバージョンで書かれる（[`encode_schema`]）。列 1 行あたり
+/// `name:tag:param:nullable:state`（`state` は `L`=生存／`D`=削除済み）の
+/// 5 フィールドで、物理スロット順（[`TableSchema::physical_slots`]）に並ぶ。
+const CATALOG_FORMAT_VERSION_V3: &str = "v3";
+
 /// カタログ v2 の `param` フィールドに許容する文字集合（TABLE-6・Issue #880）。
 /// パラメータなし型を表す `-` は本集合の外だが、[`validate_catalog_param`] で
 /// 別途特別扱いする。`:`・改行を含まないため、encode 側の `:` 区切りと
@@ -221,6 +230,20 @@ pub enum CatalogError {
     /// 想定だが、本 variant は Rust API 専用であり wire への送出経路を持たない
     /// ため `ErrorClass` には追加しない）。
     DependentObjectsStillExist(String),
+    /// `ALTER TABLE ... DROP COLUMN`／`ALTER COLUMN ... TYPE` が参照した列名が
+    /// 対象テーブルに存在しない（TABLE-19・TASK-203、Issue #901）。
+    ColumnNotFound(String),
+    /// `ALTER TABLE ... DROP COLUMN`／`ALTER COLUMN ... TYPE` の対象列が
+    /// 予約列（`id`／`tenant_id`／`visibility`）または `VECTOR` 列であり、
+    /// 削除・型変更を許可しない（TABLE-19 D1・D3、Issue #901）。
+    ProtectedColumn(String),
+    /// `ALTER COLUMN ... TYPE` に指定した型変更が受理する拡大変換の一覧
+    /// （TABLE-19 D3）に含まれない（縮小変換・異種変換・同一型を含む）。
+    IncompatibleTypeChange {
+        column: String,
+        from: String,
+        to: String,
+    },
 }
 
 impl fmt::Display for CatalogError {
@@ -246,6 +269,17 @@ impl fmt::Display for CatalogError {
             CatalogError::DependentObjectsStillExist(name) => {
                 write!(f, "dependent objects still exist for type: {name}")
             }
+            CatalogError::ColumnNotFound(name) => write!(f, "column not found: {name}"),
+            CatalogError::ProtectedColumn(name) => {
+                write!(
+                    f,
+                    "column is protected and cannot be dropped or altered: {name}"
+                )
+            }
+            CatalogError::IncompatibleTypeChange { column, from, to } => write!(
+                f,
+                "incompatible type change for column {column:?}: {from} -> {to}"
+            ),
         }
     }
 }
@@ -264,7 +298,10 @@ impl std::error::Error for CatalogError {
             | CatalogError::TableGenerationCounterOverflow
             | CatalogError::TypeNotFound(_)
             | CatalogError::TypeAlreadyExists(_)
-            | CatalogError::DependentObjectsStillExist(_) => None,
+            | CatalogError::DependentObjectsStillExist(_)
+            | CatalogError::ColumnNotFound(_)
+            | CatalogError::ProtectedColumn(_)
+            | CatalogError::IncompatibleTypeChange { .. } => None,
         }
     }
 }
@@ -906,12 +943,112 @@ impl ColumnDef {
     }
 }
 
+/// `ALTER TABLE ... DROP COLUMN` で削除された列の墓標（TABLE-19・TASK-203、
+/// Issue #901）。物理行ペイロード（`row_codec::encode_scalar_columns` の出力）は
+/// 列の宣言順に位置依存する固定形式のため、削除後も後続の生存列の物理位置を
+/// ずらさないよう、削除列の位置・型だけをカタログに残す（値は残さない。
+/// 削除後の新規書き込みは常に NULL・削除前からの既存行は構造検証のみ行い
+/// 読み捨てる。`row_codec.rs` 参照）。
+///
+/// `ty` は削除前の型をフレーム等価型へ正規化した型を保持する: `ENUM`／`JSON`／
+/// `JSONB` は行バイト列上 `TEXT` と同一フレーム（presence + u32 長 + 本体）の
+/// ため `TEXT` へ正規化し、`DROP TYPE` が削除済み列の残存参照を理由に永久に
+/// ブロックされ続ける結合を断つ（他の型は元の型をそのまま保持し、物理フレーム幅
+/// を保つ）。`VECTOR` は削除不可のため現れない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedSlot {
+    /// 物理スロット位置（0 始まり、昇順で保持する。[`TableSchema::physical_slots`]
+    /// が生存列とこの位置でマージする）。
+    physical_index: u16,
+    /// 削除前の列名。生存列の列名重複検査の対象外（同名列の再追加は新しい
+    /// 物理スロットを得る独立の列として扱う。旧値は復活しない）。
+    name: String,
+    /// 削除前の型（フレーム等価型への正規化後）。
+    ty: ColumnType,
+}
+
+impl DroppedSlot {
+    /// 削除前の列名（デバッグ・カタログエンコード専用）。
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 削除前の型（フレーム等価型への正規化後）。行の物理走査でのみ使う。
+    pub(crate) fn ty(&self) -> &ColumnType {
+        &self.ty
+    }
+}
+
+/// [`Storage::alter_table_drop_column`] が削除前の型を墓標へ格納する前に通す
+/// 正規化（TABLE-19 D1・Issue #901）。`ENUM`／`JSON`／`JSONB` は行バイト列上
+/// `TEXT` と同一フレーム（presence + u32 長 + 本体）のため `TEXT` へ正規化し、
+/// `DROP TYPE`（[`Storage::drop_enum_type`]）が削除済み列の残存参照を理由に
+/// 永久にブロックされ続ける結合を断つ。他の型は元の型をそのまま保持する
+/// （物理フレーム幅を保つ必要があるため）。`VECTOR` は呼び出し元
+/// （[`Storage::alter_table_drop_column`]）が先に拒否するためここには来ない。
+fn normalize_dropped_column_type(ty: ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::Enum(_) | ColumnType::Json | ColumnType::Jsonb => ColumnType::Text,
+        other => other,
+    }
+}
+
+/// [`TableSchema::physical_slots`] が返す 1 物理スロット。生存列は論理インデックス
+/// （`schema.columns` への添字）付き、削除済み列は墓標そのものを返す。
+pub(crate) enum PhysicalSlot<'a> {
+    Live(usize, &'a ColumnDef),
+    Dropped(&'a DroppedSlot),
+}
+
+/// [`TableSchema::physical_slots`] の実装。`dropped` は `physical_index` 昇順で
+/// 保持されている前提（[`TableSchema::from_parts`]・[`Storage::alter_table_drop_column`]
+/// の両方がこの不変条件を維持する）で、生存列（`columns` の宣言順）と墓標を
+/// 物理位置の昇順にマージする。
+pub(crate) struct PhysicalSlots<'a> {
+    columns: std::iter::Enumerate<std::slice::Iter<'a, ColumnDef>>,
+    dropped: std::iter::Peekable<std::slice::Iter<'a, DroppedSlot>>,
+    next_physical_index: usize,
+}
+
+impl<'a> Iterator for PhysicalSlots<'a> {
+    type Item = PhysicalSlot<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(d) = self.dropped.peek() {
+            if d.physical_index as usize == self.next_physical_index {
+                let d = self.dropped.next()?;
+                self.next_physical_index += 1;
+                return Some(PhysicalSlot::Dropped(d));
+            }
+        }
+        let (logical_index, column) = self.columns.next()?;
+        self.next_physical_index += 1;
+        Some(PhysicalSlot::Live(logical_index, column))
+    }
+}
+
 /// テーブル定義。列の宣言順を保持する（`ALTER TABLE ADD COLUMN` は末尾追記のみを
-/// 許可する。TABLE-5）。
+/// 許可する。TABLE-5）。`columns` は常に**論理列（生存列のみ）**を宣言順で持つ。
+/// `SELECT *`・投影・`WHERE` 解決・`RowDescription` など、行の物理配置を
+/// 意識する必要のないほぼすべての呼び出し元はこのフィールドだけを見ればよい。
+///
+/// 削除済み列（[`DroppedSlot`]）は非公開フィールド `dropped` に持ち、
+/// [`TableSchema::physical_slots`] が両者を物理位置でマージするビューを提供する。
+/// 物理配置を意識する必要があるのは行の物理ペイロード（`row_codec.rs`）と
+/// カタログの encode/decode（本モジュール）だけである（TABLE-19・TASK-203、
+/// Issue #901）。
+///
+/// **破壊的変更（Issue #901）**: 従来 `pub name`／`pub columns` のみで構成
+/// されていた本型に非公開フィールド `dropped` を追加したため、外部クレート
+/// からの `TableSchema { name, columns }` という構造体リテラル構築はコンパ
+/// イル不能になった。移行先は [`TableSchema::new`]（クレート内の呼び出し元
+/// は移行済み）。詳細・spec 側の扱いは
+/// `docs/design/alter-table-drop-modify-column.md`「D5」参照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    dropped: Vec<DroppedSlot>,
 }
 
 impl TableSchema {
@@ -919,6 +1056,44 @@ impl TableSchema {
         Self {
             name: name.into(),
             columns,
+            dropped: Vec::new(),
+        }
+    }
+
+    /// [`TableSchema::new`] の削除済み列（墓標）付き版。呼び出し元（本モジュールの
+    /// カタログ decode・[`Storage::alter_table_drop_column`]）は `dropped` を
+    /// `physical_index` 昇順で渡す契約とする（[`PhysicalSlots`] の前提）。
+    /// バリデーションは行わない（呼び出し元が [`validate_schema`] を別途通す）。
+    pub(crate) fn from_parts(
+        name: impl Into<String>,
+        columns: Vec<ColumnDef>,
+        dropped: Vec<DroppedSlot>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            dropped,
+        }
+    }
+
+    /// 削除済み列（墓標）の一覧。`physical_index` 昇順。
+    pub(crate) fn dropped_slots(&self) -> &[DroppedSlot] {
+        &self.dropped
+    }
+
+    /// 物理スロット総数（生存列 + 墓標）。列数上限 [`MAX_COLUMN_COUNT`] は
+    /// この値に適用する（墓標も物理容量を消費する。TABLE-19 D1）。
+    pub(crate) fn physical_slot_count(&self) -> usize {
+        self.columns.len() + self.dropped.len()
+    }
+
+    /// 生存列と墓標を物理位置の昇順でマージした走査（`row_codec.rs` の行
+    /// ペイロード走査・カタログ encode が共有する唯一の物理配置ビュー）。
+    pub(crate) fn physical_slots(&self) -> PhysicalSlots<'_> {
+        PhysicalSlots {
+            columns: self.columns.iter().enumerate(),
+            dropped: self.dropped.iter().peekable(),
+            next_physical_index: 0,
         }
     }
 
@@ -1124,10 +1299,13 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
             "table must have at least one column".to_string(),
         ));
     }
-    if schema.columns.len() > MAX_COLUMN_COUNT {
+    // 列数上限は物理スロット総数（生存列 + 墓標）に適用する。墓標も
+    // 物理容量（行ペイロードの位置空間）を消費するため（TABLE-19 D1・
+    // Issue #901）。
+    if schema.physical_slot_count() > MAX_COLUMN_COUNT {
         return Err(CatalogError::Invalid(format!(
             "too many columns: {}",
-            schema.columns.len()
+            schema.physical_slot_count()
         )));
     }
     let mut seen: Vec<&str> = Vec::with_capacity(schema.columns.len());
@@ -1149,6 +1327,43 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
         return Err(CatalogError::Invalid(format!(
             "table must declare at most one VECTOR column, got {vector_column_count}"
         )));
+    }
+    // 墓標側の不変条件（TABLE-19 D1・D2、Issue #901）: 削除前の物理位置が
+    // 一意・昇順であること（[`PhysicalSlots`] の前提）、削除前の型が
+    // フレーム等価型へ正規化済み（`VECTOR`／`ENUM`／`JSON`／`JSONB` を含まない）
+    // であること、削除前の列名が識別子として妥当であること（重複検査は
+    // 生存列同士のみで、墓標は対象外）。
+    let mut last_physical_index: Option<u16> = None;
+    for dropped in &schema.dropped {
+        validate_identifier(&dropped.name)?;
+        if matches!(
+            dropped.ty,
+            ColumnType::Vector(_) | ColumnType::Enum(_) | ColumnType::Json | ColumnType::Jsonb
+        ) {
+            return Err(CatalogError::Invalid(format!(
+                "dropped column {:?} must be normalized to a frame-equivalent type",
+                dropped.name
+            )));
+        }
+        if let ColumnType::Numeric { precision, scale } = dropped.ty {
+            validate_numeric_precision_scale(precision, scale)?;
+        }
+        match last_physical_index {
+            Some(prev) if prev >= dropped.physical_index => {
+                return Err(CatalogError::Invalid(
+                    "dropped column slots are not in strictly ascending physical order".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        last_physical_index = Some(dropped.physical_index);
+    }
+    if let Some(last) = last_physical_index {
+        if last as usize >= schema.physical_slot_count() {
+            return Err(CatalogError::Invalid(
+                "dropped column physical index out of range".to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1175,6 +1390,22 @@ fn encode_column_line(
     ))
 }
 
+/// [`encode_column_line`] の v3 版（5 フィールド。`state` は `L`=生存／`D`=削除済み。
+/// TABLE-19・TASK-203、Issue #901）。
+fn encode_column_line_v3(
+    name: &str,
+    type_name: &str,
+    param_field: &str,
+    nullable: bool,
+    state: char,
+) -> Result<String> {
+    validate_catalog_param(param_field)?;
+    let nullable_field = if nullable { "1" } else { "0" };
+    Ok(format!(
+        "{name}:{type_name}:{param_field}:{nullable_field}:{state}\n"
+    ))
+}
+
 /// [`TableSchema`] をカタログのテキスト形式へエンコードする。1 行目に
 /// フォーマットバージョン、2 行目に列数、以降 1 行 1 列（`name:type:dim:nullable`
 /// の 4 フィールドを `:` 区切り。識別子は `validate_identifier` により `:` を
@@ -1183,19 +1414,53 @@ fn encode_column_line(
 fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     validate_schema(schema)?;
     let mut out = String::new();
-    out.push_str(CATALOG_FORMAT_VERSION_LINE);
-    out.push('\n');
-    out.push_str(&format!("cols:{}\n", schema.columns.len()));
-    for column in &schema.columns {
-        // 型タグ・`param` の往復は ColumnType::catalog_fields に集約する
-        // （Issue #880 D2。型を追加する際にここを個別に触らずに済む）。
-        let (type_name, param_field) = column.ty.catalog_fields();
-        out.push_str(&encode_column_line(
-            &column.name,
-            type_name,
-            &param_field,
-            column.nullable,
-        )?);
+    if schema.dropped_slots().is_empty() {
+        // 墓標を持たないスキーマは常に v2 で書く（バイト列不変。既存のゴールデン
+        // テストに影響しない。TABLE-19・Issue #901）。
+        out.push_str(CATALOG_FORMAT_VERSION_LINE);
+        out.push('\n');
+        out.push_str(&format!("cols:{}\n", schema.columns.len()));
+        for column in &schema.columns {
+            // 型タグ・`param` の往復は ColumnType::catalog_fields に集約する
+            // （Issue #880 D2。型を追加する際にここを個別に触らずに済む）。
+            let (type_name, param_field) = column.ty.catalog_fields();
+            out.push_str(&encode_column_line(
+                &column.name,
+                type_name,
+                &param_field,
+                column.nullable,
+            )?);
+        }
+    } else {
+        // 墓標が 1 つでもあるスキーマは v3 で書く。物理位置の昇順
+        // （[`TableSchema::physical_slots`]）で生存列・墓標を交互に列挙する。
+        out.push_str(CATALOG_FORMAT_VERSION_V3);
+        out.push('\n');
+        out.push_str(&format!("cols:{}\n", schema.physical_slot_count()));
+        for slot in schema.physical_slots() {
+            match slot {
+                PhysicalSlot::Live(_, column) => {
+                    let (type_name, param_field) = column.ty.catalog_fields();
+                    out.push_str(&encode_column_line_v3(
+                        &column.name,
+                        type_name,
+                        &param_field,
+                        column.nullable,
+                        'L',
+                    )?);
+                }
+                PhysicalSlot::Dropped(dropped) => {
+                    let (type_name, param_field) = dropped.ty().catalog_fields();
+                    out.push_str(&encode_column_line_v3(
+                        dropped.name(),
+                        type_name,
+                        &param_field,
+                        true,
+                        'D',
+                    )?);
+                }
+            }
+        }
     }
     if out.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::Invalid(format!(
@@ -1262,11 +1527,18 @@ fn decode_schema_body(
     let version_line = lines
         .next()
         .ok_or_else(|| CatalogError::Invalid("catalog value is empty".to_string()))?;
-    if version_line != CATALOG_FORMAT_VERSION_LINE {
-        return Err(CatalogError::Invalid(format!(
-            "unknown catalog format version: {version_line:?}"
-        )));
-    }
+    // v3（TABLE-19・Issue #901）は 1 行あたり 5 フィールド（末尾に `state`
+    // `L`／`D`）を持つ以外は v2 と同じ枠組みを共有する。`cols:` は物理スロット
+    // 総数（v2 では常に生存列数と一致）を表す。
+    let is_v3 = match version_line {
+        CATALOG_FORMAT_VERSION_LINE => false,
+        CATALOG_FORMAT_VERSION_V3 => true,
+        other => {
+            return Err(CatalogError::Invalid(format!(
+                "unknown catalog format version: {other:?}"
+            )))
+        }
+    };
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::Invalid("catalog value truncated: missing cols line".to_string())
@@ -1274,31 +1546,31 @@ fn decode_schema_body(
     let count_str = cols_line
         .strip_prefix("cols:")
         .ok_or_else(|| CatalogError::Invalid(format!("malformed cols line: {cols_line:?}")))?;
-    let col_count: usize = count_str
+    let slot_count: usize = count_str
         .parse()
         .map_err(|_| CatalogError::Invalid(format!("malformed column count: {count_str:?}")))?;
-    if col_count > MAX_COLUMN_COUNT {
+    if slot_count > MAX_COLUMN_COUNT {
         return Err(CatalogError::Invalid(format!(
-            "too many columns: {col_count}"
+            "too many columns: {slot_count}"
         )));
     }
 
-    // 残り行を、宣言列数（col_count。上で MAX_COLUMN_COUNT 以下と検証済み）を
-    // 超えない範囲でのみ `ColumnDef`（内部で `String` を確保する）を構築する。
-    // 旧実装の `lines.collect()` は残り行数が宣言列数と無関係に無制限へ膨らむ
-    // 攻撃入力（大量の短い行）に対して行数比例のアロケーションを先に行って
-    // いたが（.claude/rules/coding-rust.md「untrusted 入力の扱い」）、本実装は
-    // `col_count` 件目までしか `ColumnDef` を構築しない単一走査へ変更し、
+    // 残り行を、宣言スロット数（slot_count。上で MAX_COLUMN_COUNT 以下と検証済み）を
+    // 超えない範囲でのみ構築する。旧実装の `lines.collect()` は残り行数が
+    // 宣言列数と無関係に無制限へ膨らむ攻撃入力（大量の短い行）に対して行数比例の
+    // アロケーションを先に行っていたが（.claude/rules/coding-rust.md「untrusted
+    // 入力の扱い」）、本実装は `slot_count` 件目までしか構築しない単一走査へ変更し、
     // 未知の型タグ・不正な `param` はその列を構築する前に拒否する（Issue #880 D7）。
-    // `col_count` を超える行は「末尾の空行（トレーリング改行）1 行のみ」を
+    // `slot_count` を超える行は「末尾の空行（トレーリング改行）1 行のみ」を
     // 許容し、それ以外は余剰行として拒否する。
-    let mut columns = Vec::with_capacity(col_count);
+    let mut columns = Vec::with_capacity(slot_count);
+    let mut dropped: Vec<DroppedSlot> = Vec::new();
     let mut trailing_seen = false;
     for (line_index, line) in lines.enumerate() {
-        if line_index >= col_count {
+        if line_index >= slot_count {
             if trailing_seen || !line.is_empty() {
                 return Err(CatalogError::Invalid(format!(
-                    "catalog value line count mismatch: expected {col_count} columns, got more than {col_count} lines"
+                    "catalog value line count mismatch: expected {slot_count} columns, got more than {slot_count} lines"
                 )));
             }
             trailing_seen = true;
@@ -1318,6 +1590,16 @@ fn decode_schema_body(
         let nullable_field = fields
             .next()
             .ok_or_else(|| CatalogError::Invalid(format!("malformed column line: {line:?}")))?;
+        // v2 は 4 フィールド固定（state 相当は常に「生存」）。v3 は 5 番目に
+        // `state` フィールドを必須で持つ。
+        let state_field =
+            if is_v3 {
+                Some(fields.next().ok_or_else(|| {
+                    CatalogError::Invalid(format!("malformed column line: {line:?}"))
+                })?)
+            } else {
+                None
+            };
         if fields.next().is_some() {
             return Err(CatalogError::Invalid(format!(
                 "malformed column line: {line:?}"
@@ -1341,18 +1623,59 @@ fn decode_schema_body(
             }
         };
 
-        columns.push(ColumnDef::new(name, ty, nullable));
+        match state_field {
+            None | Some("L") => {
+                columns.push(ColumnDef::new(name, ty, nullable));
+            }
+            Some("D") => {
+                // 墓標の型は必ずフレーム等価型（TABLE-19 D1・D2）でなければ
+                // ならない。手書きの不正データが `VECTOR`／`ENUM`／`JSON`／
+                // `JSONB` を削除済み状態で持ち込むのを拒否する。
+                if matches!(
+                    ty,
+                    ColumnType::Vector(_)
+                        | ColumnType::Enum(_)
+                        | ColumnType::Json
+                        | ColumnType::Jsonb
+                ) {
+                    return Err(CatalogError::Invalid(format!(
+                        "dropped column {name:?} has a non frame-equivalent type"
+                    )));
+                }
+                let physical_index = u16::try_from(line_index).map_err(|_| {
+                    CatalogError::Invalid("dropped column physical index overflow".to_string())
+                })?;
+                dropped.push(DroppedSlot {
+                    physical_index,
+                    name: name.to_string(),
+                    ty,
+                });
+            }
+            Some(other) => {
+                return Err(CatalogError::Invalid(format!(
+                    "malformed column state field: {other:?}"
+                )))
+            }
+        }
     }
-    if columns.len() != col_count {
+    if columns.len() + dropped.len() != slot_count {
         return Err(CatalogError::Invalid(format!(
-            "catalog value line count mismatch: expected {col_count} columns, got {} lines",
-            columns.len()
+            "catalog value line count mismatch: expected {slot_count} columns, got {} lines",
+            columns.len() + dropped.len()
         )));
     }
+    // v3 なのに墓標 0 件は形式の一意性に反する（同一スキーマが 2 通りに
+    // エンコードされ得る状態を許さない。TABLE-19 D2）。
+    if is_v3 && dropped.is_empty() {
+        return Err(CatalogError::Invalid(
+            "v3 catalog format requires at least one dropped column".to_string(),
+        ));
+    }
 
-    let schema = TableSchema::new(table_name, columns);
-    // デコード結果を再度検証する（列数上限・列名重複・識別子）。手書きの不正データが
-    // フィールドごとの検証をすり抜けても、スキーマ全体の不変条件はここで担保する。
+    let schema = TableSchema::from_parts(table_name, columns, dropped);
+    // デコード結果を再度検証する（列数上限・列名重複・識別子・墓標の不変条件）。
+    // 手書きの不正データがフィールドごとの検証をすり抜けても、スキーマ全体の
+    // 不変条件はここで担保する。
     validate_schema(&schema)?;
     Ok(schema)
 }
@@ -1710,13 +2033,169 @@ impl Storage {
             if schema.columns.iter().any(|c| c.name == column.name) {
                 return Err(CatalogError::ColumnAlreadyExists(column.name.clone()));
             }
-            if schema.columns.len() >= MAX_COLUMN_COUNT {
+            // 列数上限は物理スロット総数（生存列 + 墓標）に適用する（TABLE-19 D1・
+            // Issue #901。墓標も物理容量を消費するため、ADD 前に既存の墓標数も
+            // 合算して判定する）。
+            if schema.physical_slot_count() >= MAX_COLUMN_COUNT {
                 return Err(CatalogError::Invalid(format!(
                     "too many columns: {}",
-                    schema.columns.len() + 1
+                    schema.physical_slot_count() + 1
                 )));
             }
             schema.columns.push(column);
+            let encoded = encode_schema(&schema)?;
+            table.insert(table_name, encoded.as_slice())?;
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// 既存列を削除する（`ALTER TABLE ... DROP COLUMN`。TABLE-19・TASK-203、
+    /// Issue #901）。カタログのみを書き換える O(1) 操作で、行ストア
+    /// （`user_rows/{table_name}`）には一切アクセスしない（TABLE-4/TABLE-5 と
+    /// 同じ責務境界）。
+    ///
+    /// 行の物理ペイロード（`row_codec.rs`）は列の宣言順に位置依存する固定形式
+    /// のため、削除後も後続の生存列の物理位置をずらさないよう、削除列の物理
+    /// 位置・型（フレーム等価型へ正規化済み）だけを [`DroppedSlot`]（墓標）として
+    /// カタログに残す。既存行の削除列の値は読み捨てられ（構造検証のみ行い
+    /// 出力しない）、削除後に書き込まれる行は当該位置に常に NULL を書く
+    /// （`row_codec::encode_scalar_columns`／`merge_encode_scalar_columns` 参照）。
+    ///
+    /// 予約列（`id`／`tenant_id`／`visibility`）・`VECTOR` 列・最後の 1 列は
+    /// `Err`（`CatalogError::ProtectedColumn`／`CatalogError::Invalid`）で拒否する
+    /// （fail-closed。TABLE-19 D1）。対象列が存在しない場合は
+    /// `Err(CatalogError::ColumnNotFound)`。
+    ///
+    /// 失効契約は他の DDL（`alter_table_add_column` 等）と同じくテーブル単位
+    /// 世代カウンタへ一本化する（`bump_table_generation_in_txn`）。
+    pub fn alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
+        validate_identifier(table_name)?;
+        validate_identifier(column_name)?;
+        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
+            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+        }
+        let write_txn = self.begin_write_txn()?;
+        {
+            let mut table = write_txn.open_table(CATALOG_TABLE)?;
+            let existing: Vec<u8> = {
+                let guard = table
+                    .get(table_name)?
+                    .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+                guard.value().to_vec()
+            };
+            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
+            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+
+            // 対象列の物理位置は、削除前のスキーマの物理走査（`.enumerate()`
+            // の添字がそのまま物理位置に一致する。[`TableSchema::physical_slots`]
+            // は物理位置の昇順で生存列・墓標を列挙するため）で求める。
+            let target = schema
+                .physical_slots()
+                .enumerate()
+                .find_map(|(physical_index, slot)| match slot {
+                    PhysicalSlot::Live(logical_index, column) if column.name == column_name => {
+                        Some((logical_index, physical_index, column.ty.clone()))
+                    }
+                    _ => None,
+                });
+            let (logical_index, physical_index, ty) =
+                target.ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+            if ty.is_vector() {
+                return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+            }
+            let physical_index = u16::try_from(physical_index).map_err(|_| {
+                CatalogError::Invalid("dropped column physical index overflow".to_string())
+            })?;
+
+            schema.columns.remove(logical_index);
+            schema.dropped.push(DroppedSlot {
+                physical_index,
+                name: column_name.to_string(),
+                ty: normalize_dropped_column_type(ty),
+            });
+            // `physical_slots()`（[`PhysicalSlots`]）は `dropped` が物理位置の
+            // 昇順であることを前提とする。
+            schema.dropped.sort_by_key(|d| d.physical_index);
+
+            // `validate_schema`（`encode_schema` 内で呼ばれる）が「生存列 1 本以上」
+            // を含む全ての不変条件を検証する。ここでの追加検証は不要。
+            let encoded = encode_schema(&schema)?;
+            table.insert(table_name, encoded.as_slice())?;
+        }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// `NUMERIC(p, s)` 列の精度 `p` を拡大する（`ALTER TABLE ... ALTER COLUMN
+    /// ... TYPE NUMERIC(new_precision, s)`。`s` は変更しない。TABLE-19 D3・
+    /// TASK-203、Issue #901）。
+    ///
+    /// この変更は行の物理フレーム幅（presence(1) + unscaled i128(16) = 17 バイト
+    /// 固定）に一切影響しないため、カタログのみを書き換える O(1) 操作であり、
+    /// 既存行の書き換えは不要（[`crate::numeric::Decimal`] は unscaled 値を
+    /// `precision` に対して都度検証するため、`new_precision > 旧 precision`
+    /// であれば既存の全テナントの既存値は新しい宣言の下でも必ず有効な値として
+    /// 読み出せる）。
+    ///
+    /// 受理するのはこの 1 パターン（`NUMERIC` → より大きい `precision`・同一
+    /// `scale` の `NUMERIC`）のみで、それ以外の型変更（`INTEGER`→`BIGINT`・
+    /// `REAL`→`DOUBLE PRECISION` を含む、行の書き換えを要する拡大変換や、
+    /// 縮小変換・異種変換・同一型への変更）はすべて
+    /// `Err(CatalogError::IncompatibleTypeChange)` で拒否する（行の書き換えを
+    /// 伴う変換は本 Issue のスコープ外。`docs/design/alter-table-drop-modify-column.md`
+    /// 参照）。
+    pub fn alter_table_widen_numeric_precision(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        new_precision: u8,
+    ) -> Result<()> {
+        validate_identifier(table_name)?;
+        validate_identifier(column_name)?;
+        if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
+            return Err(CatalogError::ProtectedColumn(column_name.to_string()));
+        }
+        let write_txn = self.begin_write_txn()?;
+        {
+            let mut table = write_txn.open_table(CATALOG_TABLE)?;
+            let existing: Vec<u8> = {
+                let guard = table
+                    .get(table_name)?
+                    .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+                guard.value().to_vec()
+            };
+            let mut resolve = |name: &str| get_enum_type_in_write_txn(&write_txn, name);
+            let mut schema = decode_schema_with_resolver(table_name, &existing, &mut resolve)?;
+            let column = schema
+                .columns
+                .iter_mut()
+                .find(|c| c.name == column_name)
+                .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+            let (old_precision, old_scale) = match column.ty {
+                ColumnType::Numeric { precision, scale } => (precision, scale),
+                ref other => {
+                    return Err(CatalogError::IncompatibleTypeChange {
+                        column: column_name.to_string(),
+                        from: other.catalog_fields().0.to_string(),
+                        to: format!("numeric,{new_precision}"),
+                    })
+                }
+            };
+            if new_precision <= old_precision {
+                return Err(CatalogError::IncompatibleTypeChange {
+                    column: column_name.to_string(),
+                    from: format!("numeric,{old_precision},{old_scale}"),
+                    to: format!("numeric,{new_precision},{old_scale}"),
+                });
+            }
+            // 新しい (precision, scale) の組が有効であること（1..=MAX_PRECISION・
+            // scale <= precision）を検証してから確定する。
+            validate_numeric_precision_scale(new_precision, old_scale)?;
+            column.ty = ColumnType::Numeric {
+                precision: new_precision,
+                scale: old_scale,
+            };
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
@@ -2169,7 +2648,10 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::TableGenerationCounterOverflow
         | CatalogError::TypeNotFound(_)
         | CatalogError::TypeAlreadyExists(_)
-        | CatalogError::DependentObjectsStillExist(_) => SqlSurfaceError::Internal {
+        | CatalogError::DependentObjectsStillExist(_)
+        | CatalogError::ColumnNotFound(_)
+        | CatalogError::ProtectedColumn(_)
+        | CatalogError::IncompatibleTypeChange { .. } => SqlSurfaceError::Internal {
             detail: "catalog lookup failed".to_string(),
         },
     }
@@ -2258,11 +2740,20 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
     let version_line = lines
         .next()
         .ok_or_else(|| CatalogError::CorruptSchema("catalog value is empty".to_string()))?;
-    if version_line != CATALOG_FORMAT_VERSION_LINE {
-        return Err(CatalogError::CorruptSchema(format!(
-            "unknown catalog format version: {version_line:?}"
-        )));
-    }
+    // v3（TABLE-19・Issue #901）は列行が 5 フィールド（末尾に `state`）になる
+    // 以外は同じ枠組み。生存・削除済みいずれの行も保守的に依存判定の対象に
+    // 含める（`decode_schema_body` は削除済み列の型を必ず TEXT へ正規化するが、
+    // ここは decode の完全な検証を経由しない軽量パーサーであり、fail-closed に
+    // 倒して依存を見落とさない）。
+    let is_v3 = match version_line {
+        CATALOG_FORMAT_VERSION_LINE => false,
+        CATALOG_FORMAT_VERSION_V3 => true,
+        other => {
+            return Err(CatalogError::CorruptSchema(format!(
+                "unknown catalog format version: {other:?}"
+            )))
+        }
+    };
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -2292,6 +2783,27 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
                 "malformed column line: {line:?}"
             )));
         };
+        if is_v3 {
+            // v3 の 5 番目フィールドは `state`（"L"＝生存／"D"＝削除済み）。
+            // `decode_schema_body` の state 検証（"L"／"D" 以外は拒否）と同じ
+            // 契約をここでも徹底する（codex-review P1 指摘・PR #1045: フィールドの
+            // 存在だけを見て値を検証しないと、不正な state 値を持つ破損カタログ値が
+            // 「依存なし」に丸められ `drop_enum_type` が破損カタログを残したまま
+            // ENUM 型を削除できてしまう）。
+            match fields.next() {
+                Some("L") | Some("D") => {}
+                Some(other) => {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "malformed column state field: {other:?}"
+                    )))
+                }
+                None => {
+                    return Err(CatalogError::CorruptSchema(format!(
+                        "malformed column line: {line:?}"
+                    )))
+                }
+            }
+        }
         if fields.next().is_some() {
             return Err(CatalogError::CorruptSchema(format!(
                 "malformed column line: {line:?}"
@@ -2795,6 +3307,52 @@ mod tests {
         assert!(
             matches!(err, CatalogError::CorruptSchema(_)),
             "drop_enum_type must fail-closed on corrupt catalog values, got: {err:?}"
+        );
+
+        // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// `catalog_value_references_enum_type`（`drop_enum_type` 等が使う軽量な
+    /// 依存判定）は v3 カタログ値の 5 番目フィールド（`state`）が「フィールドの
+    /// 存在」だけでなく値そのものが `"L"`／`"D"` であることも検証しなければ
+    /// ならない（codex-review P1 指摘・PR #1045）。値がその他の不正な文字列
+    /// （破損カタログ）である場合に「依存なし」へ丸めてしまうと、
+    /// `drop_enum_type` が破損カタログを残したまま実際には参照されている
+    /// ENUM 型を削除できてしまう。
+    #[test]
+    fn drop_enum_type_rejects_v3_catalog_value_with_invalid_state_field() {
+        let path = unique_db_path("catalog-drop-enum-v3-bad-state");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // v3 形式のカタログ値で、ENUM 型 `mood` を参照する列の state フィールドを
+        // "L"／"D" のいずれでもない不正値にする。値検証を欠くと
+        // `catalog_value_references_enum_type` はフィールドが 5 個存在すること
+        // だけで通過させ「依存なし」と誤判定しうる。
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V3}\ncols:1\nmood_col:enum:{type_name}:0:X\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn.commit().expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on an invalid v3 state field, got: {err:?}"
         );
 
         // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
@@ -3501,5 +4059,434 @@ mod tests {
         storage.drop_table("docs").expect("drop_table");
         expected += 1;
         assert_eq!(storage.write_txn_creations(), expected, "drop_table");
+    }
+
+    // --- ALTER TABLE DROP COLUMN / ALTER COLUMN TYPE（TABLE-19・TASK-203、
+    // Issue #901）------------------------------------------------------------
+
+    /// DROP COLUMN はカタログのみを書き換える O(1) 操作であり、既存行の物理
+    /// バイト列には一切触れないこと（TABLE-19 D1 の核心）を、削除前後で
+    /// 生バイト列が完全一致することにより固定する。
+    #[test]
+    fn alter_table_drop_column_preserves_existing_row_bytes_and_reads_correctly() {
+        let path = unique_db_path("drop-column-preserves-bytes");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                    ColumnDef::new("kind", ColumnType::Text, true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Text("hello".to_string()),
+                    RowCodecValue::Text("ja".to_string()),
+                ],
+            )
+            .expect("insert typed row");
+
+        let before = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("get row before drop");
+
+        storage
+            .alter_table_drop_column("docs", "kind")
+            .expect("drop column");
+
+        let after = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("get row after drop");
+        assert_eq!(
+            before.metadata, after.metadata,
+            "DROP COLUMN must not rewrite existing row bytes"
+        );
+        assert_eq!(before.embedding, after.embedding);
+
+        let schema = storage.get_table_schema("docs").expect("get schema");
+        assert_eq!(
+            schema.columns.len(),
+            2,
+            "kind must be removed from logical columns"
+        );
+        assert!(schema.columns.iter().all(|c| c.name != "kind"));
+        assert_eq!(schema.dropped_slots().len(), 1);
+
+        let decoded =
+            row_codec::decode_scalar_columns(&schema, &after.metadata).expect("decode scalar");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1], RowCodecValue::Text("hello".to_string()));
+    }
+
+    /// 予約列（`id`／`tenant_id`／`visibility`）・`VECTOR` 列・不存在列・最後の
+    /// 1 列はいずれも fail-closed に拒否し、カタログを一切変更しない（TABLE-19
+    /// D1）。
+    #[test]
+    fn alter_table_drop_column_rejects_protected_missing_and_last_column() {
+        let path = unique_db_path("drop-column-rejections");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table");
+
+        assert!(matches!(
+            storage.alter_table_drop_column("docs", "id"),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_drop_column("docs", "tenant_id"),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_drop_column("docs", "visibility"),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_drop_column("docs", "embedding"),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_drop_column("docs", "missing"),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_drop_column("missing_table", "body"),
+            Err(CatalogError::TableNotFound(_))
+        ));
+
+        // カタログは一切変わっていないことを確認する。
+        let schema = storage.get_table_schema("docs").expect("get schema");
+        assert_eq!(schema.columns.len(), 2);
+        assert!(schema.dropped_slots().is_empty());
+
+        // `VECTOR` 列を持たないテーブルで唯一の列を消すと生存列が 0 本になる
+        // ため拒否する。
+        storage
+            .create_table(&TableSchema::new(
+                "scalar_only",
+                vec![ColumnDef::new("body", ColumnType::Text, false)],
+            ))
+            .expect("create scalar-only table");
+        assert!(matches!(
+            storage.alter_table_drop_column("scalar_only", "body"),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    /// 削除後に同名列を再追加すると独立した新しい物理スロットを得て、削除前の
+    /// 行の値は復活しない（TABLE-19 D1）。削除後に書き込む行の墓標位置には
+    /// 常に NULL が書かれる（`row_codec::encode_scalar_columns`）ことも併せて
+    /// 確認する。
+    #[test]
+    fn alter_table_drop_column_then_readd_same_name_does_not_resurrect_old_value() {
+        let path = unique_db_path("drop-column-readd");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("kind", ColumnType::Text, true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Text("ja".to_string()),
+                ],
+            )
+            .expect("insert row1 before drop");
+
+        storage
+            .alter_table_drop_column("docs", "kind")
+            .expect("drop column");
+        storage
+            .alter_table_add_column("docs", ColumnDef::new("kind", ColumnType::Text, true))
+            .expect("re-add column with the same name");
+
+        storage
+            .insert_typed_row(
+                "docs",
+                2,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![3.0, 4.0]),
+                    RowCodecValue::Text("re-added".to_string()),
+                ],
+            )
+            .expect("insert row2 after re-add");
+
+        let schema = storage.get_table_schema("docs").expect("get schema");
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.dropped_slots().len(), 1);
+
+        let row1 = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("get row1");
+        let decoded1 =
+            row_codec::decode_scalar_columns(&schema, &row1.metadata).expect("decode row1");
+        assert_eq!(
+            decoded1[1],
+            RowCodecValue::Null,
+            "old kind value must not resurrect under the re-added column"
+        );
+
+        let row2 = storage
+            .get_row_from_table("docs", "tenant-a", 2)
+            .expect("get row2");
+        let decoded2 =
+            row_codec::decode_scalar_columns(&schema, &row2.metadata).expect("decode row2");
+        assert_eq!(decoded2[1], RowCodecValue::Text("re-added".to_string()));
+    }
+
+    /// カタログ v3（墓標あり）は DB の再オープンを跨いで正しく往復する
+    /// （TABLE-19 D2）。
+    #[test]
+    fn alter_table_drop_column_schema_survives_reopen() {
+        let path = unique_db_path("drop-column-reopen");
+        let _guard = CleanupGuard(path.clone());
+        {
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&TableSchema::new(
+                    "docs",
+                    vec![
+                        ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                        ColumnDef::new("body", ColumnType::Text, false),
+                        ColumnDef::new("kind", ColumnType::Text, true),
+                    ],
+                ))
+                .expect("create table");
+            storage
+                .insert_typed_row(
+                    "docs",
+                    1,
+                    "tenant-a",
+                    Visibility::Public,
+                    &[
+                        RowCodecValue::Vector(vec![1.0, 2.0]),
+                        RowCodecValue::Text("hello".to_string()),
+                        RowCodecValue::Text("ja".to_string()),
+                    ],
+                )
+                .expect("insert typed row");
+            storage
+                .alter_table_drop_column("docs", "kind")
+                .expect("drop column");
+        }
+
+        let storage = Storage::open(&path).expect("reopen storage");
+        let schema = storage.get_table_schema("docs").expect("get schema");
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.dropped_slots().len(), 1);
+        let row = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("get row after reopen");
+        let decoded =
+            row_codec::decode_scalar_columns(&schema, &row.metadata).expect("decode after reopen");
+        assert_eq!(decoded[1], RowCodecValue::Text("hello".to_string()));
+    }
+
+    /// `merge_encode_scalar_columns`（UPDATE の read-merge-write 経路）も、
+    /// 墓標位置には既存値（`existing`）・SET 対象（`overrides`）のいずれに
+    /// 関わらず常に NULL を書く（TABLE-19 D1）。
+    #[test]
+    fn merge_encode_scalar_columns_always_nulls_dropped_slots() {
+        let path = unique_db_path("drop-column-merge-encode");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                    ColumnDef::new("kind", ColumnType::Text, true),
+                ],
+            ))
+            .expect("create table");
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Text("hello".to_string()),
+                    RowCodecValue::Text("ja".to_string()),
+                ],
+            )
+            .expect("insert typed row");
+        storage
+            .alter_table_drop_column("docs", "kind")
+            .expect("drop column");
+
+        let schema = storage.get_table_schema("docs").expect("get schema");
+        let row = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("get row");
+        let existing = row_codec::scan_scalar_columns(&schema, &row.metadata).expect("scan");
+        let updated_value = RowCodecValue::Text("updated".to_string());
+        let overrides: Vec<(usize, &RowCodecValue)> = vec![(1, &updated_value)];
+        let merged = row_codec::merge_encode_scalar_columns(&schema, &existing, &overrides)
+            .expect("merge encode");
+        let decoded = row_codec::decode_scalar_columns(&schema, &merged).expect("decode merged");
+        assert_eq!(decoded[1], RowCodecValue::Text("updated".to_string()));
+    }
+
+    /// `NUMERIC(p, s)` の精度拡大（`ALTER COLUMN ... TYPE NUMERIC(p', s)`。
+    /// TABLE-19 D3）はカタログのみを書き換え、既存値は不変のまま新しい精度の
+    /// 下でも有効に読み出せる。
+    #[test]
+    fn alter_table_widen_numeric_precision_preserves_existing_values() {
+        let path = unique_db_path("widen-numeric-precision");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new(
+                        "amount",
+                        ColumnType::Numeric {
+                            precision: 5,
+                            scale: 2,
+                        },
+                        true,
+                    ),
+                ],
+            ))
+            .expect("create table");
+        let decimal = crate::numeric::Decimal::from_parts(12345, 2).expect("valid decimal");
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0]),
+                    RowCodecValue::Numeric(decimal),
+                ],
+            )
+            .expect("insert typed row");
+
+        storage
+            .alter_table_widen_numeric_precision("docs", "amount", 10)
+            .expect("widen precision");
+
+        let schema = storage.get_table_schema("docs").expect("get schema");
+        assert_eq!(
+            schema.columns[1].ty,
+            ColumnType::Numeric {
+                precision: 10,
+                scale: 2
+            }
+        );
+        let row = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("get row");
+        let decoded = row_codec::decode_scalar_columns(&schema, &row.metadata).expect("decode");
+        assert_eq!(decoded[1], RowCodecValue::Numeric(decimal));
+
+        // 拡大後の精度でしか表現できない値も新規に書き込めることを確認する。
+        let large = crate::numeric::Decimal::from_parts(1_234_567_890, 2).expect("valid decimal");
+        storage
+            .insert_typed_row(
+                "docs",
+                2,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![3.0, 4.0]),
+                    RowCodecValue::Numeric(large),
+                ],
+            )
+            .expect("insert typed row within widened precision");
+    }
+
+    /// 縮小・同一精度・異種型（`NUMERIC` 以外）への変更はいずれも
+    /// `Err(CatalogError::IncompatibleTypeChange)` で拒否し、カタログを変更
+    /// しない（TABLE-19 D3）。
+    #[test]
+    fn alter_table_widen_numeric_precision_rejects_non_widening_changes() {
+        let path = unique_db_path("widen-numeric-rejections");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new(
+                        "amount",
+                        ColumnType::Numeric {
+                            precision: 5,
+                            scale: 2,
+                        },
+                        true,
+                    ),
+                    ColumnDef::new("body", ColumnType::Text, true),
+                ],
+            ))
+            .expect("create table");
+
+        assert!(matches!(
+            storage.alter_table_widen_numeric_precision("docs", "amount", 5),
+            Err(CatalogError::IncompatibleTypeChange { .. })
+        ));
+        assert!(matches!(
+            storage.alter_table_widen_numeric_precision("docs", "amount", 3),
+            Err(CatalogError::IncompatibleTypeChange { .. })
+        ));
+        assert!(matches!(
+            storage.alter_table_widen_numeric_precision("docs", "body", 10),
+            Err(CatalogError::IncompatibleTypeChange { .. })
+        ));
+        assert!(matches!(
+            storage.alter_table_widen_numeric_precision("docs", "missing", 10),
+            Err(CatalogError::ColumnNotFound(_))
+        ));
+        assert!(matches!(
+            storage.alter_table_widen_numeric_precision("docs", "id", 10),
+            Err(CatalogError::ProtectedColumn(_))
+        ));
+
+        let schema = storage.get_table_schema("docs").expect("get schema");
+        assert_eq!(
+            schema.columns[1].ty,
+            ColumnType::Numeric {
+                precision: 5,
+                scale: 2
+            },
+            "rejected ALTER COLUMN TYPE must not mutate the catalog"
+        );
     }
 }

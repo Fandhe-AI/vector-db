@@ -90,25 +90,31 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 再度追随（旧: 1540／1619）。PR #1007（Issue #882・REAL/DOUBLE 列型）・
     // Issue #885（NUMERIC / DECIMAL 列型）・Issue #887（UUID 列型）の base
     // 取り込みマージ・Issue #881（INTEGER／BIGINT 列型）マージ取り込みで
-    // `catalog.rs` に行が追加され、再度追随（旧: 1567／1591／1639／1653／
-    // 1677）。Issue #899（CREATE TABLE 構文）・Issue #902（`DROP TABLE` の
-    // DDL 実行権限ゲート）の base 取り込みマージで `catalog.rs` 冒頭側・
-    // `Storage::drop_table` のドキュメンテーションコメントが増え、以下 2 件の
-    // 行番号がさらに移動したための追随（旧: 1701／1705／1780）。Issue #995
-    // （`VECTOR` 列を持たないテーブルへの INSERT 系書き込み受理）の base 取り込み
-    // マージで `TableSchema::validate_embedding_dim`／`validate_row_embedding_dim`・
-    // `Storage::insert_row_into_table`／`insert_typed_row` のドキュメンテーション
-    // コメントが計 33 行増え、以下 2 件の行番号がさらに移動したための追随
-    // （旧: 1711／1790）。PR #1044 レビュー対応（`DROP TABLE` 配線済み記述への
-    // 訂正コメント）で `catalog.rs` 冒頭側にさらに 2 行増え、再度追随
-    // （旧: 1744／1823）。
-    ("catalog.rs", 1746),
+    // `catalog.rs` に行が追加され、再度追随
+    // （旧: 1567／1591／1639／1653／1677）。Issue #901（`ALTER TABLE ... DROP
+    // COLUMN`／`ALTER COLUMN ... TYPE` の追加。`DroppedSlot`／`PhysicalSlot`・
+    // `Storage::alter_table_drop_column`／`alter_table_widen_numeric_precision`）
+    // で `catalog.rs` 冒頭側に行が追加され、再度追随（旧: 1701）。Issue #899
+    // （CREATE TABLE 構文）・Issue #902（`DROP TABLE` の DDL 実行権限ゲート）の
+    // base 取り込みマージで `catalog.rs` 冒頭側・`Storage::drop_table` の
+    // ドキュメンテーションコメントが増え、以下 2 件の行番号がさらに移動した
+    // ための追随（旧: 2173／2252）。PR #1045 レビュー対応（`TableSchema` の
+    // 公開 API 互換性ドキュメンテーションコメント追加、Issue #901）で
+    // `catalog.rs` 冒頭側にさらに 7 行追加され、再度追随（旧: 2177／2256）。
+    // Issue #995（`VECTOR` 列を持たないテーブルへの INSERT 系書き込み受理）の
+    // base 取り込みマージで `TableSchema::validate_embedding_dim`／
+    // `validate_row_embedding_dim`・`Storage::insert_row_into_table`／
+    // `insert_typed_row` のドキュメンテーションコメントが計 33 行増え、以下
+    // 2 件の行番号がさらに移動したための追随（旧: 2184／2263）。PR #1044
+    // レビュー対応（`DROP TABLE` 配線済み記述への訂正コメント）で `catalog.rs`
+    // 冒頭側にさらに 2 行増え、再度追随（旧: 2217／2296）。
+    ("catalog.rs", 2225),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（`alter_enum_type_add_value` の commit 呼び出しは
     // 依存テーブルの世代を明示的に進行させるため ALLOWLIST 対象外のまま）。
-    ("catalog.rs", 1825),
+    ("catalog.rs", 2304),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
