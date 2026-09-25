@@ -3041,31 +3041,69 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             "too many columns: {col_count}"
         )));
     }
-    if is_v4 {
+    // v4 の pk 行は `decode_schema_body`（構造検証）→ `validate_primary_key`
+    // （重複列・未知列の検証。`validate_schema` 経由）の 2 段で検証される。
+    // この軽量パーサーは列行を読む前に pk 行の構造だけを検証し（要素数上限・
+    // 各要素の非空・識別子妥当性）、重複列・未知列の判定は列行を読み終えて
+    // 実在する列名の集合が判明してから行う（codex-review P1 指摘・PR #1050:
+    // 接頭辞と非空だけの軽量チェックでは、重複列・未知列・空要素等を含み
+    // `decode_schema_body`／`validate_schema` なら `CorruptSchema` で拒否する
+    // はずの壊れた v4 カタログでも、ENUM 参照列が無ければ「依存なし」に
+    // 丸められ `drop_enum_type` の fail-closed 依存関係検査をすり抜けてしまう）。
+    let pk_cols: Option<Vec<String>> = if is_v4 {
         let pk_line = lines.next().ok_or_else(|| {
             CatalogError::CorruptSchema("catalog value truncated: missing pk line".to_string())
         })?;
-        if !pk_line.starts_with("pk:") || pk_line.len() <= "pk:".len() {
-            return Err(CatalogError::CorruptSchema(format!(
-                "malformed pk line: {pk_line:?}"
-            )));
+        let pk_body = pk_line.strip_prefix("pk:").ok_or_else(|| {
+            CatalogError::CorruptSchema(format!("malformed pk line: {pk_line:?}"))
+        })?;
+        if pk_body.is_empty() {
+            return Err(CatalogError::CorruptSchema(
+                "v4 catalog format requires at least one primary key column".to_string(),
+            ));
         }
-    }
+        let mut cols: Vec<String> = Vec::new();
+        for (i, name) in pk_body.split(',').enumerate() {
+            if i >= MAX_PRIMARY_KEY_COLUMNS {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "too many primary key columns: exceeds {MAX_PRIMARY_KEY_COLUMNS}"
+                )));
+            }
+            if name.is_empty() {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "malformed pk line: {pk_line:?}"
+                )));
+            }
+            validate_identifier(name).map_err(|_| {
+                CatalogError::CorruptSchema(format!("malformed pk line: {pk_line:?}"))
+            })?;
+            cols.push(name.to_string());
+        }
+        Some(cols)
+    } else {
+        None
+    };
 
     let mut found = false;
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for _ in 0..col_count {
         let line = lines.next().ok_or_else(|| {
             CatalogError::CorruptSchema("catalog value truncated: missing column line".to_string())
         })?;
         let mut fields = line.split(':');
-        let (Some(_name), Some(tag), Some(param), Some(_nullable)) =
+        let (Some(name), Some(tag), Some(param), Some(_nullable)) =
             (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             return Err(CatalogError::CorruptSchema(format!(
                 "malformed column line: {line:?}"
             )));
         };
-        if has_state_field {
+        // state（v2 は常に生存扱い）を先に確定させてから重複検査を行う。
+        // `validate_schema` の一意性検査は生存列同士のみが対象で墓標は対象外
+        // （TABLE-19: 削除→再作成で同名列が墓標と生存列に共存しうる）ため、
+        // ここでも生存列名だけを `seen_names` へ積む（対象を広げると正当な
+        // v3/v4 カタログを誤って壊れた値扱いしてしまう）。
+        let is_live = if has_state_field {
             // v3 の 5 番目フィールドは `state`（"L"＝生存／"D"＝削除済み）。
             // `decode_schema_body` の state 検証（"L"／"D" 以外は拒否）と同じ
             // 契約をここでも徹底する（codex-review P1 指摘・PR #1045: フィールドの
@@ -3073,7 +3111,8 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
             // 「依存なし」に丸められ `drop_enum_type` が破損カタログを残したまま
             // ENUM 型を削除できてしまう）。
             match fields.next() {
-                Some("L") | Some("D") => {}
+                Some("L") => true,
+                Some("D") => false,
                 Some(other) => {
                     return Err(CatalogError::CorruptSchema(format!(
                         "malformed column state field: {other:?}"
@@ -3085,10 +3124,22 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
                     )))
                 }
             }
-        }
+        } else {
+            true
+        };
         if fields.next().is_some() {
             return Err(CatalogError::CorruptSchema(format!(
                 "malformed column line: {line:?}"
+            )));
+        }
+        // 列名の重複は `validate_schema`（生存列同士のみを対象とする一意性
+        // 検証）が拒否する不変条件であり、この軽量パーサーでも同じ契約を
+        // 敷いておかないと、ENUM 未参照列を重複させただけの壊れた v4/v3
+        // カタログが「依存なし」に丸められうる（同種の fail-closed 徹底。
+        // codex-review P1 指摘・PR #1050）。
+        if is_live && !seen_names.insert(name) {
+            return Err(CatalogError::CorruptSchema(format!(
+                "duplicate column name: {name:?}"
             )));
         }
         if tag == "enum" && param == type_name {
@@ -3110,6 +3161,27 @@ fn catalog_value_references_enum_type(bytes: &[u8], type_name: &str) -> Result<b
         }
         trailing_seen = true;
     }
+
+    // pk 行の参照整合性は生存列名の集合が確定した後でしか判定できないため、
+    // 列行を読み終えた後にまとめて検証する（`validate_primary_key` の
+    // 「重複なし・生存列に存在する」契約と同じ。codex-review P1 指摘・
+    // PR #1050）。
+    if let Some(pk_cols) = pk_cols {
+        let mut pk_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for name in &pk_cols {
+            if !pk_seen.insert(name.as_str()) {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "duplicate primary key column: {name:?}"
+                )));
+            }
+            if !seen_names.contains(name.as_str()) {
+                return Err(CatalogError::CorruptSchema(format!(
+                    "primary key references unknown column: {name:?}"
+                )));
+            }
+        }
+    }
+
     Ok(found)
 }
 
@@ -3781,6 +3853,91 @@ mod tests {
         );
 
         // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// `catalog_value_references_enum_type` は v4 カタログの `pk:` 行が
+    /// 実在しない列を参照している場合も `decode_schema_body`／
+    /// `validate_schema`（`validate_primary_key`）と同じく拒否しなければ
+    /// ならない（codex-review P1 指摘・PR #1050）。この値は ENUM 参照列を
+    /// 一切持たないため、pk 行を接頭辞と非空だけで検証する軽量チェックだと
+    /// 「依存なし」に丸められ、実際には `decode_schema_body` なら拒否する
+    /// 壊れたカタログを残したまま `drop_enum_type` が進んでしまう。
+    #[test]
+    fn drop_enum_type_rejects_v4_catalog_value_with_unknown_primary_key_column() {
+        let path = unique_db_path("catalog-drop-enum-v4-unknown-pk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        // v4 形式で `pk:` 行が宣言列に存在しない `missing` を参照する。ENUM
+        // 参照列は含まない。
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V4}\ncols:1\npk:missing\ncode:text:-:0:L\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on a v4 pk line referencing an unknown column, got: {err:?}"
+        );
+
+        // 型は削除されず残っていること（fail-open だとここが消えてしまう）。
+        storage
+            .get_enum_type(type_name)
+            .expect("enum type must still exist after the rejected drop");
+    }
+
+    /// 上記と対の検証: `pk:` 行が同一列を重複して参照する壊れた v4 カタログも
+    /// 同じく `CorruptSchema` で拒否される（`validate_primary_key` の
+    /// 「主キー列の重複なし」契約と同じ。codex-review P1 指摘・PR #1050）。
+    #[test]
+    fn drop_enum_type_rejects_v4_catalog_value_with_duplicate_primary_key_column() {
+        let path = unique_db_path("catalog-drop-enum-v4-dup-pk");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let type_name = "mood";
+        storage
+            .create_enum_type(type_name, vec!["happy".to_string()])
+            .expect("create enum type");
+
+        let corrupt_value =
+            format!("{CATALOG_FORMAT_VERSION_V4}\ncols:1\npk:code,code\ncode:text:-:0:L\n");
+        let write_txn = storage.begin_write_txn().expect("begin write txn");
+        {
+            let mut table = write_txn
+                .open_table(CATALOG_TABLE)
+                .expect("open catalog table");
+            table
+                .insert("docs", corrupt_value.as_bytes())
+                .expect("insert corrupt catalog value");
+        }
+        write_txn
+            .commit_raw_for_test()
+            .expect("commit corrupt catalog value");
+
+        let err = storage.drop_enum_type(type_name).unwrap_err();
+        assert!(
+            matches!(err, CatalogError::CorruptSchema(_)),
+            "drop_enum_type must fail-closed on a v4 pk line with a duplicate column, got: {err:?}"
+        );
+
         storage
             .get_enum_type(type_name)
             .expect("enum type must still exist after the rejected drop");

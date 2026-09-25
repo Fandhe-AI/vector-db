@@ -2790,7 +2790,16 @@ impl<'a> Parser<'a> {
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
-                if columns.len() >= MAX_CREATE_TABLE_COLUMNS {
+                // カンマの次要素が表制約 `PRIMARY KEY (...)` の場合は `columns`
+                // へ追加されない（列を消費しない）ため、上限判定の対象から
+                // 除外する（Cursor Bugbot 指摘・PR #1050: ちょうど上限数の列を
+                // 宣言したテーブルへ末尾で表制約 `PRIMARY KEY` を付けると、
+                // 実際には列を 1 つも追加しないにもかかわらず「ペイロード
+                // 過大」として拒否され、同じ制約を先頭・中間に置いた場合と
+                // 非対称な挙動になっていた）。
+                let next_is_primary_key_constraint =
+                    self.peek_ident_matches("PRIMARY") && self.peek_ident_matches_at(1, "KEY");
+                if !next_is_primary_key_constraint && columns.len() >= MAX_CREATE_TABLE_COLUMNS {
                     return Err(SqlSurfaceError::payload_too_large(
                         "too many columns in CREATE TABLE",
                     ));
@@ -7845,6 +7854,29 @@ mod tests {
         match result {
             Err(SqlSurfaceError::PayloadTooLarge { .. }) => {}
             other => panic!("expected PayloadTooLarge, got: {other:?}"),
+        }
+    }
+
+    /// Cursor Bugbot 指摘（PR #1050）に対する回帰テスト: ちょうど上限数の
+    /// 列を宣言したテーブルへ末尾で表制約 `PRIMARY KEY (...)` を付けても、
+    /// 表制約は `columns` を消費しないため受理される（先頭・中間に置いた
+    /// 場合と対称な挙動になることを固定する）。
+    #[test]
+    fn create_table_accepts_trailing_primary_key_constraint_at_max_columns() {
+        let cols: Vec<String> = (0..MAX_CREATE_TABLE_COLUMNS)
+            .map(|i| format!("c{i} TEXT"))
+            .collect();
+        let sql = format!("CREATE TABLE t ({}, PRIMARY KEY (c0))", cols.join(", "));
+        let tokens = crate::sql::lexer::tokenize(&sql).expect("tokenize");
+        let result = validate_create_table_tokens(&tokens);
+        match &result {
+            Ok(v) => {
+                assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
+                assert_eq!(v.primary_key, Some(vec!["c0".to_string()]));
+            }
+            Err(e) => panic!(
+                "expected ok for exactly {MAX_CREATE_TABLE_COLUMNS} columns with trailing PRIMARY KEY, got err: {e:?}"
+            ),
         }
     }
 }
