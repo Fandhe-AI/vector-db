@@ -731,6 +731,27 @@ fn observe_candidate_slots_grouped_inner(
                 }
             }
         }
+        // TASK-208・Issue #912: `classify_scalar_plan` は OR 群を含む述語を常に
+        // `PlainScan` へ縮退させるため通常到達しないが、多層防御として評価する
+        // （`aggregate::observe_candidate_slots` と同じ判断）。
+        for group in &bound.or_filters {
+            let group_embedding: &[f32] = if group.references_embedding() {
+                arena
+                    .vector(slot_idx)
+                    .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?
+            } else {
+                &[]
+            };
+            if !group.matches(
+                &scanned,
+                id,
+                group_embedding,
+                arena.dim() as usize,
+                &mut expr_scratch,
+            )? {
+                continue 'candidates;
+            }
+        }
 
         // GROUP BY キー列は束縛段（`sql::parser::bind_group_by_clause`）で TEXT
         // 列に限定済み（BOOLEAN 列は `22000` で拒否）のため常に `Text` のはずだが、
@@ -1080,6 +1101,7 @@ pub(crate) fn execute_grouped_aggregate(
         &bound.items,
         &bound.metadata_filters,
         &bound.expr_filters,
+        &bound.or_filters,
         Some(group_by.column_index),
     );
     let tier = if referenced.needs_embedding() {
@@ -1115,11 +1137,17 @@ pub(crate) fn execute_grouped_aggregate(
     if let (Some(expected_dim_value), Some(arena_access), Some(scalar_access)) =
         (expected_dim, arena_cache.as_ref(), scalar_cache.as_ref())
     {
-        let where_less = bound.metadata_filters.is_empty() && bound.expr_filters.is_empty();
+        // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b` だけの
+        // `GROUP BY`（`metadata_filters`／`expr_filters` は両方空）が
+        // 「WHERE なし」と誤判定され、列挙形（`ScalarIndex::column_groups`。
+        // フィルタを一切適用しない）へ流れて OR 条件が黙って無視される
+        // fail-open のバグになる（security.md「不安全な設計」対応）。
+        let where_less = !bound.has_where_filters();
         let scalar_shape = crate::sql::scalar_plan::ScalarShapeInput {
             scalar_prefilter: true,
             metadata_filters: &bound.metadata_filters,
             expr_filters: &bound.expr_filters,
+            or_filters: &bound.or_filters,
         };
         let candidate_walk = !where_less
             && crate::sql::scalar_plan::classify_scalar_plan(&scalar_shape)
@@ -1330,6 +1358,23 @@ pub(crate) fn execute_grouped_aggregate(
                                 "WHERE expression did not evaluate to a boolean",
                             ))
                         }
+                    }
+                }
+                // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存の
+                // メタデータフィルタ・式述語と同じ SCALAR 段の一部として適用する。
+                for group in &bound.or_filters {
+                    let group_embedding: &[f32] = match tier {
+                        DecodeTier::Embedding => embedding_scratch.as_slice(),
+                        DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                    };
+                    if !group.matches(
+                        &scanned,
+                        id,
+                        group_embedding,
+                        dim as usize,
+                        &mut expr_scratch,
+                    )? {
+                        continue 'rows;
                     }
                 }
 
@@ -1626,6 +1671,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection: vec![
                 crate::sql::parser::ProjectionColumn::GroupKey {
@@ -1707,6 +1753,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection: vec![
                 crate::sql::parser::ProjectionColumn::GroupKey {
@@ -1984,6 +2031,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection: vec![
                 crate::sql::parser::ProjectionColumn::GroupKey {
@@ -2034,6 +2082,7 @@ mod tests {
             &bound.items,
             &bound.metadata_filters,
             &bound.expr_filters,
+            &bound.or_filters,
             bound.group_by.as_ref().map(|g| g.column_index),
         );
         assert!(

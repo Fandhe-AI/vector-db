@@ -198,6 +198,7 @@ impl ReferencedColumns {
         items: &[crate::sql::parser::BoundAggregateItem],
         metadata_filters: &[declarative_filter::MetadataFilter],
         expr_filters: &[BoundExpr],
+        or_filters: &[crate::sql::where_tree::BoundOrGroup],
         extra_scalar_index: Option<usize>,
     ) -> Self {
         let mut scalar_mask = vec![false; schema.columns.len()];
@@ -257,6 +258,22 @@ impl ReferencedColumns {
             has_scalar_reference = true;
             if let Some(slot) = scalar_mask.get_mut(index) {
                 *slot = true;
+            }
+        }
+        // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群が参照する列・embedding
+        // も同様に反映する（`metadata_filters`／`expr_filters` と同じ理由。
+        // security.md「不安全な設計」対応）。
+        if !or_filters.is_empty() {
+            has_scalar_reference = true;
+        }
+        for group in or_filters {
+            group.visit_column_indices(&mut |idx| {
+                if let Some(slot) = scalar_mask.get_mut(idx) {
+                    *slot = true;
+                }
+            });
+            if group.references_embedding() {
+                needs_embedding = true;
             }
         }
 
@@ -1416,9 +1433,13 @@ pub(crate) fn execute_aggregate_with_cache(
         &bound.items,
         &bound.metadata_filters,
         &bound.expr_filters,
+        &bound.or_filters,
         None,
     );
-    let tier = select_decode_tier(&referenced, !bound.expr_filters.is_empty());
+    let tier = select_decode_tier(
+        &referenced,
+        !bound.expr_filters.is_empty() || !bound.or_filters.is_empty(),
+    );
 
     // Issue #475: `WHERE` が索引対応述語のみ（`classify_scalar_plan` が
     // `PlainScan` 以外）で構成される場合、`user_rows/{table}` の全行走査
@@ -1440,6 +1461,7 @@ pub(crate) fn execute_aggregate_with_cache(
             scalar_prefilter: true,
             metadata_filters: &bound.metadata_filters,
             expr_filters: &bound.expr_filters,
+            or_filters: &bound.or_filters,
         };
         if crate::sql::scalar_plan::classify_scalar_plan(&scalar_shape)
             != crate::sql::scalar_plan::ScalarPlan::PlainScan
@@ -1686,6 +1708,23 @@ pub(crate) fn execute_aggregate_with_cache(
                             "WHERE expression did not evaluate to a boolean",
                         ))
                     }
+                }
+            }
+            // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存のメタデータ
+            // フィルタ・式述語と同じ SCALAR 段の一部として適用する。
+            for group in &bound.or_filters {
+                let group_embedding: &[f32] = match tier {
+                    DecodeTier::Embedding => embedding_scratch.as_slice(),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                };
+                if !group.matches(
+                    &scanned,
+                    id,
+                    group_embedding,
+                    dim as usize,
+                    &mut expr_scratch,
+                )? {
+                    continue 'rows;
                 }
             }
 
@@ -2091,6 +2130,28 @@ pub(crate) fn observe_candidate_slots(
                 }
             }
         }
+        // TASK-208・Issue #912: `classify_scalar_plan` は OR 群を含む述語を常に
+        // `PlainScan` へ縮退させるため、この索引経由の候補走査へは通常到達しない
+        // （`bound.or_filters` は空のはず）。多層防御として、万一到達しても
+        // OR を黙って無視しない（fail-open 防止）。
+        for group in &bound.or_filters {
+            let group_embedding: &[f32] = if group.references_embedding() {
+                arena
+                    .vector(slot_idx)
+                    .ok_or_else(|| accumulator_bug("candidate slot out of bounds (vector)"))?
+            } else {
+                &[]
+            };
+            if !group.matches(
+                &scanned,
+                id,
+                group_embedding,
+                arena.dim() as usize,
+                &mut expr_scratch,
+            )? {
+                continue 'candidates;
+            }
+        }
 
         let vector = RowVector {
             dim: arena.dim(),
@@ -2317,6 +2378,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection: vec![crate::sql::parser::ProjectionColumn::Aggregate {
                 item_index: 0,
@@ -2350,6 +2412,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection,
             group_by: None,
@@ -3397,7 +3460,7 @@ mod tests {
                 input: input.clone(),
                 name: "result".to_string(),
             }];
-            let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+            let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], None);
             assert!(
                 !referenced.needs_embedding(),
                 "COUNT({label}) must not require embedding decode"
@@ -3437,7 +3500,7 @@ mod tests {
             input: AggregateInput::AllVisible,
             name: "result".to_string(),
         }];
-        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], None);
         assert_eq!(select_decode_tier(&referenced, false), DecodeTier::Fast);
     }
 
@@ -3451,7 +3514,7 @@ mod tests {
             input: AggregateInput::VectorColumnPresence,
             name: "result".to_string(),
         }];
-        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], None);
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], None);
         assert!(!referenced.needs_embedding());
         assert_eq!(
             select_decode_tier(&referenced, false),

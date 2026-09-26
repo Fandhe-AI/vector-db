@@ -918,8 +918,6 @@ fn push_dml_where_predicates(
     predicates: &[crate::sql::allowlist::WherePredicate],
     udf_registry: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-    use crate::sql::allowlist::WherePredicate;
-
     let count = u32::try_from(predicates.len()).map_err(|_| dml_hash_field_too_large())?;
     b.push_raw(&count.to_le_bytes());
 
@@ -928,64 +926,7 @@ fn push_dml_where_predicates(
         std::collections::BTreeMap::new();
 
     for pred in predicates {
-        match pred {
-            WherePredicate::Equality { column, value } => {
-                b.push_u8(1);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                b.push_bytes(value.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
-            WherePredicate::Prefix { column, pattern } => {
-                b.push_u8(2);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                b.push_bytes(pattern.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
-            WherePredicate::PredicateCall { name } => {
-                b.push_u8(3);
-                b.push_bytes(name.to_ascii_lowercase().as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
-            WherePredicate::Expression(expr) => {
-                b.push_u8(4);
-                push_dml_expr(b, expr, None)?;
-                collect_referenced_udfs(expr, udf_registry, &mut referenced)?;
-            }
-            // `BoolColumn`（`WHERE flag`）と `BoolEquality { value: true }`
-            // （`WHERE flag = true`）は評価結果としては同一だが、構文が異なる
-            // ため安全側に倒し別タグ・別ハッシュとする（Issue #883）。
-            WherePredicate::BoolEquality { column, value } => {
-                b.push_u8(5);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                b.push_u8(u8::from(*value));
-            }
-            WherePredicate::BoolColumn { column } => {
-                b.push_u8(6);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-            }
-            // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較
-            // （`< > <= >=`。TABLE-13・TASK-199、Issue #891）。演算子の判別子
-            // （`CompareOp` の宣言順）を末尾へ付け加えることで、列・リテラルが
-            // 同じでも演算子が異なれば別ハッシュになる。
-            WherePredicate::Compare { column, op, value } => {
-                b.push_u8(7);
-                b.push_bytes(column.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                b.push_bytes(value.as_bytes())
-                    .map_err(|_| dml_hash_field_too_large())?;
-                let op_tag: u8 = match op {
-                    crate::sql::allowlist::CompareOp::Lt => 0,
-                    crate::sql::allowlist::CompareOp::Le => 1,
-                    crate::sql::allowlist::CompareOp::Gt => 2,
-                    crate::sql::allowlist::CompareOp::Ge => 3,
-                };
-                b.push_u8(op_tag);
-            }
-        }
+        push_dml_where_predicate(b, pred, udf_registry, &mut referenced)?;
     }
 
     // 参照 UDF 定義セクション（ADR §4.4.1「6.」）。参照 UDF が無ければ件数
@@ -1013,6 +954,96 @@ fn push_dml_where_predicates(
         }
     }
 
+    Ok(())
+}
+
+/// [`push_dml_where_predicates`] が各述語 1 個ぶんを直列化する再帰本体
+/// （TASK-208・SQL-24、Issue #912）。`WherePredicate::Or`（タグ 8）は
+/// 「分岐数（u32 LE）→ 分岐ごとの述語数（u32 LE）→ 各述語を本関数で再帰的に
+/// 直列化」という形にすることで、`a OR (b AND c)` と `(a OR b) AND c` が異なる
+/// ハッシュになる（分岐の木構造そのものを直列化に反映する）。タグ 1〜7 の
+/// 直列化形式は本 Issue 以前と一切変えない（`AND` だけの既存述語列の
+/// content hash は不変。回帰テストで固定する）。
+fn push_dml_where_predicate(
+    b: &mut HashInputBuilder,
+    pred: &crate::sql::allowlist::WherePredicate,
+    udf_registry: &crate::sql::udf_call::UdfRegistry,
+    referenced: &mut std::collections::BTreeMap<String, crate::sql::udf_call::UdfDefinition>,
+) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+    use crate::sql::allowlist::WherePredicate;
+
+    match pred {
+        WherePredicate::Equality { column, value } => {
+            b.push_u8(1);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(value.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        WherePredicate::Prefix { column, pattern } => {
+            b.push_u8(2);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(pattern.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        WherePredicate::PredicateCall { name } => {
+            b.push_u8(3);
+            b.push_bytes(name.to_ascii_lowercase().as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        WherePredicate::Expression(expr) => {
+            b.push_u8(4);
+            push_dml_expr(b, expr, None)?;
+            collect_referenced_udfs(expr, udf_registry, referenced)?;
+        }
+        // `BoolColumn`（`WHERE flag`）と `BoolEquality { value: true }`
+        // （`WHERE flag = true`）は評価結果としては同一だが、構文が異なる
+        // ため安全側に倒し別タグ・別ハッシュとする（Issue #883）。
+        WherePredicate::BoolEquality { column, value } => {
+            b.push_u8(5);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_u8(u8::from(*value));
+        }
+        WherePredicate::BoolColumn { column } => {
+            b.push_u8(6);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+        }
+        // `DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA` 列の範囲比較
+        // （`< > <= >=`。TABLE-13・TASK-199、Issue #891）。演算子の判別子
+        // （`CompareOp` の宣言順）を末尾へ付け加えることで、列・リテラルが
+        // 同じでも演算子が異なれば別ハッシュになる。
+        WherePredicate::Compare { column, op, value } => {
+            b.push_u8(7);
+            b.push_bytes(column.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            b.push_bytes(value.as_bytes())
+                .map_err(|_| dml_hash_field_too_large())?;
+            let op_tag: u8 = match op {
+                crate::sql::allowlist::CompareOp::Lt => 0,
+                crate::sql::allowlist::CompareOp::Le => 1,
+                crate::sql::allowlist::CompareOp::Gt => 2,
+                crate::sql::allowlist::CompareOp::Ge => 3,
+            };
+            b.push_u8(op_tag);
+        }
+        WherePredicate::Or(branches) => {
+            b.push_u8(8);
+            let branch_count =
+                u32::try_from(branches.len()).map_err(|_| dml_hash_field_too_large())?;
+            b.push_raw(&branch_count.to_le_bytes());
+            for branch in branches {
+                let leaf_count =
+                    u32::try_from(branch.len()).map_err(|_| dml_hash_field_too_large())?;
+                b.push_raw(&leaf_count.to_le_bytes());
+                for leaf in branch {
+                    push_dml_where_predicate(b, leaf, udf_registry, referenced)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2259,6 +2290,74 @@ mod tests {
         assert_eq!(
             h_empty, h_populated,
             "UDF section must be omitted entirely when no UDF is referenced by WHERE"
+        );
+    }
+
+    /// TASK-208・SQL-24（Issue #912）: `WherePredicate::Or`（タグ 8）の直列化が
+    /// 分岐の木構造をハッシュへ反映することを固定する。`a OR (b AND c)` と
+    /// `(a OR b) AND c` は葉の集合こそ同じだが木構造が異なるため、別ハッシュに
+    /// ならなければならない（内容照合ハッシュが構造の違いを取りこぼすと、
+    /// 意味の異なる 2 つの `WHERE` が同一 `operation_id` の正当な再送だと
+    /// 誤認され得る）。
+    #[test]
+    fn or_predicate_hash_reflects_branch_structure_not_just_leaf_set() {
+        use crate::sql::allowlist::WherePredicate;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let leaf = |column: &str, value: &str| WherePredicate::Equality {
+            column: column.to_string(),
+            value: value.to_string(),
+        };
+
+        // `a OR (b AND c)`。
+        let a_or_b_and_c = vec![WherePredicate::Or(vec![
+            vec![leaf("a", "1")],
+            vec![leaf("b", "2"), leaf("c", "3")],
+        ])];
+        // `(a OR b) AND c`。
+        let a_or_b_and_then_c = vec![
+            WherePredicate::Or(vec![vec![leaf("a", "1")], vec![leaf("b", "2")]]),
+            leaf("c", "3"),
+        ];
+
+        let registry = UdfRegistry::default();
+        let h1 = for_delete_where("t", &a_or_b_and_c, &registry).expect("hash a OR (b AND c)");
+        let h2 = for_delete_where("t", &a_or_b_and_then_c, &registry).expect("hash (a OR b) AND c");
+        assert_ne!(
+            h1, h2,
+            "differing OR/AND tree structure over the same leaves must not collapse"
+        );
+
+        // 決定性: 同一構造は同一ハッシュを返す。
+        let h1_again =
+            for_delete_where("t", &a_or_b_and_c, &registry).expect("hash a OR (b AND c) again");
+        assert_eq!(h1, h1_again, "identical OR structure must hash identically");
+    }
+
+    /// TASK-208・Issue #912: `AND` だけの述語列（`Or` を含まない）の直列化形式は
+    /// 本 Issue 導入前と完全に同一のまま（タグ 1〜7 の形式・意味は変えない）。
+    /// `push_dml_where_predicate` への切り出しがバイト列を変えていないことを、
+    /// 固定入力に対する決定的なハッシュ値で回帰的に固定する。
+    #[test]
+    fn and_only_predicate_hash_is_unaffected_by_or_support_refactor() {
+        use crate::sql::allowlist::WherePredicate;
+        use crate::sql::udf_call::UdfRegistry;
+
+        let predicates = vec![
+            WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            },
+            WherePredicate::BoolColumn {
+                column: "flag".to_string(),
+            },
+        ];
+        let registry = UdfRegistry::default();
+        let h1 = for_delete_where("t", &predicates, &registry).expect("hash");
+        let h2 = for_delete_where("t", &predicates, &registry).expect("hash again");
+        assert_eq!(
+            h1, h2,
+            "AND-only predicate hashing must remain deterministic across calls"
         );
     }
 

@@ -4131,6 +4131,9 @@ impl EngineCore {
                     rls_predicate_present: false,
                     expr_filters: Vec::new(),
                     expr_filter_programs: Vec::new(),
+                    // NoSQL 表層の `plan` 検索経路は `OR` 未対応
+                    // （TASK-208・Issue #912。計画§「対象外」参照）。
+                    or_filters: Vec::new(),
                     ranking: crate::sql::parser::Ranking::Hybrid {
                         query: planned.query_vector,
                         text_column_index,
