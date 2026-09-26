@@ -462,8 +462,9 @@ fn err4_c_unsupported_op_projects_0a000_to_501() {
     let (core, _guard) = new_core();
     let addr = spawn(core);
 
-    // 語彙外 op。
-    let resp = query_as_alice(addr, br#"{"op":"drop_table","table":"docs"}"#);
+    // 語彙外 op（`drop_table` は Issue #910 で語彙に加わったため、
+    // NOSQL-13 対象外の index 系 DDL 相当を使う）。
+    let resp = query_as_alice(addr, br#"{"op":"drop_index","table":"docs"}"#);
     assert_projected(&resp, "0A000");
 }
 
@@ -740,20 +741,23 @@ fn err4_f_internal_error_projects_xx000_to_500() {
 /// 解析し、射影のみを検証する。
 #[test]
 fn err4_f_unreachable_classes_project_via_production_encoder() {
-    // `DuplicateTable`（`42P07`）・`DuplicateColumn`（`42701`。SQL-23・TASK-85、
-    // Issue #899）は SQL 表層専用の `CREATE TABLE` 分類であり、NoSQL 表層の
-    // `op` 許可リストに `create_table` 相当が存在しないため実要求からは
-    // 構造的に到達不能（`ForbiddenTenantMismatch`・`RowNotFound` と同じ理由）。
-    // `2BP01`／`42809`（TABLE-18・SQL-23・TASK-205、Issue #909）も
-    // `CREATE VIEW`／`DROP VIEW` が SQL 表層専用の DDL であるため同様に
-    // 到達不能。明示トランザクション（SQL-31・TASK-221）の状態エラーも、
-    // NoSQL 表層の `op` 語彙にトランザクション制御が無いため同様に到達不能。
+    // `2BP01`／`42809`（TABLE-18・SQL-23・TASK-205、Issue #909）は
+    // `CREATE VIEW`／`DROP VIEW` が SQL 表層専用の DDL（NoSQL-13 の対象外。
+    // Issue #910 で `op` 許可リストへ加わったのは `create_table`／
+    // `alter_table`／`drop_table` の 3 op のみ）であるため到達不能。
+    // 明示トランザクション（SQL-31・TASK-221）の状態エラーも、NoSQL 表層の
+    // `op` 語彙にトランザクション制御が無いため同様に到達不能。
+    // `DuplicateTable`（`42P07`）・`DuplicateColumn`（`42701`）・
+    // `ForbiddenTenantMismatch`（`42501`。DDL 実行権限不足）は Issue #910 で
+    // `create_table`／`alter_table`／`drop_table` から実要求経由で到達可能に
+    // なったため、本リストから外した（NoSQL の実要求経由の固定は
+    // `tests/nosql13_ddl.rs` の `create_table_duplicate_table_is_42p07`・
+    // `alter_table_add_column_duplicate_column_is_42701`・
+    // `all_three_ddl_ops_reject_with_42501_without_ddl_permission` が担う）。
+    // `RowNotFound` は本 Issue の対象外のため引き続き到達不能のまま。
     for class in [
-        ErrorClass::ForbiddenTenantMismatch,
         ErrorClass::RowNotFound,
         ErrorClass::InvalidCursorName,
-        ErrorClass::DuplicateTable,
-        ErrorClass::DuplicateColumn,
         ErrorClass::DependentObjectsStillExist,
         ErrorClass::WrongObjectType,
         ErrorClass::InvalidTransactionState,

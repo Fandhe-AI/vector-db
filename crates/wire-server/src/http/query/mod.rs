@@ -61,9 +61,15 @@
 //! `TIMESTAMP`／`UUID`／`ARRAY` を含む全列型を SQL 表層と同一の束縛経路
 //! （`engine::sql::parser::bind_insert`／`bind_update`）へ到達させる
 //! （Issue #896・NOSQL-17）。
+//! [`ddl`] は `create_table`／`alter_table`／`drop_table` op（Issue #910・
+//! NOSQL-13・TASK-207）を SQL 表層の DDL（SQL-23）と同一の実行器
+//! （`EngineCore::execute_parsed_in_session`）へトークン列として到達させる
+//! （`gate.rs` の `Op::CreateTable`／`Op::AlterTable`／`Op::DropTable` アーム
+//! から呼ばれる）。
 
 pub mod aggregate;
 pub mod base64_std;
+pub mod ddl;
 pub mod delete;
 pub mod dml_target;
 pub mod explain;
