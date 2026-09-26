@@ -728,6 +728,48 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
     }
 }
 
+/// 既に束縛済みの `BoundExpr` 部分木が内部に持つ `CASE`／`COALESCE`／`NULLIF` の
+/// 最大入れ子段数を数える（対象ビヘイビア: SQL-26。Issue #921 レビュー指摘対応）。
+///
+/// `BindEnv::case_nesting` は束縛「実行中」の構文木を辿る間だけ有効なカウンタで
+/// あり、UDF 呼び出しの実引数はそれ自身の呼び出し元コンテキストで一度束縛
+/// し終えた時点でカウンタが呼び出し前の段数へ戻る（[`bind_with_case_nesting`]）。
+/// そのため `bind_call` が実引数を束縛済み `BoundExpr` として `env.params` へ
+/// 格納したあと、UDF 本体側で `Expr::Ident`（パラメータ参照）を介してその部分木を
+/// まるごと展開すると、呼び出し元での「実引数単体としては上限内」だった入れ子と
+/// 展開先（本体側で既に `CASE`/`COALESCE`/`NULLIF` の内側にいる場合の現在段数）の
+/// 入れ子が合算され、どちらの計測時点でも `MAX_CASE_NESTING` 超過として観測され
+/// ないまま実効ネストだけが上限を超えてすり抜けうる。この関数で展開対象の部分木
+/// が持つ最大追加段数を求め、`bind_expr_in` の `Expr::Ident` 分岐で
+/// `env.case_nesting`（展開先での現在段数）に加算した和を検査することで、
+/// UDF 引数展開後の実効ネストを直接検査する。
+fn max_bound_case_nesting(expr: &BoundExpr) -> usize {
+    match expr {
+        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef | BoundExpr::Null => 0,
+        BoundExpr::Builtin { args, .. } => {
+            args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
+        }
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            max_bound_case_nesting(lhs).max(max_bound_case_nesting(rhs))
+        }
+        BoundExpr::WasmCall { args, .. } => {
+            args.iter().map(max_bound_case_nesting).max().unwrap_or(0)
+        }
+        BoundExpr::Case { whens, else_result } => {
+            let branches_max = whens
+                .iter()
+                .map(|(c, r)| max_bound_case_nesting(c).max(max_bound_case_nesting(r)))
+                .max()
+                .unwrap_or(0);
+            1 + branches_max.max(max_bound_case_nesting(else_result))
+        }
+        BoundExpr::Coalesce(args) => 1 + args.iter().map(max_bound_case_nesting).max().unwrap_or(0),
+        BoundExpr::NullIf { lhs, rhs } => {
+            1 + max_bound_case_nesting(lhs).max(max_bound_case_nesting(rhs))
+        }
+    }
+}
+
 /// 式木が `VECTOR` 列（[`BoundExpr::VectorRef`]）へ到達するかを判定する
 /// （Issue #350: 集計経路が `embedding` を実際にデコードすべきかの判定基盤）。
 /// `embedding` アクセスは束縛段で `VectorRef` に一元化されている（本モジュールの
@@ -995,6 +1037,28 @@ fn bind_expr_in(
                 *node_budget = node_budget
                     .checked_sub(expanded_size)
                     .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+                // 実引数（`bound`）は呼び出し元コンテキストで既に単体の入れ子段数
+                // 検査を通過済みだが、その段数は展開先（ここに到達した時点の
+                // `env.case_nesting`。本体側で既に CASE/COALESCE/NULLIF の内側に
+                // いれば正）とは独立に計測されたものであり、単純な `bound.clone()`
+                // ではこの 2 つの段数が合算されずすり抜ける（`max_bound_case_nesting`
+                // のドキュメンテーションコメント参照。Issue #921 レビュー指摘対応）。
+                // 展開後の実効ネストを `env.case_nesting + 実引数内部の最大段数` として
+                // 直接検査し、`MAX_CASE_NESTING` 超過を fail-closed に拒否する。
+                let expanded_nesting = max_bound_case_nesting(bound);
+                let effective_nesting =
+                    env.case_nesting
+                        .checked_add(expanded_nesting)
+                        .ok_or_else(|| {
+                            SqlSurfaceError::payload_too_large(
+                                "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+                            )
+                        })?;
+                if effective_nesting > MAX_CASE_NESTING {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+                    ));
+                }
                 return Ok((bound.clone(), *ty));
             }
             let schema = env.schema.ok_or_else(|| {
@@ -2447,6 +2511,40 @@ mod tests {
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
         let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn case_nesting_beyond_limit_is_rejected_after_udf_argument_inlining() {
+        // codex-review PR #1101 指摘（対象ビヘイビア: SQL-26。Issue #921）:
+        // 実引数が単体では上限 `MAX_CASE_NESTING` ちょうど（合法）でも、その
+        // 実引数を本体側でさらに `COALESCE` に包む UDF に渡すと、展開後の
+        // 実効ネストが上限を超える。呼び出し元の実引数束縛（合法）・UDF 本体の
+        // 定義時検証（`ident("x")` のみで合法）のどちらの計測時点でも単独では
+        // 超過が見えないため、`Expr::Ident` によるパラメータ展開時に検査しないと
+        // すり抜ける（`max_bound_case_nesting` 参照）。
+        let mut registry = UdfRegistry::default();
+        define_function(
+            &mut registry,
+            "wrap_once",
+            &["x".to_string()],
+            &Expr::Coalesce(vec![ident("x")]),
+        )
+        .expect("defining a 1-level-nesting UDF body should succeed");
+
+        let mut nested_arg = num("1");
+        for _ in 0..MAX_CASE_NESTING {
+            nested_arg = Expr::Coalesce(vec![nested_arg]);
+        }
+        // 実引数単体（`nested_arg`）はちょうど `MAX_CASE_NESTING` 段で合法。
+        let schema = schema_with_vector();
+        let mut budget = MAX_EXPR_NODES;
+        bind_expr(&nested_arg, &schema, &UdfRegistry::default(), &mut budget)
+            .expect("the argument alone must still be within the limit");
+
+        let call_expr = call("wrap_once", vec![nested_arg]);
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&call_expr, &schema, &registry, &mut budget).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 

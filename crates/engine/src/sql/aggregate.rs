@@ -1044,6 +1044,15 @@ impl Accumulator {
                 };
                 match program.eval(id, embedding, scratch)? {
                     ExprValue::Scalar(v) => Some(crate::sql::distinct::canon_f64(v).to_vec()),
+                    // NULL は COUNT(DISTINCT expr) の対象から除外する（対象
+                    // ビヘイビア: SQL-26。Issue #921 レビュー指摘対応。非 distinct
+                    // 経路〔本ファイル `ScalarExpr` 分岐の `ExprValue::Null => Ok(())`〕
+                    // と同じ「NULL は集計対象外」契約を distinct 側でも成立させる。
+                    // 他列型（`*Column`）の `None` 分岐と同様、この `None` は
+                    // 「この行は distinct 集合へ加えない」を表し、内部バグとしては
+                    // 扱わない。`COUNT(DISTINCT NULLIF(...))` のように NULL を返す
+                    // 式で誤って内部エラーにしない）。
+                    ExprValue::Null => None,
                     _ => {
                         return Err(accumulator_bug(
                             "scalar-typed BoundExpr evaluated to a non-scalar value (distinct)",

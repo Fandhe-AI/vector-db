@@ -327,6 +327,31 @@ fn count_of_nullif_counts_only_non_null_values() {
     }
 }
 
+#[test]
+fn count_distinct_of_nullif_counts_only_non_null_distinct_values() {
+    // Cursor Bugbot（PR #1101 レビュー指摘）: `COUNT(DISTINCT NULLIF(...))` の
+    // ような、NULL を返しうるスカラー式を `COUNT(DISTINCT expr)` に渡すと、
+    // `sql::aggregate` の distinct 観測経路が `ExprValue::Null` を「実装バグ」
+    // 扱いして internal error（`accumulator_bug`）になっていた。非 distinct の
+    // `COUNT(NULLIF(...))`（上の `count_of_nullif_counts_only_non_null_values`）
+    // と同じ「NULL は対象から除外する」契約を distinct 側でも成立させる。
+    let (core, _guard) = new_core_with_docs();
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx(),
+            &mut session,
+            "SELECT COUNT(DISTINCT NULLIF(id, 1)) AS c FROM docs",
+        )
+        .expect("SELECT COUNT(DISTINCT NULLIF(...)) should succeed");
+    let result = expect_query(outcome);
+    match cell(&result.rows[0], 0) {
+        // id=1 は NULL になり除外される。残り distinct 値は {2, 3} の 2 件。
+        Cell::Integer(v) => assert_eq!(*v, 2),
+        other => panic!("expected Cell::Integer, got {other:?}"),
+    }
+}
+
 // --- RLS（既存 #353 の契約: 可視行 0 件ならエラーにならない） -----------------
 
 #[test]
