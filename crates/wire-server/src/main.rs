@@ -14,7 +14,8 @@
 //! [--hnsw-sparse-visited-max <N>]
 //! [--auth-method cleartext|scram-sha-256] [--scram-mock-key-file <path>]
 //! [--ddl-allowed-users <user1>[,<user2>...]]
-//! [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]]
+//! [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]
+//!  [--tls-scram-channel-binding enable|disable]]
 //! [--fault-inject post-commit-panic]`
 //! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
 //! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
@@ -128,8 +129,21 @@
 //! 済ませず起動を拒否する。`docs/design/tls-wire-connection.md` 参照）。
 //! TLS 有効時は起動ログへ `TLS enabled (mode=...)` の 1 行のみを出す
 //! （鍵・証明書の内容は出さない）。`SSLRequest` への `'S'` 応答・TLS
-//! ハンドシェイク本体（Issue #965・#966）・実クライアント接続試験（#969）・
-//! SCRAM channel binding（#970）は本 Issue の対象外のまま。
+//! ハンドシェイク本体（Issue #965・#966）・実クライアント接続試験（#969）は
+//! 本 Issue の対象外のまま。
+//!
+//! `--tls-scram-channel-binding`（`enable`／`disable`。未指定時の既定は
+//! `disable`。Issue #970・WIRE-18 ポインタ）: SCRAM-SHA-256-PLUS
+//! （`p=tls-server-end-point`）を機構リストへ提示するか
+//! （`TlsServerConfig::with_scram_channel_binding`）を選ぶ CLI からの
+//! 唯一の入口。`--tls-mode` と同じく `--tls-cert`／`--tls-key` を指定した
+//! ときのみ意味を持ち、単独指定は組合せ不正として fail-closed 拒否する。
+//! 本サーバーが受理する唯一の葉鍵種別（Ed25519）に対し、libpq の既定設定
+//! `channel_binding=prefer`・`channel_binding=require` は `enable` 選択時に
+//! 限り TLS 確立後の SCRAM 交換で失敗しうる（TLS ハンドシェイク自体は
+//! 成立する。実測結果・訂正済みの記述は `docs/design/
+//! tls-channel-binding.md` 参照）ため既定は `disable`。`enable` 有効時は
+//! 起動ログへ運用上の注意を 1 行追加で出す（後述）。
 //!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
@@ -220,6 +234,7 @@ fn run_server(args: &[String]) -> ExitCode {
     let mut tls_cert_raw: Option<PathBuf> = None;
     let mut tls_key_raw: Option<PathBuf> = None;
     let mut tls_mode_raw: Option<String> = None;
+    let mut tls_scram_channel_binding_raw: Option<String> = None;
     // Issue #705（テスト専用・feature `fault-injection` 限定）。feature 無効
     // ビルドではこの変数自体が存在せず、`--fault-inject` は下記 `other =>`
     // 分岐で未知引数として拒否される。
@@ -520,6 +535,25 @@ fn run_server(args: &[String]) -> ExitCode {
                 tls_mode_raw = Some(v.clone());
                 i += 2;
             }
+            wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!(
+                        "wire-server: {} requires one of {:?}",
+                        wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG,
+                        wire_server::tls_opt::SCRAM_CHANNEL_BINDING_TOKENS
+                    );
+                    return ExitCode::FAILURE;
+                };
+                if tls_scram_channel_binding_raw.is_some() {
+                    eprintln!(
+                        "wire-server: {} specified more than once",
+                        wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG
+                    );
+                    return ExitCode::FAILURE;
+                }
+                tls_scram_channel_binding_raw = Some(v.clone());
+                i += 2;
+            }
             // Issue #705（テスト専用・feature `fault-injection` 限定）。feature
             // 無効ビルドではこのアームごとコンパイルされず、`--fault-inject`
             // は下の `other =>` で未知引数として拒否される（fail-closed）。
@@ -720,6 +754,7 @@ fn run_server(args: &[String]) -> ExitCode {
         tls_cert_raw.as_deref(),
         tls_key_raw.as_deref(),
         tls_mode_raw.as_deref(),
+        tls_scram_channel_binding_raw.as_deref(),
     ) {
         Ok(opt) => opt,
         Err(e) => {
@@ -761,13 +796,19 @@ fn run_server(args: &[String]) -> ExitCode {
     // `Display` に委譲するため、鍵・証明書のバイト列・長さは出力されない。
     let tls_config = match &tls_options {
         None => None,
-        Some((cert, key, _mode)) => match wire_server::tls_opt::load_server_config_arc(cert, key) {
-            Ok(cfg) => Some(cfg),
-            Err(e) => {
-                eprintln!("wire-server: failed to load TLS configuration: {e}");
-                return ExitCode::FAILURE;
+        Some((cert, key, _mode, scram_channel_binding)) => {
+            match wire_server::tls_opt::load_server_config_arc_with_options(
+                cert,
+                key,
+                *scram_channel_binding,
+            ) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    eprintln!("wire-server: failed to load TLS configuration: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
-        },
+        }
     };
 
     // 通信路の保護状態は TLS opt-in の有無・`--tls-mode` によって決まる
@@ -775,7 +816,7 @@ fn run_server(args: &[String]) -> ExitCode {
     // ユーザーストア読込より前に行うことで、ユーザーストアの内容に関わらず
     // bind 先が拒否対象であれば即座に終了できる（fail-closed を早期に
     // 確定させる）。
-    let transport_security = match tls_options.as_ref().map(|(_, _, mode)| *mode) {
+    let transport_security = match tls_options.as_ref().map(|(_, _, mode, _)| *mode) {
         None => TransportSecurity::Cleartext,
         Some(wire_server::tls_opt::TlsMode::Require) => TransportSecurity::TlsRequired,
         Some(wire_server::tls_opt::TlsMode::Allow) => TransportSecurity::TlsOptional,
@@ -1017,8 +1058,28 @@ fn run_server(args: &[String]) -> ExitCode {
     // 1 行だけ出す（鍵・証明書の内容は出さない）。未指定時はこの行を一切出さず
     // 既存 stderr をビット同一のまま保つ（`durability`／`surface nosql` の行と
     // 同じ方針。`listening on` より前・bind 成功後に置く）。
-    if let Some((_, _, mode)) = &tls_options {
+    if let Some((_, _, mode, scram_channel_binding)) = &tls_options {
         eprintln!("wire-server: TLS enabled (mode={})", mode.token());
+        // Issue #970: `--tls-scram-channel-binding enable` を選んだ場合のみ、
+        // Ed25519 葉証明書での libpq 相互運用上の既知の注意を 1 行追加する
+        // （既定 `disable` では従来どおりこの行を出さず stderr をビット同一の
+        // まま保つ）。
+        if *scram_channel_binding {
+            // codex-review PR #1087 P2 是正: この行は `--tls-scram-channel-binding
+            // enable` 指定の事実のみを示す（「実際に提示された」という確定的な
+            // 主張はしない）。実際の提示は `--auth-method scram-sha-256` かつ
+            // 当該接続で `tls-server-end-point` を算出できた場合に限る
+            // （`--auth-method cleartext` では SASL 自体を送らないため PLUS は
+            // 一切提示されない。非対応の署名アルゴリズムの証明書でも同様）。
+            eprintln!(
+                "wire-server: SCRAM-SHA-256-PLUS advertisement enabled ({} enable); only takes \
+                 effect for scram-sha-256 authentication when tls-server-end-point could be \
+                 computed for this server's certificate; libpq's default \
+                 channel_binding=prefer/require may then fail against this server's Ed25519 \
+                 leaf certificate (see docs/design/tls-channel-binding.md)",
+                wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG
+            );
+        }
     }
 
     // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
@@ -1043,7 +1104,7 @@ fn run_server(args: &[String]) -> ExitCode {
             // ならない）。無効時は従来どおり `accept_loop_with_engine` を呼び、
             // 既存経路とビット同一のまま維持する。
             match (&tls_config, &tls_options) {
-                (Some(cfg), Some((_, _, mode))) => {
+                (Some(cfg), Some((_, _, mode, _))) => {
                     server::accept_loop_with_tls_mode(
                         listener,
                         store,
@@ -1258,31 +1319,46 @@ fn resolve_auth_method(raw: Option<&str>) -> Result<wire_server::auth::AuthMetho
     }
 }
 
-/// `--tls-cert`／`--tls-key`／`--tls-mode` の未パース値（Issue #967）から
-/// `(cert_path, key_path, TlsMode)` を解決する。純関数として切り出し、
+/// `--tls-cert`／`--tls-key`／`--tls-mode`／`--tls-scram-channel-binding`
+/// の未パース値（Issue #967・#970）から `(cert_path, key_path, TlsMode,
+/// scram_channel_binding)` を解決する。純関数として切り出し、
 /// `std::env::args()` を直接読まずに単体テストできるようにする
 /// （`resolve_search_engine`・`resolve_durability` と同じ流儀。
 /// `--scram-mock-key-file` の組合せ検証を参考にした設計）。
 ///
-/// - `cert`・`key` がいずれも `None`: TLS 未指定。`mode_raw` が `Some` でも
-///   単独指定として `Err`（D4。`--hnsw-*` が `--search-engine` を要求するのと
-///   同じ設計）。それ以外は `Ok(None)`（TLS 無効のまま既存経路を通す）。
+/// - `cert`・`key` がいずれも `None`: TLS 未指定。`mode_raw`・
+///   `scram_channel_binding_raw` のいずれかが `Some` でも単独指定として
+///   `Err`（D4。`--hnsw-*` が `--search-engine` を要求するのと同じ設計）。
+///   それ以外は `Ok(None)`（TLS 無効のまま既存経路を通す）。
 /// - `cert`・`key` の片方のみ `Some`: 組合せ不正として `Err`。
 /// - `cert`・`key` がいずれも `Some`: `mode_raw` を [`wire_server::tls_opt::
 ///   parse`] で解決する（`None`＝未指定は既定 `TlsMode::Require`。D3:
-///   安全側の既定値）。不正な語彙値は `Err`（fail-closed。既定へ黙って
-///   読み替えない）。
+///   安全側の既定値）。`scram_channel_binding_raw` は
+///   [`wire_server::tls_opt::parse_scram_channel_binding`] で解決する
+///   （`None`＝未指定は既定 `false`＝非提示。Ed25519 葉証明書での libpq
+///   相互運用実測に基づく安全側の既定値。`docs/design/
+///   tls-channel-binding.md` 参照）。不正な語彙値はいずれも `Err`
+///   （fail-closed。既定へ黙って読み替えない）。
 fn resolve_tls_options(
     cert: Option<&std::path::Path>,
     key: Option<&std::path::Path>,
     mode_raw: Option<&str>,
-) -> Result<Option<(PathBuf, PathBuf, wire_server::tls_opt::TlsMode)>, String> {
+    scram_channel_binding_raw: Option<&str>,
+) -> Result<Option<(PathBuf, PathBuf, wire_server::tls_opt::TlsMode, bool)>, String> {
     match (cert, key) {
         (None, None) => {
             if mode_raw.is_some() {
                 return Err(format!(
                     "{} requires {} and {} to also be set",
                     wire_server::tls_opt::MODE_FLAG,
+                    wire_server::tls_opt::CERT_FLAG,
+                    wire_server::tls_opt::KEY_FLAG
+                ));
+            }
+            if scram_channel_binding_raw.is_some() {
+                return Err(format!(
+                    "{} requires {} and {} to also be set",
+                    wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG,
                     wire_server::tls_opt::CERT_FLAG,
                     wire_server::tls_opt::KEY_FLAG
                 ));
@@ -1304,7 +1380,16 @@ fn resolve_tls_options(
                 None => wire_server::tls_opt::TlsMode::Require,
                 Some(raw) => wire_server::tls_opt::parse(raw)?,
             };
-            Ok(Some((cert.to_path_buf(), key.to_path_buf(), mode)))
+            let scram_channel_binding = match scram_channel_binding_raw {
+                None => false,
+                Some(raw) => wire_server::tls_opt::parse_scram_channel_binding(raw)?,
+            };
+            Ok(Some((
+                cert.to_path_buf(),
+                key.to_path_buf(),
+                mode,
+                scram_channel_binding,
+            )))
         }
     }
 }
@@ -1792,22 +1877,34 @@ mod tests {
         expect_err(resolve_durability(Some("Immediate")));
     }
 
-    // Issue #967: `--tls-cert`／`--tls-key`／`--tls-mode` の組合せ解決の
-    // 単体テスト。子プロセス経由の外形的検証（起動受理・拒否・TLS
-    // ハンドシェイク完走・`08P01` 平文拒否）は `tests/wire_tls_cli.rs` が担う。
+    // Issue #967・#970: `--tls-cert`／`--tls-key`／`--tls-mode`／
+    // `--tls-scram-channel-binding` の組合せ解決の単体テスト。子プロセス
+    // 経由の外形的検証（起動受理・拒否・TLS ハンドシェイク完走・`08P01`
+    // 平文拒否）は `tests/wire_tls_cli.rs` が担う。
 
     #[test]
     fn resolve_tls_options_none_when_all_unset() {
-        assert_eq!(resolve_tls_options(None, None, None), Ok(None));
+        assert_eq!(resolve_tls_options(None, None, None, None), Ok(None));
     }
 
     #[test]
     fn resolve_tls_options_mode_alone_is_rejected() {
         // D4: `--tls-mode` 単独指定は組合せ不正（`--hnsw-*` が
         // `--search-engine` を要求するのと同じ設計）。
-        let err = expect_err(resolve_tls_options(None, None, Some("require")));
+        let err = expect_err(resolve_tls_options(None, None, Some("require"), None));
         assert!(
             err.contains(wire_server::tls_opt::MODE_FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_tls_options_scram_channel_binding_alone_is_rejected() {
+        // `--tls-mode` と同じ組合せ不正の設計を `--tls-scram-channel-binding`
+        // にも適用する（Issue #970）。
+        let err = expect_err(resolve_tls_options(None, None, None, Some("enable")));
+        assert!(
+            err.contains(wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG),
             "unexpected error: {err}"
         );
     }
@@ -1816,6 +1913,7 @@ mod tests {
     fn resolve_tls_options_cert_alone_is_rejected() {
         let err = expect_err(resolve_tls_options(
             Some(std::path::Path::new("cert.pem")),
+            None,
             None,
             None,
         ));
@@ -1831,6 +1929,7 @@ mod tests {
             None,
             Some(std::path::Path::new("key.pem")),
             None,
+            None,
         ));
         assert!(
             err.contains(wire_server::tls_opt::CERT_FLAG),
@@ -1841,9 +1940,10 @@ mod tests {
     #[test]
     fn resolve_tls_options_mode_unset_defaults_to_require() {
         // D3: モード省略時の既定は安全側の `require`。
-        let (cert, key, mode) = resolve_tls_options(
+        let (cert, key, mode, scram_channel_binding) = resolve_tls_options(
             Some(std::path::Path::new("cert.pem")),
             Some(std::path::Path::new("key.pem")),
+            None,
             None,
         )
         .expect("cert+key must be accepted")
@@ -1851,14 +1951,18 @@ mod tests {
         assert_eq!(cert, std::path::PathBuf::from("cert.pem"));
         assert_eq!(key, std::path::PathBuf::from("key.pem"));
         assert_eq!(mode, wire_server::tls_opt::TlsMode::Require);
+        // Issue #970: 未指定時の既定は非提示（`false`）。libpq 相互運用実測
+        // に基づく安全側の既定値（`docs/design/tls-channel-binding.md`）。
+        assert!(!scram_channel_binding);
     }
 
     #[test]
     fn resolve_tls_options_accepts_explicit_allow() {
-        let (_, _, mode) = resolve_tls_options(
+        let (_, _, mode, _) = resolve_tls_options(
             Some(std::path::Path::new("cert.pem")),
             Some(std::path::Path::new("key.pem")),
             Some("allow"),
+            None,
         )
         .expect("cert+key+allow must be accepted")
         .expect("cert+key+allow must yield Some");
@@ -1871,9 +1975,52 @@ mod tests {
             Some(std::path::Path::new("cert.pem")),
             Some(std::path::Path::new("key.pem")),
             Some("prefer"),
+            None,
         ));
         assert!(
             err.contains(wire_server::tls_opt::MODE_FLAG),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_tls_options_scram_channel_binding_unset_defaults_to_disabled() {
+        // Issue #970: cert+key のみ指定した既存経路が壊れないことも確認する
+        // （新フラグ追加が既定挙動を変えない回帰確認）。
+        let (_, _, _, scram_channel_binding) = resolve_tls_options(
+            Some(std::path::Path::new("cert.pem")),
+            Some(std::path::Path::new("key.pem")),
+            None,
+            None,
+        )
+        .expect("cert+key must be accepted")
+        .expect("cert+key must yield Some");
+        assert!(!scram_channel_binding);
+    }
+
+    #[test]
+    fn resolve_tls_options_accepts_explicit_enable() {
+        let (_, _, _, scram_channel_binding) = resolve_tls_options(
+            Some(std::path::Path::new("cert.pem")),
+            Some(std::path::Path::new("key.pem")),
+            None,
+            Some("enable"),
+        )
+        .expect("cert+key+enable must be accepted")
+        .expect("cert+key+enable must yield Some");
+        assert!(scram_channel_binding);
+    }
+
+    #[test]
+    fn resolve_tls_options_rejects_unknown_scram_channel_binding_value() {
+        let err = expect_err(resolve_tls_options(
+            Some(std::path::Path::new("cert.pem")),
+            Some(std::path::Path::new("key.pem")),
+            None,
+            Some("true"),
+        ));
+        assert!(
+            err.contains(wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG),
             "unexpected error: {err}"
         );
     }

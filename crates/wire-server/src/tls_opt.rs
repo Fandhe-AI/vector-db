@@ -1,7 +1,8 @@
 //! `wire-server` バイナリ（`main.rs`）が起動時に受け取る TLS opt-in CLI
-//! 引数（`--tls-cert`／`--tls-key`／`--tls-mode`）の閉じた語彙パーサと
-//! サーバー証明書・鍵の読み込み手順（Issue #967・親 #941・TASK-228。対象
-//! ビヘイビア WIRE-7, WIRE-9, HTTP-9, HTTP-10）。
+//! 引数（`--tls-cert`／`--tls-key`／`--tls-mode`／`--tls-scram-channel-
+//! binding`）の閉じた語彙パーサとサーバー証明書・鍵の読み込み手順
+//! （Issue #967・#970・親 #941・TASK-228。対象ビヘイビア WIRE-7, WIRE-9,
+//! WIRE-18, HTTP-9, HTTP-10）。
 //!
 //! `--durability`（[`crate::durability_opt`]）・`--search-engine`
 //! （[`crate::search_engine_opt`]）と同型の「プロセス起動時にのみ明示指定
@@ -14,6 +15,16 @@
 //! 拒否するか（`require`）を選ぶ（`crate::handshake::
 //! handle_connection_with_tls_mode` が参照する）。証明書・鍵ファイルの
 //! バイト列・長さは本モジュールの外（ログ・エラーメッセージ）へ一切出さない。
+//!
+//! `--tls-scram-channel-binding`（`enable`／`disable`。既定 `disable`）は
+//! SCRAM-SHA-256-PLUS（`p=tls-server-end-point`）を機構リストへ提示する
+//! か（`TlsServerConfig::with_scram_channel_binding`。Issue #970）を CLI
+//! から切り替える唯一の入口。`--tls-cert`／`--tls-key` を指定したときのみ
+//! 意味を持ち、単独指定は `--tls-mode` と同じ理由で組合せ不正として
+//! fail-closed 拒否する（`main::resolve_tls_options` 参照）。本サーバーが
+//! 受理する唯一の葉鍵種別（Ed25519）に対し、`enable` を選ぶと libpq の
+//! `channel_binding=prefer`／`require` が接続失敗しうる（`docs/design/
+//! tls-channel-binding.md` の実測結果参照）ため既定は `disable`。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -33,6 +44,14 @@ pub const MODE_FLAG: &str = "--tls-mode";
 /// `--tls-mode` が受理する語彙（順序は `parse` の分岐・エラーメッセージの
 /// 一覧順・README 記載順の単一情報源。`durability_opt::TOKENS` と同じ流儀）。
 pub const MODE_TOKENS: [&str; 2] = ["require", "allow"];
+
+/// `--tls-scram-channel-binding` の CLI フラグ名（Issue #970）。
+pub const SCRAM_CHANNEL_BINDING_FLAG: &str = "--tls-scram-channel-binding";
+
+/// `--tls-scram-channel-binding` が受理する語彙（`MODE_TOKENS` と同じ流儀。
+/// 既定は `disable` 相当。`main::resolve_tls_options` が未指定時にこの既定を
+/// 適用する）。
+pub const SCRAM_CHANNEL_BINDING_TOKENS: [&str; 2] = ["enable", "disable"];
 
 /// `SSLRequest` を経ない平文 StartupMessage の受理ポリシー。
 ///
@@ -74,6 +93,19 @@ pub fn parse(raw: &str) -> Result<TlsMode, String> {
     }
 }
 
+/// `raw`（CLI 引数の値）を [`SCRAM_CHANNEL_BINDING_TOKENS`] の厳密一致でのみ
+/// 受理し、`TlsServerConfig::with_scram_channel_binding` へ渡す `bool` へ
+/// 変換する（`parse` と同じ「厳密一致のみ受理」方針）。
+pub fn parse_scram_channel_binding(raw: &str) -> Result<bool, String> {
+    match raw {
+        "enable" => Ok(true),
+        "disable" => Ok(false),
+        other => Err(format!(
+            "{SCRAM_CHANNEL_BINDING_FLAG} must be one of {SCRAM_CHANNEL_BINDING_TOKENS:?} (got {other:?})"
+        )),
+    }
+}
+
 /// [`load_server_config`] の失敗理由。`Display` は各内部エラー型の内容
 /// 非依存な `Display` へ委譲し、鍵・証明書の内容・長さは含めない
 /// （呼び出し元がフラグ名を前置してエラーメッセージを組み立てる）。
@@ -101,7 +133,11 @@ impl std::fmt::Display for TlsConfigLoadError {
 impl std::error::Error for TlsConfigLoadError {}
 
 /// `cert`（証明書チェーン PEM）・`key`（Ed25519 PKCS#8 秘密鍵 PEM）から
-/// [`TlsServerConfig`] を構築する（Issue #967）。
+/// [`TlsServerConfig`] を構築する（Issue #967）。`PLUS` 提示は既定 `false`
+/// （非提示）のまま構築する後方互換の薄いラッパーで、実体は
+/// [`load_server_config_with_options`] に委譲する（codex-review PR #1087
+/// P1 是正: 公開関数へ必須引数を追加すると既存呼び出し元を破壊するため、
+/// 2 引数のシグネチャ自体は変えない）。
 ///
 /// 手順（鍵を先に読むのは、葉証明書の公開鍵照合に公開鍵が要るため）:
 /// 1. `key` から Ed25519 seed を読み、署名鍵を導出する。
@@ -112,6 +148,19 @@ impl std::error::Error for TlsConfigLoadError {}
 /// `Ed25519Seed`／`SigningKey` は複製せず、鍵のバイト列・長さをエラー
 /// メッセージへ出さない（`Ed25519Seed` の `Drop` ゼロ化を活かす）。
 pub fn load_server_config(cert: &Path, key: &Path) -> Result<TlsServerConfig, TlsConfigLoadError> {
+    load_server_config_with_options(cert, key, false)
+}
+
+/// [`load_server_config`] に `--tls-scram-channel-binding`（Issue #970）の
+/// 解決済み値を追加で渡せる入口。`main.rs` はこちらを呼ぶ
+/// （`handle_connection_with_options`・`accept_loop_with_tls_mode` 等、
+/// 既存関数を「オプション追加時は `_with_options` を新設し、元の関数は
+/// 既定値で委譲する後方互換ラッパーへ変える」流儀に合わせる）。
+pub fn load_server_config_with_options(
+    cert: &Path,
+    key: &Path,
+    scram_channel_binding: bool,
+) -> Result<TlsServerConfig, TlsConfigLoadError> {
     let seed = pkcs8::load_ed25519_private_key_file(key).map_err(TlsConfigLoadError::Key)?;
     let signing_key = SigningKey::from_seed(&seed);
     let public_key = signing_key.public_key();
@@ -120,16 +169,30 @@ pub fn load_server_config(cert: &Path, key: &Path) -> Result<TlsServerConfig, Tl
     let chain = x509::load_server_certificate_chain_file(cert, &public_key, now)
         .map_err(TlsConfigLoadError::Certificate)?;
 
-    TlsServerConfig::new(chain, signing_key).map_err(TlsConfigLoadError::Mismatch)
+    TlsServerConfig::new(chain, signing_key)
+        .map(|cfg| cfg.with_scram_channel_binding(scram_channel_binding))
+        .map_err(TlsConfigLoadError::Mismatch)
 }
 
 /// [`load_server_config`] の結果を `Arc` へ包むヘルパー（`server::
-/// accept_loop_with_tls_mode` が要求する型と一致させる）。
+/// accept_loop_with_tls_mode` が要求する型と一致させる）。既定 `false`
+/// のまま構築する後方互換ラッパー（実体は
+/// [`load_server_config_arc_with_options`]）。
 pub fn load_server_config_arc(
     cert: &Path,
     key: &Path,
 ) -> Result<Arc<TlsServerConfig>, TlsConfigLoadError> {
-    load_server_config(cert, key).map(Arc::new)
+    load_server_config_arc_with_options(cert, key, false)
+}
+
+/// [`load_server_config_arc`] に `--tls-scram-channel-binding` の解決済み
+/// 値を追加で渡せる入口（`main.rs` が呼ぶ）。
+pub fn load_server_config_arc_with_options(
+    cert: &Path,
+    key: &Path,
+    scram_channel_binding: bool,
+) -> Result<Arc<TlsServerConfig>, TlsConfigLoadError> {
+    load_server_config_with_options(cert, key, scram_channel_binding).map(Arc::new)
 }
 
 #[cfg(test)]
@@ -190,7 +253,8 @@ mod tests {
         // `TlsServerConfig`（`Ok` 側）は鍵・証明書を保持するため `Debug` を
         // 導出しない（内容を誤ってログへ出さないための設計判断）。
         // `expect_err` は `Ok` 側に `Debug` を要求するため使わず、`match` で
-        // 直接判定する。
+        // 直接判定する。2 引数版の呼び出しが壊れないことも兼ねて確認する
+        // （codex-review PR #1087 P1 是正: 破壊的シグネチャ変更の回帰確認）。
         match load_server_config(
             Path::new("/nonexistent/cert.pem"),
             Path::new("/nonexistent/key.pem"),
@@ -199,5 +263,55 @@ mod tests {
             Err(other) => panic!("expected Key error, got a different error: {other}"),
             Ok(_) => panic!("missing files must fail"),
         }
+    }
+
+    #[test]
+    fn load_server_config_with_options_reports_missing_key_file() {
+        // `_with_options` 入口も同じ失敗を返すことを確認する（薄いラッパー
+        // であることの回帰確認）。
+        match load_server_config_with_options(
+            Path::new("/nonexistent/cert.pem"),
+            Path::new("/nonexistent/key.pem"),
+            true,
+        ) {
+            Err(TlsConfigLoadError::Key(_)) => {}
+            Err(other) => panic!("expected Key error, got a different error: {other}"),
+            Ok(_) => panic!("missing files must fail"),
+        }
+    }
+
+    #[test]
+    fn parse_scram_channel_binding_accepts_all_tokens() {
+        for tok in SCRAM_CHANNEL_BINDING_TOKENS {
+            assert!(
+                parse_scram_channel_binding(tok).is_ok(),
+                "expected {tok:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_scram_channel_binding_enable_and_disable_round_trip() {
+        assert_eq!(parse_scram_channel_binding("enable"), Ok(true));
+        assert_eq!(parse_scram_channel_binding("disable"), Ok(false));
+    }
+
+    #[test]
+    fn parse_scram_channel_binding_rejects_case_variants_and_whitespace() {
+        for raw in [
+            "Enable", "ENABLE", " disable", "disable ", "Disable", "", "true", "enable\n",
+        ] {
+            assert!(
+                parse_scram_channel_binding(raw).is_err(),
+                "expected {raw:?} to be rejected (strict match only)"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_scram_channel_binding_rejects_control_character_injection() {
+        let err = parse_scram_channel_binding("enable\0bogus")
+            .expect_err("must reject control characters");
+        assert!(err.contains(SCRAM_CHANNEL_BINDING_FLAG));
     }
 }

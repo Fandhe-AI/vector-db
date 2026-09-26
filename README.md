@@ -73,7 +73,8 @@ cargo run -p fandhe-vector-db-wire-server -- --users <ユーザーストアの�
   [--ddl-allowed-users <user1>[,<user2>...]] \
   [--auth-method cleartext|scram-sha-256] \
   [--scram-mock-key-file <path>] \
-  [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]]
+  [--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow] \
+   [--tls-scram-channel-binding enable|disable]]
 ```
 
 `--users`・`--db` はいずれも必須です（省略時は匿名ログイン・匿名 DB を暗黙生成せず
@@ -235,10 +236,10 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
 - **NoSQL 表層（`--surface nosql`）とは併用できません**（起動時 fail-closed で
   拒否）。`POST /v1/session` は Argon2id 照合を直接呼ぶ別経路であり SASL の
   ような往復を持たないためです（HTTP-10）。
-- TLS 自体は `--tls-cert`／`--tls-key`（下記参照）で opt-in できますが、
-  SCRAM channel binding（`SCRAM-SHA-256-PLUS`・`p=` フラグ）は現時点では
-  結線されておらず提示・受理せず `08P01` で拒否します（詳細は Issue #941・
-  #970 参照）。
+- TLS 自体は `--tls-cert`／`--tls-key`（下記参照）で opt-in できます。SCRAM
+  channel binding（`SCRAM-SHA-256-PLUS`・`p=` フラグ）は結線済みですが、
+  機構リストへの提示は `--tls-scram-channel-binding enable`（下記参照。
+  既定 `disable`）を明示指定した場合のみです（Issue #941・#970）。
 - **`--scram-mock-key-file <path>` が必須です**（`scram-sha-256` 選択時のみ。
   未指定・`cleartext` との組合せ・32 バイト未満のファイルはいずれも
   fail-closed で起動拒否）。未知ユーザー向けモック検証子（列挙攻撃対策）の
@@ -292,8 +293,23 @@ TLS 有効時は起動ログへ `TLS enabled (mode=require|allow)` の 1 行の�
 まま不変です）。`--surface nosql`（HTTP リスナー）との併用は現時点では
 拒否されます（NoSQL 表層はまだ TLS を終端しないため。Issue #968 で対応
 予定）。実クライアント（psql・openssl s_client 等）での接続試験は
-Issue #969、SCRAM channel binding（`tls-server-end-point`）は Issue #970 の
-担当です。詳細は `docs/design/tls-wire-connection.md` を参照してください。
+Issue #969 の担当です。詳細は `docs/design/tls-wire-connection.md` を
+参照してください。
+
+`--tls-scram-channel-binding`（`enable`／`disable`。Issue #970・WIRE-18
+ポインタ）は SCRAM-SHA-256-PLUS（`p=tls-server-end-point`。RFC 5929 §4）
+を機構リストへ提示するかを選ぶ opt-in CLI 引数です。`--tls-mode` と同じく
+`--tls-cert`／`--tls-key` を指定したときのみ意味を持ち、単独指定は
+fail-closed で起動エラーになります。**未指定時の既定は `disable`**（非
+提示）です。本サーバーが受理する唯一の葉鍵種別である Ed25519 証明書に
+対し、libpq（psql 18.6・OpenSSL 3.5.5 で実測）の既定設定
+`channel_binding=prefer`・`channel_binding=require` は `enable` を選ぶと
+TLS 確立後の SCRAM 交換で失敗しうる（`could not find digest for NID
+UNDEF`。TLS ハンドシェイク自体は成立します）ため、一般的な libpq
+クライアントとの互換性を優先し既定を `disable` にしています。`enable`
+を選んだ場合は起動ログへ運用上の注意を 1 行追加で出します。実測結果・
+判断根拠の詳細は `docs/design/tls-channel-binding.md`（ADR）を参照して
+ください。
 
 ### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 

@@ -1,0 +1,360 @@
+//! RFC 5929 §4 の `tls-server-end-point` チャネルバインディング値の算出
+//! （TASK-228・WIRE-9・WIRE-18・HTTP-10 ポインタ。Issue #970・親 #941）。
+//!
+//! SCRAM-SHA-256-PLUS（[`super::super::auth::scram`]。WIRE-18）がチャネル
+//! バインディングとして提示・検証する値は、TLS サーバー証明書（葉）の
+//! `signatureAlgorithm` に応じたハッシュ関数で、葉証明書の DER 全体を
+//! ハッシュしたものである（RFC 5929 §4.1）。本モジュールはこの算出のみを
+//! 担う純粋関数層で、TLS 接続状態・SCRAM の交渉判定は一切持たない。
+//!
+//! `TlsServerConfig::new`（[`super::server_handshake`]。#967 が起動時に
+//! 構築する接続点）が起動時に 1 回だけ呼び出し、結果を [`super::server_handshake::
+//! TlsSession`]／[`super::stream::TlsStream`]／[`crate::wire_stream::WireStream`]
+//! へ伝搬する。非対応の署名アルゴリズムは呼び出し元が起動失敗にはせず
+//! `None`（チャネルバインディング非提供）へ縮退させる契約とする
+//! （`docs/design/tls-channel-binding.md` 参照）。
+//!
+//! ## 定数時間性
+//!
+//! 証明書は公開データであり、`signatureAlgorithm` の OID による分岐は
+//! 秘密値に依存しない（[`super::x509`] の「定数時間性」節と同じ整理）。
+
+use super::x509::MAX_CERTIFICATE_DER_LEN;
+use crate::tls::der::{DerError, DerReader};
+
+const TAG_SEQUENCE: u8 = 0x30;
+const TAG_BIT_STRING: u8 = 0x03;
+const TAG_OID: u8 = 0x06;
+
+/// rsaEncryption 系署名アルゴリズムの OID（本モジュール内での比較専用に
+/// 個別定義する。[`super::x509`] の同名定数とは独立に持つ）。
+const OID_MD5_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x04];
+const OID_SHA1_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x05];
+const OID_SHA256_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+const OID_SHA512_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
+const OID_ECDSA_WITH_SHA1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01];
+const OID_ECDSA_WITH_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+const OID_ECDSA_WITH_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
+/// Ed25519（1.3.101.112。RFC 8410 §3）。RFC 5929 は単一ハッシュを持たない
+/// 署名方式を定義していないため、Ed25519 署名の証明書へ SHA-256 を使うのは
+/// 本リポの実装既定値（`docs/design/tls-channel-binding.md` 参照）。
+const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+
+/// [`tls_server_end_point`] が返すハッシュ値（署名アルゴリズムに応じて
+/// SHA-256／SHA-512 のいずれか。長さ固定のため可変長 `Vec` を使わない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsServerEndPoint {
+    Sha256([u8; 32]),
+    Sha512([u8; 64]),
+}
+
+impl TlsServerEndPoint {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            TlsServerEndPoint::Sha256(digest) => digest.as_slice(),
+            TlsServerEndPoint::Sha512(digest) => digest.as_slice(),
+        }
+    }
+}
+
+/// [`tls_server_end_point`] の拒否理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelBindingError {
+    /// `Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
+    /// signatureValue BIT STRING }` の外側構造が DER として不正、または
+    /// DER 長が [`MAX_CERTIFICATE_DER_LEN`] を超える。
+    Malformed,
+    /// `signatureAlgorithm` の OID が下表（本モジュール内の対応表）に無い。
+    UnsupportedSignatureAlgorithm,
+}
+
+impl std::fmt::Display for ChannelBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelBindingError::Malformed => {
+                write!(f, "certificate DER is malformed for channel binding")
+            }
+            ChannelBindingError::UnsupportedSignatureAlgorithm => write!(
+                f,
+                "certificate signature algorithm is not supported for channel binding"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChannelBindingError {}
+
+/// `signatureAlgorithm` OID から、`tls-server-end-point`（RFC 5929 §4.1）が
+/// 使うべきハッシュ関数を選ぶ。表に無い OID は fail-closed に拒否する
+/// （推測で別のハッシュを当てない）。
+enum HashChoice {
+    Sha256,
+    Sha512,
+}
+
+fn classify_signature_oid(oid: &[u8]) -> Option<HashChoice> {
+    if oid == OID_MD5_WITH_RSA
+        || oid == OID_SHA1_WITH_RSA
+        || oid == OID_ECDSA_WITH_SHA1
+        || oid == OID_SHA256_WITH_RSA
+        || oid == OID_ECDSA_WITH_SHA256
+        || oid == OID_ED25519
+    {
+        Some(HashChoice::Sha256)
+    } else if oid == OID_SHA512_WITH_RSA || oid == OID_ECDSA_WITH_SHA512 {
+        Some(HashChoice::Sha512)
+    } else {
+        None
+    }
+}
+
+/// `AlgorithmIdentifier ::= SEQUENCE { algorithm OBJECT IDENTIFIER,
+/// parameters ANY OPTIONAL }` の構造を検査し、OID の値部分を返す
+/// （[`super::x509::validate_algorithm_identifier_structure`] と同じ形の
+/// 検査を、本モジュール独立の `DerReader` 呼び出しとして行う）。
+fn read_algorithm_oid(tlv_value: &[u8]) -> Result<&[u8], ChannelBindingError> {
+    let mut reader = DerReader::new(tlv_value);
+    let oid = reader
+        .read_expected(TAG_OID)
+        .map_err(|_| ChannelBindingError::Malformed)?;
+    if !reader.is_empty() {
+        // parameters ANY: 中身の意味は解釈しないが、1 個の TLV として
+        // 整形式であることだけ要求する。
+        reader
+            .read_any()
+            .map_err(|_: DerError| ChannelBindingError::Malformed)?;
+    }
+    reader
+        .expect_end()
+        .map_err(|_| ChannelBindingError::Malformed)?;
+    Ok(oid)
+}
+
+/// RFC 5929 §4 の `tls-server-end-point` チャネルバインディング値を算出する。
+///
+/// `cert_der` は葉証明書の DER 全体（[`super::x509::ServerCertificateChain::
+/// leaf_der`] が返す値）を想定する。手順:
+///
+/// 1. `cert_der.len() > MAX_CERTIFICATE_DER_LEN` を確保前に拒否する
+/// 2. `Certificate` 外側 `SEQUENCE` を読み、`tbsCertificate`（`SEQUENCE`。
+///    中身は解釈しない）・`signatureAlgorithm`（`SEQUENCE`）・
+///    `signatureValue`（`BIT STRING`）の 3 要素のみで構成されることを
+///    検査する（後続バイトは拒否）
+/// 3. `signatureAlgorithm` の OID を [`classify_signature_oid`] でハッシュへ
+///    分類し、`cert_der` 全体をそのハッシュでダイジェストする
+pub fn tls_server_end_point(cert_der: &[u8]) -> Result<TlsServerEndPoint, ChannelBindingError> {
+    if cert_der.len() > MAX_CERTIFICATE_DER_LEN {
+        return Err(ChannelBindingError::Malformed);
+    }
+
+    let mut outer = DerReader::new(cert_der);
+    let certificate_seq = outer
+        .read_expected(TAG_SEQUENCE)
+        .map_err(|_| ChannelBindingError::Malformed)?;
+    outer
+        .expect_end()
+        .map_err(|_| ChannelBindingError::Malformed)?;
+
+    let mut fields = DerReader::new(certificate_seq);
+    let _tbs_certificate = fields
+        .read_expected(TAG_SEQUENCE)
+        .map_err(|_| ChannelBindingError::Malformed)?;
+    let signature_algorithm = fields
+        .read_expected(TAG_SEQUENCE)
+        .map_err(|_| ChannelBindingError::Malformed)?;
+    let _signature_value = fields
+        .read_expected(TAG_BIT_STRING)
+        .map_err(|_| ChannelBindingError::Malformed)?;
+    fields
+        .expect_end()
+        .map_err(|_| ChannelBindingError::Malformed)?;
+
+    let oid = read_algorithm_oid(signature_algorithm)?;
+    match classify_signature_oid(oid) {
+        Some(HashChoice::Sha256) => Ok(TlsServerEndPoint::Sha256(engine::crypto::sha256::digest(
+            cert_der,
+        ))),
+        Some(HashChoice::Sha512) => Ok(TlsServerEndPoint::Sha512(super::sha512::digest(cert_der))),
+        None => Err(ChannelBindingError::UnsupportedSignatureAlgorithm),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = body.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else if len < 0x100 {
+            out.push(0x81);
+            out.push(len as u8);
+        } else {
+            out.push(0x82);
+            out.push((len >> 8) as u8);
+            out.push((len & 0xff) as u8);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn sequence(parts: &[&[u8]]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for part in parts {
+            body.extend_from_slice(part);
+        }
+        tlv(TAG_SEQUENCE, &body)
+    }
+
+    fn algorithm_identifier(oid: &[u8]) -> Vec<u8> {
+        sequence(&[&tlv(TAG_OID, oid)])
+    }
+
+    /// 最小の合成 `Certificate` DER（`tbsCertificate` は中身を持たない空
+    /// `SEQUENCE` で十分。本モジュールは中身を解釈しない）。署名値も
+    /// 空のダミー `BIT STRING` で足りる。
+    fn synthetic_certificate_der(signature_oid: &[u8]) -> Vec<u8> {
+        let tbs_certificate = sequence(&[]);
+        let signature_algorithm = algorithm_identifier(signature_oid);
+        let signature_value = tlv(TAG_BIT_STRING, &[0x00, 0xaa]);
+        sequence(&[&tbs_certificate, &signature_algorithm, &signature_value])
+    }
+
+    #[test]
+    fn sha256_signature_algorithms_hash_with_sha256() {
+        for oid in [
+            OID_MD5_WITH_RSA,
+            OID_SHA1_WITH_RSA,
+            OID_ECDSA_WITH_SHA1,
+            OID_SHA256_WITH_RSA,
+            OID_ECDSA_WITH_SHA256,
+            OID_ED25519,
+        ] {
+            let der = synthetic_certificate_der(oid);
+            let result = tls_server_end_point(&der).expect("supported algorithm");
+            let expected = engine::crypto::sha256::digest(&der);
+            match result {
+                TlsServerEndPoint::Sha256(digest) => assert_eq!(digest, expected),
+                TlsServerEndPoint::Sha512(_) => panic!("expected SHA-256 for OID {oid:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn sha512_signature_algorithms_hash_with_sha512() {
+        for oid in [OID_SHA512_WITH_RSA, OID_ECDSA_WITH_SHA512] {
+            let der = synthetic_certificate_der(oid);
+            let result = tls_server_end_point(&der).expect("supported algorithm");
+            let expected = crate::tls::sha512::digest(&der);
+            match result {
+                TlsServerEndPoint::Sha512(digest) => assert_eq!(digest, expected),
+                TlsServerEndPoint::Sha256(_) => panic!("expected SHA-512 for OID {oid:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_signature_algorithm_is_rejected() {
+        // sha384WithRSAEncryption（1.2.840.113549.1.1.12）。自作 SHA-384 が
+        // 無いため非対応（`docs/design/tls-channel-binding.md` 参照）。
+        let oid: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+        let der = synthetic_certificate_der(oid);
+        assert_eq!(
+            tls_server_end_point(&der),
+            Err(ChannelBindingError::UnsupportedSignatureAlgorithm)
+        );
+    }
+
+    #[test]
+    fn oversized_certificate_der_is_rejected_before_parsing() {
+        let der = vec![0u8; MAX_CERTIFICATE_DER_LEN + 1];
+        assert_eq!(
+            tls_server_end_point(&der),
+            Err(ChannelBindingError::Malformed)
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_after_certificate_are_rejected() {
+        let mut der = synthetic_certificate_der(OID_ED25519);
+        der.push(0x00);
+        assert_eq!(
+            tls_server_end_point(&der),
+            Err(ChannelBindingError::Malformed)
+        );
+    }
+
+    #[test]
+    fn truncated_certificate_is_rejected() {
+        let der = synthetic_certificate_der(OID_ED25519);
+        let truncated = &der[..der.len() - 1];
+        assert_eq!(
+            tls_server_end_point(truncated),
+            Err(ChannelBindingError::Malformed)
+        );
+    }
+
+    #[test]
+    fn signature_algorithm_with_extra_trailing_element_is_rejected() {
+        // AlgorithmIdentifier に OID + parameters（高々 1 個）を超える
+        // 余剰 TLV を持つ不正な構造（`super::x509::
+        // validate_algorithm_identifier_structure` が拒否する形と同じ）。
+        let malformed_algorithm =
+            sequence(&[&tlv(TAG_OID, OID_ED25519), &tlv(0x05, &[]), &tlv(0x05, &[])]);
+        let tbs_certificate = sequence(&[]);
+        let signature_value = tlv(TAG_BIT_STRING, &[0x00, 0xaa]);
+        let der = sequence(&[&tbs_certificate, &malformed_algorithm, &signature_value]);
+        assert_eq!(
+            tls_server_end_point(&der),
+            Err(ChannelBindingError::Malformed)
+        );
+    }
+
+    /// RFC 8410 §10.2 の公開テストベクタ（SPKI は X25519 だが署名は
+    /// Ed25519。`tests/tls_x509.rs::RFC8410_10_2_X25519_CERT_PEM` と同一の
+    /// PEM で、[`super::super::pem::decode_certificate_chain_pem`]〔本番の
+    /// PEM デコーダ〕でそのまま読み直せることも兼ねて確認する）。OpenSSL
+    /// `x509 -fingerprint -sha256` で独立に算出済みの `tls-server-end-point`
+    /// 値と一致することを固定する（本モジュールが署名の主体
+    /// `signatureAlgorithm` だけを見て SPKI アルゴリズムは見ないことの
+    /// 確認も兼ねる）。
+    const RFC8410_10_2_X25519_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBLDCB36ADAgECAghWAUdKKo3DMDAFBgMrZXAwGTEXMBUGA1UEAwwOSUVURiBUZX\n\
+N0IERlbW8wHhcNMTYwODAxMTIxOTI0WhcNNDAxMjMxMjM1OTU5WjAZMRcwFQYDVQQD\n\
+DA5JRVRGIFRlc3QgRGVtbzAqMAUGAytlbgMhAIUg8AmJMKdUdIt93LQ+91oNvzoNJj\n\
+ga9OukqY6qm05qo0UwQzAPBgNVHRMBAf8EBTADAQEAMA4GA1UdDwEBAAQEAwIDCDAg\n\
+BgNVHQ4BAQAEFgQUmx9e7e0EM4Xk97xiPFl1uQvIuzswBQYDK2VwA0EAryMB/t3J5v\n\
+/BzKc9dNZIpDmAgs3babFOTQbs+BolzlDUwsPrdGxO3YNGhW7Ibz3OGhhlxXrCe1Cg\n\
+w1AH9efZBw==\n\
+-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn rfc8410_10_2_certificate_matches_independently_computed_sha256() {
+        let chain =
+            crate::tls::pem::decode_certificate_chain_pem(RFC8410_10_2_X25519_CERT_PEM.as_bytes())
+                .expect("valid PEM chain");
+        let der = chain.first().expect("single certificate").clone();
+        let result = tls_server_end_point(&der).expect("Ed25519 signature is supported");
+        // OpenSSL `x509 -in cert.pem -noout -fingerprint -sha256` で独立に
+        // 算出した値（コロン区切りの16進を連結したもの）。
+        let expected_hex = "180516f0a03e4893d234a28f3ad28921bc35d1b12bd35134847240dafb715a11";
+        let expected = hex_decode(expected_hex);
+        match result {
+            TlsServerEndPoint::Sha256(digest) => assert_eq!(digest.as_slice(), expected.as_slice()),
+            TlsServerEndPoint::Sha512(_) => panic!("expected SHA-256 for Ed25519 signature"),
+        }
+    }
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        digits
+            .chunks(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).expect("ascii hex pair");
+                u8::from_str_radix(text, 16).expect("valid hex byte")
+            })
+            .collect()
+    }
+}

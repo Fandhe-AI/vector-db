@@ -90,15 +90,25 @@
 //!   `next_record`）を使い、`handshake::read_next_frame_header` の
 //!   `WouldBlock`/`TimedOut` 読み直し契約（SQL-31・TASK-221）と両立する
 //!
+//! - [`channel_binding`]: RFC 5929 §4 の `tls-server-end-point` チャネル
+//!   バインディング値の算出（Issue #970）。葉証明書の `signatureAlgorithm`
+//!   に応じたハッシュで葉証明書 DER 全体をハッシュする純粋関数層で、
+//!   [`server_handshake::TlsServerConfig::new`] が起動時に 1 回だけ呼び出し
+//!   [`server_handshake::TlsSession`]／[`stream::TlsStream`]／
+//!   [`crate::wire_stream::WireStream`] へ伝搬する。SCRAM-SHA-256-PLUS
+//!   （[`crate::auth::scram`]・WIRE-18）がこの値をチャネルバインディングと
+//!   して使う
+//!
 //! CLI からの証明書・鍵読み込み（#967）・HTTPS 表層（#968）・3 クライアント
-//! 接続テスト（#969）・channel binding（#970）はいずれも後続 sub-issue の
-//! 担当であり、本モジュールは対象外のまま。並列開発時のコンフリクトを
-//! 避けるため、後続 sub-issue は `pub mod` を 1 行ずつ追加していく想定。
+//! 接続テスト（#969）はいずれも後続 sub-issue の担当であり、本モジュールは
+//! 対象外のまま。並列開発時のコンフリクトを避けるため、後続 sub-issue は
+//! `pub mod` を 1 行ずつ追加していく想定。
 
 pub mod aes;
 pub mod aes_gcm;
 pub mod alert;
 pub mod certificate_verify;
+pub mod channel_binding;
 pub mod client_hello;
 pub(crate) mod der;
 pub mod ed25519;

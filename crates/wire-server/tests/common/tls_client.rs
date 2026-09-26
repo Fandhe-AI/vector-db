@@ -126,12 +126,23 @@ fn build_ed25519_leaf_certificate_der(public_key: &[u8; 32]) -> Vec<u8> {
 /// テスト用サーバー設定（RFC 8032 TEST 1 の鍵材料から作った自己署名
 /// 証明書 1 枚）。`wire_tls_connection.rs` が `accept_loop_with_tls` へ渡す。
 pub fn test_config() -> Arc<TlsServerConfig> {
+    test_config_with_scram_channel_binding(true)
+}
+
+/// [`test_config`] と同じ証明書・鍵で、SCRAM-SHA-256-PLUS の提示可否
+/// （`TlsServerConfig::with_scram_channel_binding`。Issue #970）だけを
+/// 明示的に指定できる版。`tls_channel_binding.rs`・
+/// `wire_scram_plus_tls.rs` が提示無効化設定の挙動を検証するために使う。
+pub fn test_config_with_scram_channel_binding(enabled: bool) -> Arc<TlsServerConfig> {
     let der = build_ed25519_leaf_certificate_der(&RFC8032_TEST1_PUBLIC_KEY);
     let chain =
         ServerCertificateChain::from_der_chain(vec![der], &RFC8032_TEST1_PUBLIC_KEY, 1_600_000_000)
             .expect("valid synthetic chain");
     let key = SigningKey::from_seed_bytes(hex_decode32(RFC8032_TEST1_SEED));
-    Arc::new(TlsServerConfig::new(chain, key).expect("matching leaf/key"))
+    let config = TlsServerConfig::new(chain, key)
+        .expect("matching leaf/key")
+        .with_scram_channel_binding(enabled);
+    Arc::new(config)
 }
 
 /// [`build_ed25519_leaf_certificate_der`] の validity（`notBefore`／
@@ -223,6 +234,11 @@ pub struct TestClient {
     transcript: Transcript,
     pub sealer: Sealer,
     pub opener: Opener,
+    /// 受信した `Certificate` メッセージの葉証明書 DER（Issue #970 の
+    /// `tls_channel_binding.rs` が、サーバー側 `tls_server_end_point()`
+    /// と独立にクライアント側でも `tls-server-end-point` を算出して
+    /// 一致検証するために使う）。ハンドシェイク完了前は空のまま。
+    pub server_leaf_der: Vec<u8>,
 }
 
 fn build_client_hello(client_pub: [u8; 32]) -> (Record, RawHandshake) {
@@ -274,6 +290,7 @@ impl TestClient {
             transcript: Transcript::new(),
             sealer: Sealer::new(),
             opener: Opener::new(),
+            server_leaf_der: Vec::new(),
         }
     }
 
@@ -307,6 +324,14 @@ impl TestClient {
             .expect("valid message")
             .expect("Certificate present");
         assert_eq!(cert_raw.msg_type, HandshakeType::Certificate);
+        let certificate =
+            handshake::Certificate::parse(&cert_raw.body).expect("valid Certificate body");
+        self.server_leaf_der = certificate
+            .certificate_list
+            .first()
+            .expect("Certificate message carries at least the leaf")
+            .cert_data
+            .clone();
         self.transcript
             .append_certificate(&cert_raw)
             .expect("valid Certificate");
@@ -580,6 +605,13 @@ impl TlsTestChannel {
     /// [`TestClient`]（鍵材料）と生ソケットの両方を取り出す。
     pub fn into_parts(self) -> (TestClient, std::net::TcpStream) {
         (self.client, self.socket)
+    }
+
+    /// 受信した葉証明書 DER（[`TestClient::server_leaf_der`]）。
+    /// `wire_scram_plus_tls.rs` がクライアント側で独立に
+    /// `tls-server-end-point` を算出するために使う（Issue #970）。
+    pub fn client_leaf_der(&self) -> &[u8] {
+        &self.client.server_leaf_der
     }
 }
 

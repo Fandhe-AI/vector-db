@@ -147,13 +147,18 @@ fn write_authentication_ok<S: WireStream>(stream: &mut S) -> Result<()> {
 /// （[`FrameError::TooLarge`] と同じ分類）へ写像する。
 const MAX_SASL_MESSAGE_LEN: usize = 2048;
 
-/// `AuthenticationSASL`（'R'/10）: 提示する機構は [`scram::MECHANISM_NAME`]
-/// の 1 つのみ（`-PLUS` は SCRAM channel binding 未結線のため提示しない。
-/// TLS 自体は Issue #967 で opt-in 済みだが channel binding
-/// （`tls-server-end-point`）は Issue #970 の担当。Issue #941・TASK-228 へ
-/// 引き継ぐ）。
-fn write_authentication_sasl<S: WireStream>(stream: &mut S) -> Result<()> {
+/// `AuthenticationSASL`（'R'/10）: `offer_plus` が `false` の場合は
+/// [`scram::MECHANISM_NAME`] の 1 つのみ（TLS 未接続、または TLS 接続でも
+/// チャネルバインディング非提供・提示無効化設定の場合。既存挙動とビット
+/// 同一）。`true` の場合は [`scram::MECHANISM_NAME_PLUS`] を先頭に加えた
+/// 2 機構を提示する（TLS 接続かつ `tls-server-end-point` を算出できた場合。
+/// Issue #970・WIRE-18）。
+fn write_authentication_sasl<S: WireStream>(stream: &mut S, offer_plus: bool) -> Result<()> {
     let mut body = Vec::new();
+    if offer_plus {
+        body.extend_from_slice(scram::MECHANISM_NAME_PLUS.as_bytes());
+        body.push(0);
+    }
     body.extend_from_slice(scram::MECHANISM_NAME.as_bytes());
     body.push(0);
     body.push(0); // 機構リストの終端（空文字列）。
@@ -195,7 +200,15 @@ fn write_authentication_sasl_final<S: WireStream>(stream: &mut S, data: &[u8]) -
 /// 「int32 の長さ（`-1` は不可）」「client-first-message 本体」の順。
 /// PasswordMessage と型バイトは同じだが本文形状が異なるため
 /// `read_password_message` は流用しない。
-fn read_sasl_initial_response<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> {
+///
+/// `offer_plus` が `true`（[`write_authentication_sasl`] が PLUS を提示した
+/// 接続）の場合のみ [`scram::MECHANISM_NAME_PLUS`] も受理し、戻り値の
+/// `bool` で「クライアントが PLUS を選んだか」を返す（Issue #970）。
+/// `offer_plus` が `false` の場合の受理条件・エラーはビット単位で不変。
+fn read_sasl_initial_response<S: WireStream>(
+    stream: &mut S,
+    offer_plus: bool,
+) -> Result<(bool, Vec<u8>)> {
     let type_byte = match framing::read_typed_frame_header(stream)? {
         Some(b) => b,
         None => return Err(HandshakeError::Protocol("expected SASLInitialResponse")),
@@ -211,9 +224,13 @@ fn read_sasl_initial_response<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> 
 
     let mut pos = 0usize;
     let mechanism = read_c_string(&body, &mut pos)?;
-    if mechanism != scram::MECHANISM_NAME {
+    let selected_plus = if offer_plus && mechanism == scram::MECHANISM_NAME_PLUS {
+        true
+    } else if mechanism == scram::MECHANISM_NAME {
+        false
+    } else {
         return Err(HandshakeError::Protocol("unsupported SASL mechanism"));
-    }
+    };
     let len_bytes: [u8; 4] = body
         .get(pos..pos + 4)
         .and_then(|s| s.try_into().ok())
@@ -231,7 +248,7 @@ fn read_sasl_initial_response<S: WireStream>(stream: &mut S) -> Result<Vec<u8>> 
             "SASL message length does not match declared value",
         ));
     }
-    Ok(rest.to_vec())
+    Ok((selected_plus, rest.to_vec()))
 }
 
 /// `SASLResponse`（型 'p'）を読む。本文は raw bytes（PasswordMessage と異なり
@@ -1173,19 +1190,33 @@ fn authenticate_cleartext<S: WireStream>(
 /// TASK-222）。未知ユーザーはモック検証子（`scram::mock_verifier`）で
 /// 同一手順を最後まで実行し、固定遅延（`client-final` 検証開始時点から
 /// [`auth::AUTH_FAILURE_DELAY`]）・同一のエラー応答で列挙攻撃を防ぐ。
-/// SCRAM channel binding（`-PLUS`／`p=<cb-name>`）は未結線のため
-/// 提示・受理しない（`08P01`。TLS 自体は Issue #967 で opt-in 済みだが
-/// channel binding（`tls-server-end-point`）は Issue #970 の担当。
-/// Issue #941・TASK-228 へ引き継ぐ）。
+/// TLS 接続かつ `tls-server-end-point`（[`crate::wire_stream::WireStream::
+/// tls_server_end_point`]）を算出できた場合に限り SCRAM-SHA-256-PLUS
+/// （`p=tls-server-end-point`）も提示・受理する（Issue #970）。それ以外
+/// （TLS 未接続・非対応の署名アルゴリズム・提示無効化設定）では従来どおり
+/// `-PLUS`／`p=<cb-name>` を提示・受理しない（`08P01`）。
 fn authenticate_scram<S: WireStream>(
     stream: &mut S,
     store: &UserStore,
     username: &str,
 ) -> Result<AuthOutcome> {
-    write_authentication_sasl(stream)?;
+    // この接続でチャネルバインディングを提供できるか（TLS 接続かつ
+    // `tls-server-end-point` を算出できた場合のみ `Some`。TLS 未接続・
+    // 非対応の署名アルゴリズム・提示無効化設定はいずれも `None` に畳み込み
+    // 済み。Issue #970・WIRE-18）。
+    let cb_end_point: Option<Vec<u8>> = stream.tls_server_end_point().map(|b| b.to_vec());
+    let server_offers_plus = cb_end_point.is_some();
 
-    let client_first_body = read_sasl_initial_response(stream)?;
-    let client_first = match scram::parse_client_first(&client_first_body) {
+    write_authentication_sasl(stream, server_offers_plus)?;
+
+    let (selected_plus, client_first_body) =
+        read_sasl_initial_response(stream, server_offers_plus)?;
+    let parse_client_first_fn = if server_offers_plus {
+        scram::parse_client_first_with_cbind
+    } else {
+        scram::parse_client_first
+    };
+    let client_first = match parse_client_first_fn(&client_first_body) {
         Ok(c) => c,
         Err(scram::ScramError::ChannelBindingRequested) => {
             write_error_response(
@@ -1203,6 +1234,41 @@ fn authenticate_scram<S: WireStream>(
             )?;
             return Ok(AuthOutcome::Failure);
         }
+    };
+
+    // チャネルバインディングの交渉（RFC 5802 §6・§7。ユーザーの存在に
+    // 依存しない純粋関数のため、mock 検証子の計算前・server-first 送出前に
+    // 判定してよい。ダウングレード検出（PLUS 提示時に `y` を選ぶ）を含め、
+    // 失敗はすべて同一の 08P01 応答へ収束させる）。
+    let channel_binding = match scram::negotiate_channel_binding(
+        selected_plus,
+        &client_first.cbind_flag,
+        server_offers_plus,
+    ) {
+        Ok(cb) => cb,
+        Err(scram::ScramError::ChannelBindingRequested) => {
+            write_error_response(
+                stream,
+                ErrorClass::ProtocolViolation,
+                "channel binding is not supported on this connection",
+            )?;
+            return Ok(AuthOutcome::Failure);
+        }
+        Err(_) => {
+            write_error_response(
+                stream,
+                ErrorClass::ProtocolViolation,
+                "channel binding negotiation failed",
+            )?;
+            return Ok(AuthOutcome::Failure);
+        }
+    };
+    // `negotiate_channel_binding` の判定表上、`TlsServerEndPoint` は
+    // `server_offers_plus`（＝`cb_end_point.is_some()`）が真の場合にしか
+    // 返らない。
+    let cbind_data: Vec<u8> = match channel_binding {
+        scram::ChannelBinding::None => Vec::new(),
+        scram::ChannelBinding::TlsServerEndPoint => cb_end_point.clone().unwrap_or_default(),
     };
 
     // P0 review 指摘（Issue #940 PR #1006）: モック検証子の生成コストが
@@ -1253,12 +1319,24 @@ fn authenticate_scram<S: WireStream>(
     // 収束させる）。
     let verify_start = std::time::Instant::now();
 
-    let expected_channel_binding_b64 = base64_std::encode(&client_first.gs2_header);
+    // `c=` の期待値は `cbind-input = gs2-header ‖ cbind-data`（RFC 5802 §5・
+    // RFC 5929 §4）。`cbind_data` はサーバー側が独立に算出した
+    // `tls-server-end-point`（クライアントが送った `c=` から逆算しない。
+    // Issue #970）であり、`channel_binding == None` の場合は空（既存
+    // 契約とビット同一）。
+    let mut expected_cbind_input =
+        Vec::with_capacity(client_first.gs2_header.len() + cbind_data.len());
+    expected_cbind_input.extend_from_slice(&client_first.gs2_header);
+    expected_cbind_input.extend_from_slice(&cbind_data);
+    let expected_channel_binding_b64 = base64_std::encode(&expected_cbind_input);
     let nonce_and_binding_match = client_final.channel_binding_b64 == expected_channel_binding_b64
         && client_final.nonce == combined_nonce;
 
-    let client_final_no_proof =
-        scram::client_final_without_proof(&client_first.gs2_header, &combined_nonce);
+    let client_final_no_proof = scram::client_final_without_proof_with_cbind(
+        &client_first.gs2_header,
+        &cbind_data,
+        &combined_nonce,
+    );
     let auth_message = scram::compute_auth_message(
         &client_first.client_first_bare,
         &server_first,
