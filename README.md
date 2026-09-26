@@ -298,8 +298,9 @@ TLS 有効時は起動ログへ `TLS enabled (mode=require|allow)` の 1 行の�
 平文・TLS の双方を受理します。TLS 構成時に同時接続数上限を超えた接続は、
 `allow` では平文と判定した接続に限り既存の平文 503 応答を維持し、TLS
 レコードと判定した接続はハンドシェイクをせず無応答で切断します。`require`
-では平文・TLS いずれの接続も要求を解釈せず無応答で切断します。実クライアント（psql・openssl s_client・curl 等）での
-接続試験は Issue #969・#968 の担当です。詳細は
+では平文・TLS いずれの接続も要求を解釈せず無応答で切断します。実
+クライアント（psql・openssl s_client・curl 等）での接続試験は
+Issue #969・#968 の担当です。詳細は
 `docs/design/tls-wire-connection.md` を参照してください。
 
 `--tls-scram-channel-binding`（`enable`／`disable`。Issue #970・WIRE-18
