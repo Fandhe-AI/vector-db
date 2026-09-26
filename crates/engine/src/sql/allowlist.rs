@@ -888,6 +888,28 @@ pub trait TableLookup {
         let _ = name;
         Ok(None)
     }
+
+    /// `name` が実テーブルであれば、束縛時（`sql::parser::bind_projection`）に
+    /// 許可される投影列名の集合（実カラム名 ＋ `id` 疑似列。スキーマが実カラム
+    /// `id` を宣言していれば重複させない）を返す。テーブルが存在しない場合・
+    /// 呼び出し側がこの照会に対応していない場合は `Ok(None)`（「列集合が
+    /// 分からないため、ここでは検査しない」を意味する。既定実装。`table_exists`
+    /// 自体の存在確認とは独立）。
+    ///
+    /// 参照される CTE・VIEW は最終的に `sql::parser::bind` が実テーブル
+    /// スキーマに対して列存在を検査するため、このメソッドが `None` を返しても
+    /// fail-open にはならない。唯一の例外はどこからも参照されない leaf CTE
+    /// （`sql::allowlist::validate_sql_tokens` の WITH 事前検証ループ）で、
+    /// これは bind に到達しないため、実テーブル直下の場合はこのメソッドの
+    /// 戻り値で列存在を検査する（Issue #928 レビュー指摘: Codex P1、
+    /// PR #1100 追加指摘）。既定実装が `Ok(None)` を返す既存の `TableLookup`
+    /// 実装（テスト用モック等）は、この場合に限り列存在検査を省略したまま
+    /// 動作し続ける（無変更でコンパイル・実行可能。`view_definition` の
+    /// 既定実装と同じ後方互換の方針）。
+    fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+        let _ = name;
+        Ok(None)
+    }
 }
 
 /// ORDER BY 関数呼び出し形（`FunctionCall`, TASK-75）の 1 引数。本モジュールは
@@ -5223,6 +5245,19 @@ pub(crate) fn validate_sql_tokens(
             // ここで明示的に検証しないと、先行 CTE が非公開列を隠していても
             // 参照されない後続 CTE がそれを射影・条件に使う文を通してしまう
             // （Issue #928 レビュー指摘: Codex P1・Cursor Bugbot Low、同一欠陥）。
+            //
+            // `resolved` の公開列集合が `None`（`Resolved::Table` か、連鎖の
+            // どの段も列を絞り込んでいない `Resolved::View { view_columns: None,
+            // .. }`）の場合、実テーブル直下の列存在検査は通常
+            // `sql::parser::bind` に委ねている（`sql::view::resolve_from` の
+            // 同種コメント参照）。これは**参照される** CTE・VIEW には妥当
+            // （最終的に `ValidatedScan` へ畳み込まれ bind を通る）だが、
+            // どこからも参照されない leaf CTE は bind に到達しないため、
+            // ここで実テーブルのスキーマへ問い合わせて代わりに検証する
+            // （PR #1100 追加レビュー指摘: Codex P1・Cursor Bugbot Low）。
+            // `TableLookup::table_columns` の既定実装は `Ok(None)`（検査省略・
+            // 後方互換）を返すため、これに対応しない `TableLookup` 実装
+            // （テスト用モック等）は無変更のまま今まで通り動作する。
             for (idx, def) in ctes.iter().enumerate() {
                 let mut budget = super::cte::ResolveBudget::new();
                 let resolved = super::cte::resolve_relation(
@@ -5233,12 +5268,20 @@ pub(crate) fn validate_sql_tokens(
                     0,
                     &mut budget,
                 )?;
-                let exposed = match &resolved {
-                    super::view::Resolved::Table => None,
-                    super::view::Resolved::View { view_columns, .. } => view_columns.as_deref(),
+                let (base_table, view_columns): (&str, Option<Vec<String>>) = match &resolved {
+                    super::view::Resolved::Table => (def.body.table_name.as_str(), None),
+                    super::view::Resolved::View {
+                        base_table,
+                        view_columns,
+                        ..
+                    } => (base_table.as_str(), view_columns.clone()),
+                };
+                let exposed = match view_columns {
+                    Some(cols) => Some(cols),
+                    None => lookup.table_columns(base_table)?,
                 };
                 super::view::check_columns_within_view(
-                    exposed,
+                    exposed.as_deref(),
                     &def.body.projection,
                     &def.body.where_predicates,
                 )?;
@@ -11010,6 +11053,72 @@ mod tests {
         )
         .expect_err("unreferenced CTE filtering on a column outside its FROM's exposed set must be rejected");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// `table_columns` を実装するフェイク（PR #1100 追加レビュー指摘の
+    /// 回帰テスト専用）。既存の `FakeCatalog` は `table_columns` 未実装
+    /// （既定実装 `Ok(None)` のまま）で、それらのテストは本回帰の対象外
+    /// （後方互換の確認を兼ねる）。
+    struct SchemaCatalog {
+        tables: std::collections::HashMap<&'static str, &'static [&'static str]>,
+    }
+
+    impl TableLookup for SchemaCatalog {
+        fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+            Ok(self.tables.contains_key(name))
+        }
+        fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+            // `catalog::Storage` の実装契約（実カラム ＋ 未宣言なら `id` 疑似列）
+            // を模す（`TableLookup::table_columns` のドキュメント参照）。
+            Ok(self.tables.get(name).map(|cols| {
+                let mut columns: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+                if !columns.iter().any(|c| c == "id") {
+                    columns.push("id".to_string());
+                }
+                columns
+            }))
+        }
+    }
+
+    #[test]
+    fn rejects_unreferenced_cte_projecting_unknown_real_table_column() {
+        // PR #1100 追加レビュー指摘の回帰テスト（Codex P1・Cursor Bugbot Low、
+        // 同一欠陥）: 事前検証ループは `Resolved::Table`（FROM が実テーブル）の
+        // 場合に公開列集合を `None` のまま `check_columns_within_view` へ渡して
+        // いたため、実テーブルに存在しない列を射影・条件に使う未参照 CTE も
+        // 検査をすり抜けて受理していた。`TableLookup::table_columns` で実テーブル
+        // のスキーマへ問い合わせて検証すること。
+        let lookup = SchemaCatalog {
+            tables: [("documents", ["id", "body"].as_slice())].into(),
+        };
+        let err = validate_sql(
+            "WITH unused AS (SELECT missing FROM documents) SELECT id FROM documents LIMIT 1",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE projecting an unknown real table column must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+
+        let err = validate_sql(
+            "WITH unused AS (SELECT id FROM documents WHERE missing = 'y') SELECT id FROM documents LIMIT 1",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE filtering on an unknown real table column must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn accepts_unreferenced_cte_projecting_id_pseudo_column_over_real_table() {
+        // 対照確認（regression guard）: `table_columns` は実カラムに加えて
+        // 疑似列 `id` も許可列へ含めること（`sql::parser::bind_projection` が
+        // `id` を疑似列として受理する契約と一致させる）。スキーマが `id` という
+        // 実カラムを宣言していない場合の対照。
+        let lookup = SchemaCatalog {
+            tables: [("documents", ["body"].as_slice())].into(),
+        };
+        expect_scan(
+            "WITH unused AS (SELECT id FROM documents) SELECT * FROM documents LIMIT 1",
+            &lookup,
+        );
     }
 
     #[test]
