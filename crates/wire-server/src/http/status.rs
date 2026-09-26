@@ -93,7 +93,12 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // `InvalidForeignKey`（`42830`。TABLE-17・TASK-205、Issue #907）は
         // `FOREIGN KEY` 宣言（`CREATE TABLE`。NoSQL 表層の `op` 語彙に DDL が無く
         // 構造的に到達しない）の不正。ERR-6 新設行の射影規則に従い 400 とする。
-        | ErrorClass::InvalidForeignKey => 400,
+        | ErrorClass::InvalidForeignKey
+        // `DatatypeMismatch`（`42804`。SQL-29 (c)・RLS-10 (b)・TASK-213、
+        // Issue #929）は集合演算の両辺の列数・列型不一致というクライアント入力
+        // 起因の拒否。NoSQL 表層の `op` 語彙に集合演算が無く構造的に到達しないが、
+        // `ErrorClass` の網羅性のため他の 42xxx 系と同じ 400 とする。
+        | ErrorClass::DatatypeMismatch => 400,
     }
 }
 
@@ -103,7 +108,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 34] = [
+    const EXPECTED: [(ErrorClass, u16); 35] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -138,6 +143,7 @@ mod tests {
         (ErrorClass::CheckViolation, 409),
         (ErrorClass::ForeignKeyViolation, 409),
         (ErrorClass::InvalidForeignKey, 400),
+        (ErrorClass::DatatypeMismatch, 400),
     ];
 
     #[test]
