@@ -316,7 +316,7 @@ fn new_accumulators(
         )
     })?;
     for item in items {
-        accs.push(Accumulator::new(item.func, &item.input)?);
+        accs.push(Accumulator::for_item(item)?);
     }
     Ok(accs)
 }
@@ -348,6 +348,12 @@ fn accumulate_row(
     total_key_bytes: usize,
     budget: &ResultBudget,
     expr_scratch: &mut Vec<StackValue>,
+    // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
+    // （全グループ・全項目の合計）で 1 つ。呼び出し元
+    // （`execute_grouped_aggregate` の直接呼び出し・`observe_group_slots`・
+    // `observe_candidate_slots_grouped_inner` のいずれも同一インスタンスを
+    // 使い回す）。
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<(), SqlSurfaceError> {
     for (accumulator, item) in accs.iter_mut().zip(items) {
         // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
@@ -356,8 +362,18 @@ fn accumulate_row(
         // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
         // 実際の保持量を正確に反映する）。
         let before = accumulator.text_len();
+        let (distinct_entries_before, distinct_bytes_before) = accumulator.distinct_footprint();
         accumulator.observe(&item.input, id, vector, scanned, expr_scratch)?;
         let after = accumulator.text_len();
+        let (distinct_entries_after, distinct_bytes_after) = accumulator.distinct_footprint();
+        if distinct_entries_after > distinct_entries_before {
+            let delta = distinct_bytes_after
+                .checked_sub(distinct_bytes_before)
+                .ok_or_else(|| {
+                    accumulator_bug("COUNT(DISTINCT) footprint bytes decreased unexpectedly")
+                })?;
+            distinct_budget.charge(delta)?;
+        }
         if after > before {
             let delta = after - before;
             *total_text_accumulator_bytes = total_text_accumulator_bytes
@@ -430,6 +446,7 @@ fn observe_group_enumeration(
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
     budget: &ResultBudget,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<bool, SqlSurfaceError> {
     let Some(groups) = index.column_groups(group_by.column_index) else {
         return Ok(false);
@@ -482,17 +499,22 @@ fn observe_group_enumeration(
             current_group_count.saturating_add(1),
             *total_key_bytes,
             budget,
+            distinct_budget,
         ) {
             Ok(()) => {}
             Err(err) if is_text_accumulator_budget_error(&err) => {
                 // PR #603 codex-review P1 指摘対応: キー順の列挙による一時的な
                 // TEXT 容量超過の誤検出。ここまでに構築した索引経路の途中結果
                 // （このグループを含め）を破棄し、呼び出し元に全走査への
-                // フォールバックを促す。
+                // フォールバックを促す。SQL-25 (c)・TASK-209:
+                // `distinct_budget`（クエリ全体で共有）もここまでの部分計上を
+                // 巻き戻す（全走査の再実行は 0 から数え直すため、二重計上を
+                // 避ける）。
                 string_groups.clear();
                 *null_group = None;
                 *total_key_bytes = 0;
                 *total_text_accumulator_bytes = 0;
+                *distinct_budget = crate::sql::distinct::DistinctBudget::new();
                 return Ok(false);
             }
             Err(err) => return Err(err),
@@ -525,6 +547,7 @@ fn observe_group_enumeration(
             current_group_count.saturating_add(1),
             *total_key_bytes,
             budget,
+            distinct_budget,
         ) {
             Ok(()) => {}
             Err(err) if is_text_accumulator_budget_error(&err) => {
@@ -532,6 +555,7 @@ fn observe_group_enumeration(
                 *null_group = None;
                 *total_key_bytes = 0;
                 *total_text_accumulator_bytes = 0;
+                *distinct_budget = crate::sql::distinct::DistinctBudget::new();
                 return Ok(false);
             }
             Err(err) => return Err(err),
@@ -574,6 +598,7 @@ fn observe_group_slots(
     group_count: usize,
     total_key_bytes: usize,
     budget: &ResultBudget,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<(), SqlSurfaceError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
@@ -617,6 +642,7 @@ fn observe_group_slots(
             total_key_bytes,
             budget,
             &mut expr_scratch,
+            distinct_budget,
         )?;
     }
     Ok(())
@@ -651,6 +677,7 @@ fn observe_candidate_slots_grouped(
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
     budget: &ResultBudget,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<bool, SqlSurfaceError> {
     match observe_candidate_slots_grouped_inner(
         snapshot,
@@ -664,6 +691,7 @@ fn observe_candidate_slots_grouped(
         total_key_bytes,
         total_text_accumulator_bytes,
         budget,
+        distinct_budget,
     ) {
         Ok(()) => Ok(true),
         Err(GroupAccumulateError::TextBudgetExceeded) => {
@@ -671,6 +699,9 @@ fn observe_candidate_slots_grouped(
             *null_group = None;
             *total_key_bytes = 0;
             *total_text_accumulator_bytes = 0;
+            // SQL-25 (c)・TASK-209: 全走査への退避時は `distinct_budget` も
+            // 巻き戻す（`observe_group_enumeration` と同じ理由）。
+            *distinct_budget = crate::sql::distinct::DistinctBudget::new();
             Ok(false)
         }
         Err(GroupAccumulateError::Other(err)) => Err(err),
@@ -692,6 +723,7 @@ fn observe_candidate_slots_grouped_inner(
     total_key_bytes: &mut usize,
     total_text_accumulator_bytes: &mut usize,
     budget: &ResultBudget,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
 ) -> Result<(), GroupAccumulateError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
@@ -789,6 +821,7 @@ fn observe_candidate_slots_grouped_inner(
                         *total_key_bytes,
                         budget,
                         &mut expr_scratch,
+                        distinct_budget,
                     )?;
                 } else {
                     check_new_group_budget(
@@ -810,6 +843,7 @@ fn observe_candidate_slots_grouped_inner(
                         *total_key_bytes,
                         budget,
                         &mut expr_scratch,
+                        distinct_budget,
                     )?;
                     string_groups.insert(try_clone_str(key_str)?, accs);
                 }
@@ -842,6 +876,7 @@ fn observe_candidate_slots_grouped_inner(
                     *total_key_bytes,
                     budget,
                     &mut expr_scratch,
+                    distinct_budget,
                 )?;
             }
         }
@@ -1122,6 +1157,13 @@ pub(crate) fn execute_grouped_aggregate(
     // PR #1049 レビュー指摘 codex P1 対応: 生成中の結果全体に対する予算判定器
     // （[`ResultBudget`]）。索引経路・全走査経路の双方が共有する。
     let budget = ResultBudget::new(bound, max_result_bytes)?;
+    // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
+    // （全グループ・全項目の合計）で 1 つ。索引経路が
+    // `is_text_accumulator_budget_error` で全走査へ退避する際は呼び出し先
+    // （`observe_group_enumeration`・`observe_candidate_slots_grouped`）が
+    // このインスタンスを空へ巻き戻すため、下の全走査はそのまま同じ変数を
+    // 使い回せる（二重計上しない）。
+    let mut distinct_budget = crate::sql::distinct::DistinctBudget::new();
 
     // Issue #475: `WHERE` なしの `GROUP BY`（列挙形。`ScalarIndex::column_groups`/
     // `slots_without_value` で索引済みの値ごとにグループを直接構築する）、また
@@ -1206,6 +1248,7 @@ pub(crate) fn execute_grouped_aggregate(
                             &mut total_key_bytes,
                             &mut total_text_accumulator_bytes,
                             &budget,
+                            &mut distinct_budget,
                         )?;
                     } else {
                         let id_preds: Vec<crate::sql::scalar_plan::IdPredicate> = bound
@@ -1233,6 +1276,7 @@ pub(crate) fn execute_grouped_aggregate(
                                 &mut total_key_bytes,
                                 &mut total_text_accumulator_bytes,
                                 &budget,
+                                &mut distinct_budget,
                             )?;
                         }
                     }
@@ -1429,6 +1473,7 @@ pub(crate) fn execute_grouped_aggregate(
                                 total_key_bytes,
                                 &budget,
                                 &mut expr_scratch,
+                                &mut distinct_budget,
                             )?;
                         } else {
                             // 新規グループ: 予算検査 → ローカルでアキュムレータを
@@ -1453,6 +1498,7 @@ pub(crate) fn execute_grouped_aggregate(
                                 total_key_bytes,
                                 &budget,
                                 &mut expr_scratch,
+                                &mut distinct_budget,
                             )?;
                             string_groups.insert(try_clone_str(key_str)?, accs);
                         }
@@ -1485,6 +1531,7 @@ pub(crate) fn execute_grouped_aggregate(
                             total_key_bytes,
                             &budget,
                             &mut expr_scratch,
+                            &mut distinct_budget,
                         )?;
                     }
                 }
@@ -1677,6 +1724,7 @@ mod tests {
                 func: AggregateFunc::Count,
                 input: AggregateInput::AllVisible,
                 name: "result".to_string(),
+                distinct: false,
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
@@ -1803,11 +1851,13 @@ mod tests {
                     func: AggregateFunc::Min,
                     input: AggregateInput::TextColumn(1),
                     name: "result_min".to_string(),
+                    distinct: false,
                 },
                 BoundAggregateItem {
                     func: AggregateFunc::Max,
                     input: AggregateInput::TextColumn(1),
                     name: "result_max".to_string(),
+                    distinct: false,
                 },
             ],
             metadata_filters: Vec::new(),
@@ -2088,6 +2138,7 @@ mod tests {
                 func: AggregateFunc::Count,
                 input: AggregateInput::UuidColumn(2),
                 name: "result".to_string(),
+                distinct: false,
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
