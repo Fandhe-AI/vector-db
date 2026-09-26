@@ -535,6 +535,168 @@ fn top_level_limit_truncates_result() {
     assert_eq!(result.rows.len(), 3);
 }
 
+// ---------- 枝数上限（54000） ----------
+
+#[test]
+fn max_branches_at_limit_succeeds_and_over_limit_is_rejected() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    // 枝数上限は 16（`sql::allowlist::MAX_SET_OP_BRANCHES`）。ちょうど 16 枝は
+    // 成功し、17 枝は `54000` になることを両側で固定する。
+    let branch = "SELECT lang FROM docs";
+    let at_limit_sql = std::iter::repeat_n(branch, 16)
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let result = run(&core, "tenant-a", &at_limit_sql);
+    assert_eq!(
+        result.rows.len(),
+        16 * 3,
+        "16 branches must all be evaluated"
+    );
+
+    let over_limit_sql = std::iter::repeat_n(branch, 17)
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let err = run_err(&core, "tenant-a", &over_limit_sql);
+    assert_eq!(err.wire_code(), "54000");
+}
+
+// ---------- 可視行数・合成結果行数の上限（54000） ----------
+
+#[test]
+fn branch_visible_rows_over_limit_is_rejected() {
+    let path = unique_db_path("set-op-branch-row-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&schema("wide")).expect("create wide");
+    storage.create_table(&schema(DOCS)).expect("create docs");
+    let tenant_ctx = ctx("tenant-a");
+    // 単一枝の可視行数上限（`MAX_SET_OP_ROWS` = `MAX_SEARCH_K` = 10000）を単独で
+    // 超える枝を用意する（もう一方の枝は最小限）。
+    for id in 1..=10_001u64 {
+        insert_row(&storage, "wide", &tenant_ctx, id, "ja", Visibility::Public);
+    }
+    insert_row(&storage, DOCS, &tenant_ctx, 1, "en", Visibility::Public);
+    let core = new_core(storage);
+
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM wide UNION ALL SELECT lang FROM docs",
+    );
+    assert_eq!(err.wire_code(), "54000");
+}
+
+#[test]
+fn composed_result_rows_over_limit_is_rejected_even_if_each_branch_is_within_limit() {
+    let path = unique_db_path("set-op-composed-row-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    storage.create_table(&schema(DOCS)).expect("create docs");
+    let tenant_ctx = ctx("tenant-a");
+    // 各枝は上限（10000）未満だが、`UNION ALL` で合成すると上限を超える
+    // （5001 + 5001 = 10002 > 10000）。
+    for id in 1..=5_001u64 {
+        insert_row(&storage, DOCS, &tenant_ctx, id, "ja", Visibility::Public);
+    }
+    let core = new_core(storage);
+
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM docs UNION ALL SELECT lang FROM docs",
+    );
+    assert_eq!(err.wire_code(), "54000");
+}
+
+// ---------- ビューを指す枝（TABLE-18・SQL-23・TASK-205、Issue #909） ----------
+
+#[test]
+fn branch_from_view_matches_base_table_equivalent() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    let mut ddl_session = SessionState::default();
+    ddl_session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut ddl_session,
+        "CREATE VIEW docs_view AS SELECT lang FROM docs",
+    )
+    .expect("create view should succeed");
+
+    // ビューを枝に指定した場合と、ビューが指す基底テーブルを直接指定した場合
+    // とで結果が一致すること（`sql::view::resolve_from` による畳み込みが
+    // 集合演算の枝でも `Statement::Scan` と同じ経路を通ることの確認）。
+    let via_view = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM docs_view UNION SELECT lang FROM other_docs",
+    );
+    let via_base = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs",
+    );
+    let mut via_view_sorted = langs(&via_view);
+    via_view_sorted.sort();
+    let mut via_base_sorted = langs(&via_base);
+    via_base_sorted.sort();
+    assert_eq!(via_view_sorted, via_base_sorted);
+}
+
+// ---------- Describe（拡張クエリプロトコル） ----------
+
+#[test]
+fn describe_matches_execute_columns() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let sql = "SELECT lang FROM docs UNION SELECT lang FROM other_docs";
+
+    let describe_session = SessionState::default();
+    let parsed = core.parse_sql(sql).expect("parse_sql should succeed");
+    let described = core
+        .describe_parsed_in_session(&describe_session, &parsed)
+        .expect("describe should succeed")
+        .expect("set operation must produce result columns");
+
+    let mut exec_session = SessionState::default();
+    let executed = expect_query(
+        core.execute_sql_in_session(&ctx("tenant-a"), &mut exec_session, sql)
+            .expect("execute should succeed"),
+    );
+
+    assert_eq!(
+        described, executed.columns,
+        "describe columns must match execute columns for a set operation"
+    );
+}
+
+// ---------- セッションレス経路（`EngineCore::execute_sql`） ----------
+
+#[test]
+fn sessionless_execute_sql_matches_session_execute() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let sql = "SELECT lang FROM docs UNION SELECT lang FROM other_docs";
+
+    let via_sessionless = core
+        .execute_sql(&ctx("tenant-a"), sql)
+        .expect("session-less execute_sql should succeed");
+    let via_session = run(&core, "tenant-a", sql);
+
+    let mut sessionless_sorted = langs(&via_sessionless);
+    sessionless_sorted.sort();
+    let mut session_sorted = langs(&via_session);
+    session_sorted.sort();
+    assert_eq!(sessionless_sorted, session_sorted);
+}
+
 // ---------- 決定性 ----------
 
 #[test]
