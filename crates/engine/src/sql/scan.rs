@@ -24,9 +24,20 @@
 //! 契約の詳細（`LIMIT` の意味・順序保証の有無・取得モードとの無関係性）は
 //! `docs/design/wide-retrieval-scan.md`（spec ビヘイビア ID は SQL-15・TASK-170 として
 //! 付与済み〔vector-db-spec#12〕。確定化は TASK-170 が担う。本モジュールは本リポの
-//! 実装既定値として動作する）参照。順序は同一スナップショット内の redb
-//! 行テーブルの物理走査順（`(tenant_id, id)` 昇順）であり、`ORDER BY` 相当の意味的
-//! 順序を持たない。
+//! 実装既定値として動作する）参照。`bound.order_by` が空の場合、順序は同一
+//! スナップショット内の redb 行テーブルの物理走査順（`(tenant_id, id)` 昇順）であり、
+//! `ORDER BY` 相当の意味的順序を持たない。
+//!
+//! **スカラー列 `ORDER BY`**（Issue #915・SQL-25・TASK-209。`docs/design/
+//! scalar-order-by-scan.md` 参照）: `bound.order_by` が非空の場合は 2 経路のいずれかで
+//! 決定的な順序を返す。(A) 先頭キーが疑似列 `id` かつ `ctx` が他テナントの `Public` 行を
+//! 可視としない場合は、自テナントのパーティション（`(tenant, 0)..=(tenant, MAX)`）を
+//! 直接範囲走査し `LIMIT` 件で打ち切る（`id` はテナント内で一意なため後続キーは
+//! 無関係）。(B) それ以外は 2 パス（1 パス目で候補の並べ替えキー・`(tenant_id, id)` を
+//! 容量 `limit` の `BinaryHeap` に保持し予算超過時は最悪要素を追い出す。2 パス目で
+//! 勝者のみを同じスナップショットから再取得し投影する）。両経路とも RLS 適用順序
+//! （デコード前のヘッダ判定 → TABLE-12 → 必要範囲のみのデコード → `WHERE` → 可視性の
+//! 再適用）は順序なし経路と同一（[`with_visible_row`] に共通化）。
 //!
 //! `OFFSET`（Issue #916・SQL-25 (b)・TASK-209。詳細は
 //! `docs/design/sql-offset-paging.md`）は「可視かつ `WHERE` 一致」の行のみを対象に
@@ -42,10 +53,13 @@ use crate::row_codec;
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::{ExprProgram, StackValue};
-use crate::sql::parser::{BoundScan, ProjectedColumn};
+use crate::sql::parser::{BoundOrderKey, BoundOrderTarget, BoundScan, OrderKind, ProjectedColumn};
 use crate::sql::udf_call::{self, ExprValue};
 use crate::storage::{self, StorageError};
 use redb::ReadableTable;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::rc::Rc;
 
 /// 結果セット全体（テキスト・ベクトル各セルの複製バイト量の合計）の累計上限。
 /// `bound.limit`（`1..=core::MAX_SEARCH_K`）で行数は既に有界だが、1 行あたりの
@@ -247,6 +261,18 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
             needs_embedding = true;
         }
     }
+    // Issue #915・SQL-25: スカラー ORDER BY のキー列も、投影されていなくても
+    // 並べ替え値抽出のためにスキャン段でデコードする必要がある（`VECTOR` 列は
+    // 束縛段〔`sql::parser::bind_scalar_order_by`〕が構造上 ORDER BY キーとして
+    // 拒否済みのため `needs_embedding` は変化しない）。
+    for key in &bound.order_by {
+        if let BoundOrderTarget::Column(index) = key.target {
+            has_scalar_reference = true;
+            if let Some(slot) = scalar_mask.get_mut(index) {
+                *slot = true;
+            }
+        }
+    }
     // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群が参照する列・embedding も
     // 同様に反映する。ここを取りこぼすと、OR 群が参照する列が
     // `scalar_mask`（`scan_scalar_columns_masked`）から漏れて常に `None` に
@@ -280,6 +306,161 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
     (tier, scalar_mask)
 }
 
+// --- Issue #915・SQL-25: スカラー ORDER BY の比較器・行値抽出 ------------------
+
+/// スカラー ORDER BY 1 キー分の実行時比較値（`sql::group_by` の NULL 規約とは
+/// 異なる PostgreSQL 既定〔ASC 末尾・DESC 先頭〕を実装する比較器の入力）。
+/// `None`（SQL NULL）は [`compare_order_key`] が型を問わず統一的に扱う。
+#[derive(Debug, Clone, PartialEq)]
+enum OrderValue {
+    /// 疑似列 `id`（テナント内で一意な `u64`）。
+    Id(u64),
+    /// `TEXT`（バイト列順）。
+    Bytes(Vec<u8>),
+    /// `INTEGER`／`BIGINT`／`DATE`／`TIMESTAMP`。
+    SignedInt(i64),
+    /// `REAL`／`DOUBLE`。
+    Float(f64),
+    Bool(bool),
+    Numeric(crate::numeric::Decimal),
+    Uuid(crate::uuid::Uuid),
+    /// `ENUM`（宣言順のラベル添字）。
+    EnumOrdinal(usize),
+}
+
+/// `f64` 比較（NaN はすべての非 NaN より大きく NaN 同士は等しい。`-0.0 == 0.0` は
+/// IEEE754 の `PartialOrd` 実装がそのまま満たす）。`f64::total_cmp` は符号ビットまで
+/// 区別する全順序のため使わない（実装既定値。§比較規約）。
+fn compare_f64(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// 同じ `OrderKind` 由来の 2 値を「昇順が自然な順序」として比較する（呼び出し元
+/// [`compare_order_key`] が ASC/DESC・NULL 位置を適用する前段）。異なる variant の
+/// 組み合わせは同一キーでは構築されない不変条件（[`extract_order_value`] が
+/// `BoundOrderKey::kind` に従って一意に variant を選ぶ）に反する状態のため、
+/// 到達しても安全側（`Ordering::Equal`）に倒す。
+fn compare_order_values(a: &OrderValue, b: &OrderValue) -> Ordering {
+    match (a, b) {
+        (OrderValue::Id(x), OrderValue::Id(y)) => x.cmp(y),
+        (OrderValue::Bytes(x), OrderValue::Bytes(y)) => x.cmp(y),
+        (OrderValue::SignedInt(x), OrderValue::SignedInt(y)) => x.cmp(y),
+        (OrderValue::Float(x), OrderValue::Float(y)) => compare_f64(*x, *y),
+        (OrderValue::Bool(x), OrderValue::Bool(y)) => x.cmp(y),
+        (OrderValue::Numeric(x), OrderValue::Numeric(y)) => crate::numeric::cmp_exact(x, y),
+        (OrderValue::Uuid(x), OrderValue::Uuid(y)) => x.cmp(y),
+        (OrderValue::EnumOrdinal(x), OrderValue::EnumOrdinal(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
+}
+
+/// 1 キー分の最終比較（NULL 位置・降順を適用済み。ASC は NULL を末尾、DESC は
+/// NULL を先頭に置く PostgreSQL 既定。§受入基準 2）。戻り値は「昇順に安定ソートすると
+/// 最終的な出力順になる」意味の `Ordering`（`Less` が先頭）。
+fn compare_order_key(a: Option<&OrderValue>, b: Option<&OrderValue>, descending: bool) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => {
+            if descending {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if descending {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Some(x), Some(y)) => {
+            let base = compare_order_values(x, y);
+            if descending {
+                base.reverse()
+            } else {
+                base
+            }
+        }
+    }
+}
+
+/// 可視行 1 件から `bound.order_by` の各キーの実行時比較値を抽出する（Issue #915）。
+/// `scanned` は呼び出し元（[`with_visible_row`]）が `DecodeTier::DimAndScalar` 以上で
+/// デコード済みの前提（`decode_tier_for` が ORDER BY のキー列を `scalar_mask` へ
+/// 反映するため、`bound.order_by` が非空なら常にこの前提を満たす）。列の実型が
+/// 束縛段（`sql::parser::bind_scalar_order_by`）で確定した `kind` と一致しない場合は
+/// 実装バグとして `Internal`（`XX000`）を返す（fail-closed。untrusted 入力起因では
+/// なくスキーマとキー種別の対応が壊れているケース）。
+fn extract_order_value(
+    schema: &TableSchema,
+    key: &BoundOrderKey,
+    id: u64,
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+) -> Result<Option<OrderValue>, SqlSurfaceError> {
+    let index = match key.target {
+        BoundOrderTarget::Id => return Ok(Some(OrderValue::Id(id))),
+        BoundOrderTarget::Column(index) => index,
+    };
+    let value = match scanned.get(index) {
+        Some(Some(v)) => v,
+        Some(None) | None => return Ok(None),
+    };
+    let column = schema
+        .columns
+        .get(index)
+        .ok_or_else(|| scan_bug("order key column index out of range"))?;
+    match (&column.ty, key.kind, value) {
+        (ColumnType::Text, OrderKind::Bytes, row_codec::ScalarRef::Text(t)) => {
+            Ok(Some(OrderValue::Bytes(t.as_bytes().to_vec())))
+        }
+        (ColumnType::Integer, OrderKind::SignedInt, row_codec::ScalarRef::Integer(v)) => {
+            Ok(Some(OrderValue::SignedInt(i64::from(*v))))
+        }
+        (ColumnType::BigInt, OrderKind::SignedInt, row_codec::ScalarRef::BigInt(v)) => {
+            Ok(Some(OrderValue::SignedInt(*v)))
+        }
+        (ColumnType::Date, OrderKind::SignedInt, row_codec::ScalarRef::Date(v)) => {
+            Ok(Some(OrderValue::SignedInt(i64::from(*v))))
+        }
+        (ColumnType::Timestamp, OrderKind::SignedInt, row_codec::ScalarRef::Timestamp(v)) => {
+            Ok(Some(OrderValue::SignedInt(*v)))
+        }
+        (ColumnType::Real, OrderKind::Float, row_codec::ScalarRef::Real(v)) => {
+            Ok(Some(OrderValue::Float(f64::from(*v))))
+        }
+        (ColumnType::Double, OrderKind::Float, row_codec::ScalarRef::Double(v)) => {
+            Ok(Some(OrderValue::Float(*v)))
+        }
+        (ColumnType::Boolean, OrderKind::Bool, row_codec::ScalarRef::Bool(v)) => {
+            Ok(Some(OrderValue::Bool(*v)))
+        }
+        (ColumnType::Numeric { .. }, OrderKind::Numeric, row_codec::ScalarRef::Numeric(v)) => {
+            Ok(Some(OrderValue::Numeric(*v)))
+        }
+        (ColumnType::Uuid, OrderKind::Uuid, row_codec::ScalarRef::Uuid(v)) => {
+            Ok(Some(OrderValue::Uuid(*v)))
+        }
+        (ColumnType::Enum(def), OrderKind::Enum, row_codec::ScalarRef::Enum(_)) => {
+            let text = value
+                .as_dictionary_text()
+                .ok_or_else(|| scan_bug("ENUM order key scan yielded a non-dictionary scalar"))?;
+            let ordinal = def
+                .labels()
+                .iter()
+                .position(|label| label == text)
+                .ok_or_else(|| scan_bug("ENUM order key value is not in the declared label set"))?;
+            Ok(Some(OrderValue::EnumOrdinal(ordinal)))
+        }
+        _ => Err(scan_bug("order key scalar/column type mismatch")),
+    }
+}
+
 /// [`BoundScan`] を実行する（Issue #454・TASK-186・NOSQL-3 の公開 API）。
 /// `core.rs::EngineCore::execute_sql_in_session` の `Statement::Scan` アームから
 /// 呼ばれるほか、[`BoundScan`] が公開型へ昇格したため engine クレート外から
@@ -310,6 +491,493 @@ pub fn execute_scan(
 /// 結果を確定させてしまう（ネットワーク入力によるメモリ確保量の増幅。
 /// security.md「不安全な設計」対応）。`core.rs` の `DECLARE` 実行経路はこの
 /// 本体を `MAX_CURSOR_BYTES_PER_SESSION` で直接呼び、行生成中に打ち切る。
+/// RLS 判定・TABLE-12 整合検査・デコード・`WHERE` を 1 行分適用してから
+/// `build` へ渡す共通ヘルパー（Issue #915: `execute_scan_with_budget` の
+/// 3 経路——順序なし・経路 (A) `id` 早期打ち切り・経路 (B) 上位 N 件 2 パスの
+/// パス 2——が同じ RLS 適用順序〔security.md P0〕を共有するために抽出した）。
+/// `build` は可視かつ `WHERE` を満たす行に対してのみ呼ばれ、その戻り値を
+/// `Some` へ包んで返す。可視でない・`WHERE` を満たさない行は `Ok(None)`
+/// （呼び出し元は「打ち切りではなくスキップ」として扱う）。`build` は投影段の
+/// 組み立て（[`build_projected_cells`]）・ORDER BY キー抽出
+/// （[`extract_order_value`]）のいずれの用途にも使う。
+#[allow(clippy::too_many_arguments)]
+fn with_visible_row<T>(
+    buf: &[u8],
+    key_tenant: &str,
+    id: u64,
+    schema: &TableSchema,
+    bound: &BoundScan,
+    tier: DecodeTier,
+    scalar_mask: &[bool],
+    expected_dim: Option<u32>,
+    ctx: &PolicyContext,
+    embedding_scratch: &mut Vec<f32>,
+    where_expr_scratch: &mut Vec<StackValue>,
+    build: impl FnOnce(u32, &[Option<row_codec::ScalarRef<'_>>], &[f32]) -> Result<T, SqlSurfaceError>,
+) -> Result<Option<T>, SqlSurfaceError> {
+    // RLS 段（無条件・デコード前）。`sql::aggregate::execute_aggregate` の
+    // 走査ループと同一の順序（security.md P0「テナント境界」）。
+    let (tenant_id, visibility, offset) =
+        storage::decode_row_header(buf).map_err(storage_internal)?;
+    if !ctx.is_visible(tenant_id, visibility) {
+        return Ok(None);
+    }
+
+    // TABLE-12: 物理キー側 `tenant_id` とヘッダ側 `tenant_id` の整合検査。
+    storage::verify_row_key_tenant(key_tenant, tenant_id).map_err(storage_internal)?;
+
+    let (dim, metadata): (u32, &[u8]) = match tier {
+        DecodeTier::Fast | DecodeTier::DimAndScalar => {
+            storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
+        }
+        DecodeTier::Embedding => storage::decode_row_body_into(buf, offset, embedding_scratch)
+            .map_err(storage_internal)?,
+    };
+    if let Some(expected) = expected_dim {
+        if dim != 0 && dim != expected {
+            return Err(SqlSurfaceError::Internal {
+                detail: "scan row scan failed: embedding dimension mismatch".to_string(),
+            });
+        }
+    }
+
+    let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = match tier {
+        DecodeTier::Fast => {
+            row_codec::validate_scalar_columns(schema, metadata)?;
+            Vec::new()
+        }
+        DecodeTier::DimAndScalar | DecodeTier::Embedding => {
+            row_codec::scan_scalar_columns_masked(schema, metadata, Some(scalar_mask))?
+        }
+    };
+
+    // SCALAR 段（WHERE）。
+    if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
+        return Ok(None);
+    }
+    for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
+        let references_embedding = udf_call::references_embedding(expr);
+        // `dim == 0`（`VECTOR` 列が NULL。上記コメント参照）の行で embedding を
+        // 参照する式を評価すると、空スライスを実データと区別できず
+        // `vec_norm` 等が `0.0` を返し本来 NULL のはずの比較が意図せず
+        // マッチしてしまう（Cursor Bugbot 指摘）。SQL の NULL 比較は
+        // unknown → `WHERE` では偽と同義に扱われる契約に合わせ、embedding を
+        // 参照する式は NULL 行を評価せず無条件にこの行を除外する。
+        if references_embedding && dim == 0 {
+            return Ok(None);
+        }
+        let embedding: &[f32] =
+            if references_embedding {
+                match tier {
+                    DecodeTier::Embedding => embedding_scratch.as_slice(),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => return Err(scan_bug(
+                        "WHERE expression references the VECTOR column but tier did not decode it",
+                    )),
+                }
+            } else {
+                &[]
+            };
+        match program.eval(id, embedding, where_expr_scratch)? {
+            ExprValue::Bool(true) => {}
+            ExprValue::Bool(false) => return Ok(None),
+            // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
+            // 述語の型を `Bool` に限定済みのため到達しない。
+            _ => {
+                return Err(SqlSurfaceError::invalid_input(
+                    "WHERE expression did not evaluate to a boolean",
+                ))
+            }
+        }
+    }
+    // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存のメタデータ
+    // フィルタ・式述語と同じ SCALAR 段の一部として適用する。
+    for group in &bound.or_filters {
+        let group_embedding: &[f32] = match tier {
+            DecodeTier::Embedding => embedding_scratch.as_slice(),
+            DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+        };
+        if !group.matches(
+            &scanned,
+            id,
+            group_embedding,
+            dim as usize,
+            where_expr_scratch,
+        )? {
+            return Ok(None);
+        }
+    }
+
+    // defense-in-depth（`RlsSafetyNet` と同趣旨）: デコード前判定が唯一の
+    // 防御線にならないよう、同じ `tenant_id`・`visibility` へ再適用する
+    // （security.md P0）。
+    if !ctx.is_visible(tenant_id, visibility) {
+        return Ok(None);
+    }
+
+    let embedding_for_build: &[f32] = match tier {
+        DecodeTier::Embedding => embedding_scratch.as_slice(),
+        DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+    };
+    build(dim, &scanned, embedding_for_build).map(Some)
+}
+
+/// 可視かつ `WHERE` を満たす行 1 件の投影段（Issue #454 の既存経路・Issue #915 の
+/// 経路 (A)／経路 (B) パス 2 が共有する）。`embedding` は `tier ==
+/// DecodeTier::Embedding` のときのみ実データ、それ以外は空スライス
+/// （[`with_visible_row`] が渡す）。
+#[allow(clippy::too_many_arguments)]
+fn build_projected_cells(
+    schema: &TableSchema,
+    bound: &BoundScan,
+    tier: DecodeTier,
+    id: u64,
+    dim: u32,
+    embedding: &[f32],
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    computed_programs: &[Option<(ExprProgram, bool)>],
+    proj_expr_scratch: &mut Vec<StackValue>,
+    byte_budget: &mut usize,
+    max_result_bytes: usize,
+) -> Result<Vec<Cell>, SqlSurfaceError> {
+    // 投影段。確保失敗時に abort せず `Err` を返せるよう `try_reserve_exact`
+    // を使う（`try_alloc_text_for_budget`／`try_clone_embedding_for_budget`
+    // と同方針）。
+    let mut cells: Vec<Cell> = Vec::new();
+    cells
+        .try_reserve_exact(bound.projection.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve scan result cells: {e}"),
+        })?;
+    for (col_idx, col) in bound.projection.iter().enumerate() {
+        match col {
+            ProjectedColumn::Id => cells.push(Cell::Integer(id)),
+            ProjectedColumn::Column { index, .. } => {
+                let column =
+                    schema
+                        .columns
+                        .get(*index)
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "projected column index out of range".to_string(),
+                        })?;
+                match &column.ty {
+                    ColumnType::Vector(_) => {
+                        // `dim == 0` は `VECTOR` 列が未設定（NULL。TABLE-5 の
+                        // 追加列を含む）という `storage::Row` の既存契約
+                        // （`sql::aggregate::RowVector` のドキュメント参照）。
+                        if dim == 0 {
+                            cells.push(Cell::Null);
+                        } else {
+                            if tier != DecodeTier::Embedding {
+                                return Err(scan_bug(
+                                    "VECTOR column projected but tier did not decode embedding",
+                                ));
+                            }
+                            cells.push(Cell::Vector(try_clone_embedding_for_budget(
+                                embedding,
+                                byte_budget,
+                                max_result_bytes,
+                            )?));
+                        }
+                    }
+                    ColumnType::Text => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Text(t))) => cells.push(Cell::Text(
+                            try_alloc_text_for_budget(t, byte_budget, max_result_bytes)?,
+                        )),
+                        Some(None) | None => cells.push(Cell::Null),
+                        Some(Some(_)) => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "scalar payload type mismatch".to_string(),
+                            })
+                        }
+                    },
+                    // F8（Issue #882 計画）: REAL/DOUBLE は `Cell::Float`
+                    // （REAL は f64 への無損失拡大）へ投影する。
+                    ColumnType::Real => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Real(v))) => {
+                            cells.push(Cell::Float(f64::from(*v)))
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                        Some(Some(_)) => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "scalar payload type mismatch".to_string(),
+                            })
+                        }
+                    },
+                    ColumnType::Double => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Double(v))) => cells.push(Cell::Float(*v)),
+                        Some(None) | None => cells.push(Cell::Null),
+                        Some(Some(_)) => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "scalar payload type mismatch".to_string(),
+                            })
+                        }
+                    },
+                    ColumnType::Integer => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Integer(v))) => {
+                            cells.push(Cell::SignedInteger(i64::from(*v)))
+                        }
+                        Some(Some(_)) => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "scanned scalar type mismatch for INTEGER column"
+                                    .to_string(),
+                            })
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                    ColumnType::BigInt => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::BigInt(v))) => {
+                            cells.push(Cell::SignedInteger(*v))
+                        }
+                        Some(Some(_)) => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "scanned scalar type mismatch for BIGINT column"
+                                    .to_string(),
+                            })
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                    ColumnType::Boolean => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Bool(b))) => cells.push(Cell::Bool(*b)),
+                        Some(None) | None => cells.push(Cell::Null),
+                        Some(Some(_)) => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "scalar payload type mismatch".to_string(),
+                            })
+                        }
+                    },
+                    ColumnType::Date => match scanned.get(*index) {
+                        Some(Some(v)) => match v.as_date() {
+                            Some(d) => cells.push(Cell::Date(d)),
+                            None => {
+                                return Err(scan_bug(
+                                    "DATE column scan yielded a non-Date scalar value",
+                                ))
+                            }
+                        },
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                    ColumnType::Timestamp => {
+                        match scanned.get(*index) {
+                            Some(Some(v)) => match v.as_timestamp() {
+                                Some(t) => cells.push(Cell::Timestamp(t)),
+                                None => return Err(scan_bug(
+                                    "TIMESTAMP column scan yielded a non-Timestamp scalar value",
+                                )),
+                            },
+                            Some(None) | None => cells.push(Cell::Null),
+                        }
+                    }
+                    ColumnType::Array(_) => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
+                            let value = try_alloc_array_for_budget(
+                                *array_ref,
+                                byte_budget,
+                                max_result_bytes,
+                            )?;
+                            cells.push(Cell::Array(value));
+                        }
+                        Some(Some(_)) => {
+                            return Err(scan_bug(
+                                "ARRAY column scan yielded a non-Array scalar value",
+                            ))
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                    ColumnType::Bytea => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Bytes(b))) => {
+                            cells.push(Cell::Bytes(try_alloc_bytes_for_budget(
+                                b,
+                                byte_budget,
+                                max_result_bytes,
+                            )?));
+                        }
+                        Some(Some(_)) => {
+                            return Err(scan_bug(
+                                "BYTEA column scan yielded a non-Bytea scalar value",
+                            ))
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                    ColumnType::Json | ColumnType::Jsonb => match scanned.get(*index) {
+                        Some(Some(row_codec::ScalarRef::Json(t))) => {
+                            cells.push(Cell::Json(try_alloc_text_for_budget(
+                                t,
+                                byte_budget,
+                                max_result_bytes,
+                            )?));
+                        }
+                        Some(Some(_)) => {
+                            return Err(scan_bug(
+                                "JSON column scan yielded a non-Json scalar value",
+                            ))
+                        }
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                    // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
+                    // `sql::exec` の投影と同じ扱い）。
+                    ColumnType::Enum(_) => match scanned.get(*index) {
+                        Some(Some(v)) => match v.as_dictionary_text() {
+                            Some(t) => {
+                                cells.push(Cell::Text(try_alloc_text_for_budget(
+                                    t,
+                                    byte_budget,
+                                    max_result_bytes,
+                                )?));
+                            }
+                            None => {
+                                return Err(scan_bug(
+                                    "ENUM column scan yielded a non-Enum scalar value",
+                                ))
+                            }
+                        },
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                    ColumnType::Numeric { .. } => match scanned.get(*index) {
+                        Some(Some(v)) => match v.as_numeric() {
+                            Some(d) => cells.push(Cell::Numeric(d)),
+                            None => {
+                                return Err(scan_bug(
+                                    "NUMERIC column scan yielded a non-Numeric scalar value",
+                                ))
+                            }
+                        },
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                    ColumnType::Uuid => match scanned.get(*index) {
+                        Some(Some(v)) => match v.as_uuid() {
+                            Some(u) => cells.push(Cell::Uuid(u)),
+                            None => {
+                                return Err(scan_bug(
+                                    "UUID column scan yielded a non-Uuid scalar value",
+                                ))
+                            }
+                        },
+                        Some(None) | None => cells.push(Cell::Null),
+                    },
+                }
+            }
+            ProjectedColumn::Computed { .. } => {
+                let (program, references_embedding) = computed_programs
+                    .get(col_idx)
+                    .and_then(|p| p.as_ref())
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "computed projection program missing at evaluation time"
+                            .to_string(),
+                    })?;
+                // `dim == 0`（`VECTOR` 列が NULL）の行で embedding を参照する
+                // 式を評価すると空スライスを実データと区別できず誤った数値
+                // （例: `vec_norm` が `0.0`）を返してしまう（Cursor Bugbot
+                // 指摘）。`ProjectedColumn::Column` の直接投影と同じく NULL を
+                // 伝播させる。
+                if *references_embedding && dim == 0 {
+                    cells.push(Cell::Null);
+                } else {
+                    let embedding_for_eval: &[f32] = if tier == DecodeTier::Embedding {
+                        embedding
+                    } else {
+                        &[]
+                    };
+                    match program.eval(id, embedding_for_eval, proj_expr_scratch)? {
+                        ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                        ExprValue::Vector(v) => {
+                            // codex-review P1 指摘対応: `Computed` 列のベクトル
+                            // 結果も `VECTOR` 列直接投影と同じ累計予算
+                            // （`MAX_SCAN_RESULT_BYTES`）へ計上する。所有化
+                            // （`into_owned_vector`）自体は `try_reserve_exact`
+                            // 経由で単発の確保失敗には強いが、累計を見ないと
+                            // 行数分の蓄積で予算を回避できてしまうため。
+                            let owned = udf_call::into_owned_vector(v)?;
+                            cells.push(Cell::Vector(try_accumulate_vector_budget(
+                                owned,
+                                byte_budget,
+                                max_result_bytes,
+                            )?));
+                        }
+                        ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
+                    }
+                }
+            }
+        }
+    }
+    Ok(cells)
+}
+
+/// 経路 (B)（上位 N 件 2 パス）の 1 パス目が `BinaryHeap` へ保持する候補
+/// 1 件分（Issue #915・SQL-25）。`spec`（`Rc` 共有）は `bound.order_by` の
+/// 複製を全候補で使い回すための参照カウント（キー数は
+/// [`crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS`] で有界）。
+#[derive(Debug, Clone)]
+struct HeapEntry {
+    keys: Vec<Option<OrderValue>>,
+    tenant_id: String,
+    id: u64,
+    spec: Rc<[BoundOrderKey]>,
+}
+
+impl HeapEntry {
+    /// `spec` の各キーを順に比較し、最初の非同点で確定する（同点継続時は
+    /// `id` 昇順 → `tenant_id` バイト順。§受入基準 2「決定的な順序」）。
+    /// 戻り値は「昇順ソートすると最終的な出力順になる」意味の `Ordering`。
+    fn order(&self, other: &Self) -> Ordering {
+        for (idx, key) in self.spec.iter().enumerate() {
+            let a = self.keys.get(idx).and_then(|o| o.as_ref());
+            let b = other.keys.get(idx).and_then(|o| o.as_ref());
+            let ord = compare_order_key(a, b, key.descending);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        match self.id.cmp(&other.id) {
+            Ordering::Equal => self.tenant_id.as_bytes().cmp(other.tenant_id.as_bytes()),
+            id_ord => id_ord,
+        }
+    }
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.order(other) == Ordering::Equal
+    }
+}
+impl Eq for HeapEntry {}
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order(other)
+    }
+}
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// `entry` が保持するバイト量の概算（TEXT キーの所有バイト・`tenant_id`・
+/// `keys` 配列自体のヒープ確保量（容量ベース）・構造体分。予算計上・解放の
+/// 対称な単位として使う（Issue #915・codex-review PR #1096 P1 是正:
+/// `keys: Vec<Option<OrderValue>>` の配列容量が未計上だと、複数キー・大きい
+/// `LIMIT + OFFSET` で配列本体が `max_result_bytes` の外側に蓄積し得た）。
+fn heap_entry_bytes(entry: &HeapEntry) -> usize {
+    let mut bytes = std::mem::size_of::<HeapEntry>();
+    bytes = bytes.saturating_add(
+        entry
+            .keys
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
+    );
+    for key in &entry.keys {
+        if let Some(OrderValue::Bytes(b)) = key {
+            bytes = bytes.saturating_add(b.len());
+        }
+    }
+    bytes.saturating_add(entry.tenant_id.len())
+}
+
+/// [`BoundScan::order_by`] の先頭キーが疑似列 `id` かどうか（経路 (A) の判定条件の
+/// 片方。Issue #915）。
+fn leading_key_is_id(bound: &BoundScan) -> bool {
+    matches!(bound.order_by.first(), Some(key) if key.target == BoundOrderTarget::Id)
+}
+
 pub(crate) fn execute_scan_with_budget(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
@@ -372,8 +1040,13 @@ pub(crate) fn execute_scan_with_budget(
 
     // 可視行ごとの embedding デコード先スクラッチバッファ・式評価用の明示スタック
     // （行ごとに新規確保しない。`sql::aggregate::execute_aggregate` と同方針）。
+    // `WHERE` 評価用（`with_visible_row` 内部）と投影段の `Computed` 列評価用
+    // （`build_projected_cells`）でスタックを分ける（Issue #915: 両者を同一の
+    // `&mut Vec<StackValue>` にすると `with_visible_row` の引数と投影クロージャの
+    // キャプチャが同じ変数を同時に可変借用してしまいコンパイルできないため）。
     let mut embedding_scratch: Vec<f32> = Vec::new();
-    let mut expr_scratch: Vec<StackValue> = Vec::new();
+    let mut where_expr_scratch: Vec<StackValue> = Vec::new();
+    let mut proj_expr_scratch: Vec<StackValue> = Vec::new();
     let mut byte_budget: usize = 0;
     let mut rows: Vec<ResultRow> = Vec::new();
     // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` で読み飛ばした「可視かつ WHERE 一致」
@@ -400,414 +1073,354 @@ pub(crate) fn execute_scan_with_budget(
     let result_row_struct_bytes = std::mem::size_of::<ResultRow>();
     let per_row_struct_bytes = cell_struct_bytes.saturating_add(result_row_struct_bytes);
 
-    if let Some(table) = table {
-        'rows: for entry in table.iter().map_err(storage_internal)? {
-            // 早期終了: 可視かつ WHERE を満たす行が `bound.limit` 件集まった時点で
-            // 走査を打ち切る（本モジュールドキュメント「順序保証なし」契約の
-            // 実装側。テナントを跨いだ物理走査順のどこで打ち切っても、不可視行は
-            // 一切カウントされないため他テナントの存在・件数の情報を漏らさない）。
+    let Some(table) = table else {
+        return Ok(QueryResult { columns, rows });
+    };
+
+    if bound.order_by.is_empty() {
+        // 順序なし（従来経路）。`build_visible_row` は可視かつ `WHERE` を
+        // 満たす行のみ `Some` を返す（Issue #915: `rows` 自体は捕捉せず
+        // 呼び出し元が push する——クロージャが `rows` を可変借用すると
+        // ループ条件 `rows.len() >= bound.limit` の読み取りと競合するため）。
+        let mut build_visible_row = |key_tenant: &str, id: u64, buf: &[u8]| {
+            with_visible_row(
+                buf,
+                key_tenant,
+                id,
+                schema,
+                bound,
+                tier,
+                &scalar_mask,
+                expected_dim,
+                ctx,
+                &mut embedding_scratch,
+                &mut where_expr_scratch,
+                |dim, scanned, embedding| {
+                    // PR #1096 レビュー指摘 P1（codex-review・cursor Bugbot 双方が
+                    // 独立検出）対応: 順序保証なし経路では物理走査順がそのまま
+                    // 出力順（本モジュールドキュメント「順序」節）のため、`skipped`
+                    // 判定を投影・`byte_budget` 加算より前に確定させる。ここで
+                    // `None` を返す行は「スキップされる行」であり、大きな
+                    // `TEXT`/`VECTOR` を含んでいても投影・予算計上を一切行わない
+                    // （既存の「スキップ行は投影・予算計上しない」契約。逆順にすると
+                    // OFFSET が大きいだけで不要に `54000` を返す回帰になる）。
+                    if skipped < bound.offset {
+                        skipped += 1;
+                        return Ok(None);
+                    }
+                    // `cells`／`rows` 確保前に累計予算を検証（確保そのものを
+                    // 許可する前に拒否できるよう `Vec::try_reserve` 系より先に
+                    // 判定する）。
+                    byte_budget =
+                        try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
+                    let cells = build_projected_cells(
+                        schema,
+                        bound,
+                        tier,
+                        id,
+                        dim,
+                        embedding,
+                        scanned,
+                        &computed_programs,
+                        &mut proj_expr_scratch,
+                        &mut byte_budget,
+                        max_result_bytes,
+                    )?;
+                    Ok(Some(ResultRow {
+                        id,
+                        score: 0.0,
+                        cells,
+                    }))
+                },
+            )
+        };
+
+        // 早期終了: 可視かつ WHERE を満たす行が `bound.limit` 件集まった
+        // 時点で走査を打ち切る（本モジュールドキュメント「順序保証なし」
+        // 契約の実装側。テナントを跨いだ物理走査順のどこで打ち切っても、
+        // 不可視行は一切カウントされないため他テナントの存在・件数の情報を
+        // 漏らさない）。
+        for entry in table.iter().map_err(storage_internal)? {
             if rows.len() >= bound.limit {
                 break;
             }
-
             let (k, v) = entry.map_err(storage_internal)?;
             let (key_tenant, id) = k.value();
             let buf = v.value();
-
-            // RLS 段（無条件・デコード前）。`sql::aggregate::execute_aggregate` の
-            // 走査ループと同一の順序（security.md P0「テナント境界」）。
-            let (tenant_id, visibility, offset) =
-                storage::decode_row_header(buf).map_err(storage_internal)?;
-            if !ctx.is_visible(tenant_id, visibility) {
-                continue;
+            // `build_visible_row` が `Some(None)` を返すのは「可視かつ WHERE を
+            // 満たすが OFFSET でスキップされる行」（投影・予算計上済みでない）。
+            if let Some(Some(row)) = build_visible_row(key_tenant, id, buf)? {
+                rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve scan result rows: {e}"),
+                })?;
+                rows.push(row);
             }
-
-            // TABLE-12: 物理キー側 `tenant_id` とヘッダ側 `tenant_id` の整合検査。
-            storage::verify_row_key_tenant(key_tenant, tenant_id).map_err(storage_internal)?;
-
-            let (dim, metadata): (u32, &[u8]) = match tier {
-                DecodeTier::Fast | DecodeTier::DimAndScalar => {
-                    storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
-                }
-                DecodeTier::Embedding => {
-                    storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
-                        .map_err(storage_internal)?
-                }
-            };
-            if let Some(expected) = expected_dim {
-                if dim != 0 && dim != expected {
-                    return Err(SqlSurfaceError::Internal {
-                        detail: "scan row scan failed: embedding dimension mismatch".to_string(),
-                    });
-                }
-            }
-
-            let scanned: Vec<Option<row_codec::ScalarRef<'_>>> = match tier {
-                DecodeTier::Fast => {
-                    row_codec::validate_scalar_columns(schema, metadata)?;
-                    Vec::new()
-                }
-                DecodeTier::DimAndScalar | DecodeTier::Embedding => {
-                    row_codec::scan_scalar_columns_masked(schema, metadata, Some(&scalar_mask))?
-                }
-            };
-
-            // SCALAR 段（WHERE）。
-            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
-                continue;
-            }
-            for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
-                let references_embedding = udf_call::references_embedding(expr);
-                // `dim == 0`（`VECTOR` 列が NULL。上記コメント参照）の行で embedding を
-                // 参照する式を評価すると、空スライスを実データと区別できず
-                // `vec_norm` 等が `0.0` を返し本来 NULL のはずの比較が意図せず
-                // マッチしてしまう（Cursor Bugbot 指摘）。SQL の NULL 比較は
-                // unknown → `WHERE` では偽と同義に扱われる契約に合わせ、embedding を
-                // 参照する式は NULL 行を評価せず無条件にこの行を除外する。
-                if references_embedding && dim == 0 {
-                    continue 'rows;
-                }
-                let embedding: &[f32] = if references_embedding {
-                    match tier {
-                        DecodeTier::Embedding => embedding_scratch.as_slice(),
-                        DecodeTier::Fast | DecodeTier::DimAndScalar => {
-                            return Err(scan_bug(
-                                "WHERE expression references the VECTOR column but tier did not decode it",
-                            ))
-                        }
+        }
+    } else if leading_key_is_id(bound) && !ctx.allows_public() {
+        // 経路 (A): 先頭キーが `id` かつ `ctx` が他テナントの `Public` 行を
+        // 可視としない場合、可視行は自テナントのパーティションに閉じる
+        // （`id` はテナント内で一意なため後続キーは無関係）。物理キーは
+        // `(tenant_id, id)` の辞書順であり `u64::MIN == 0`／`u64::MAX` が
+        // 対象テナントの id 空間の両端を覆うため、この閉区間は対象テナント
+        // 所有行のみを列挙し他テナント領域のキー・値には一切触れない
+        // （`tenant.rs::enumerate_dml_candidates` と同型の閉区間。Issue #871
+        // と同じ判断）。
+        let mut build_visible_row = |key_tenant: &str, id: u64, buf: &[u8]| {
+            with_visible_row(
+                buf,
+                key_tenant,
+                id,
+                schema,
+                bound,
+                tier,
+                &scalar_mask,
+                expected_dim,
+                ctx,
+                &mut embedding_scratch,
+                &mut where_expr_scratch,
+                |dim, scanned, embedding| {
+                    // PR #1096 レビュー指摘 P1（codex-review・cursor Bugbot 双方が
+                    // 独立検出）対応: 経路 (A) は物理走査順が疑似列 `id` による
+                    // ソート確定順と一致するため、`skipped` 判定を投影・
+                    // `byte_budget` 加算より前に確定させる（unordered 経路と同じ
+                    // 理由。スキップされる行の大きな `TEXT`/`VECTOR` で不要に
+                    // `54000` を返す回帰を避ける）。
+                    if skipped < bound.offset {
+                        skipped += 1;
+                        return Ok(None);
                     }
-                } else {
-                    &[]
-                };
-                match program.eval(id, embedding, &mut expr_scratch)? {
-                    ExprValue::Bool(true) => {}
-                    ExprValue::Bool(false) => continue 'rows,
-                    // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
-                    // 述語の型を `Bool` に限定済みのため到達しない。
-                    _ => {
-                        return Err(SqlSurfaceError::invalid_input(
-                            "WHERE expression did not evaluate to a boolean",
-                        ))
+                    byte_budget =
+                        try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
+                    let cells = build_projected_cells(
+                        schema,
+                        bound,
+                        tier,
+                        id,
+                        dim,
+                        embedding,
+                        scanned,
+                        &computed_programs,
+                        &mut proj_expr_scratch,
+                        &mut byte_budget,
+                        max_result_bytes,
+                    )?;
+                    Ok(Some(ResultRow {
+                        id,
+                        score: 0.0,
+                        cells,
+                    }))
+                },
+            )
+        };
+
+        let tenant = ctx.tenant_id();
+        let range_start = std::ops::Bound::Included((tenant, 0u64));
+        let range_end = std::ops::Bound::Included((tenant, u64::MAX));
+        let descending = bound
+            .order_by
+            .first()
+            .map(|key| key.descending)
+            .unwrap_or(false);
+        let range = table
+            .range::<(&str, u64)>((range_start, range_end))
+            .map_err(storage_internal)?;
+        if descending {
+            for entry in range.rev() {
+                if rows.len() >= bound.limit {
+                    break;
+                }
+                let (k, v) = entry.map_err(storage_internal)?;
+                let (key_tenant, id) = k.value();
+                let buf = v.value();
+                // `build_visible_row` が `Some(None)` を返すのは「可視かつ WHERE
+                // を満たすが OFFSET でスキップされる行」（投影・予算計上済みでない）。
+                if let Some(Some(row)) = build_visible_row(key_tenant, id, buf)? {
+                    rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
+                        detail: format!("failed to reserve scan result rows: {e}"),
+                    })?;
+                    rows.push(row);
+                }
+            }
+        } else {
+            for entry in range {
+                if rows.len() >= bound.limit {
+                    break;
+                }
+                let (k, v) = entry.map_err(storage_internal)?;
+                let (key_tenant, id) = k.value();
+                let buf = v.value();
+                if let Some(Some(row)) = build_visible_row(key_tenant, id, buf)? {
+                    rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
+                        detail: format!("failed to reserve scan result rows: {e}"),
+                    })?;
+                    rows.push(row);
+                }
+            }
+        }
+    } else {
+        // 経路 (B): 上位 N 件の 2 パス。パス 1 は既存の走査ループ（RLS →
+        // TABLE-12 → デコード → WHERE → 可視性の再判定）をそのまま通し、
+        // 並べ替えキーの所有値と `(tenant_id, id)` だけを容量 `bound.limit` の
+        // `BinaryHeap` に保持する（最悪要素を追い出す。§受入基準「予算」）。
+        // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` はソート確定後に適用する契約
+        // （`docs/design/sql-offset-paging.md`）のため、パス 1 では
+        // `bound.limit + bound.offset` 件（先頭から `offset` 件を捨てた後に
+        // ちょうど `limit` 件残る件数）を保持する。両者とも `validate_search_limit`・
+        // `validate_search_offset` で `MAX_SEARCH_K` 以下に検証済みのため実際には
+        // 桁あふれしないが、規約（`.claude/rules/coding-rust.md`）に従い
+        // `saturating_add` で未定義動作を避ける。
+        let heap_capacity = bound.limit.saturating_add(bound.offset);
+        let spec: Rc<[BoundOrderKey]> = Rc::from(bound.order_by.clone());
+        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+        let mut heap_budget: usize = 0;
+
+        for entry in table.iter().map_err(storage_internal)? {
+            let (k, v) = entry.map_err(storage_internal)?;
+            let (key_tenant, id) = k.value();
+            let buf = v.value();
+            let candidate_keys = with_visible_row(
+                buf,
+                key_tenant,
+                id,
+                schema,
+                bound,
+                tier,
+                &scalar_mask,
+                expected_dim,
+                ctx,
+                &mut embedding_scratch,
+                &mut where_expr_scratch,
+                |_dim, scanned, _embedding| {
+                    let mut keys = Vec::with_capacity(bound.order_by.len());
+                    for key in &bound.order_by {
+                        keys.push(extract_order_value(schema, key, id, scanned)?);
                     }
-                }
-            }
-            // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存のメタデータ
-            // フィルタ・式述語と同じ SCALAR 段の一部として適用する。
-            for group in &bound.or_filters {
-                let group_embedding: &[f32] = match tier {
-                    DecodeTier::Embedding => embedding_scratch.as_slice(),
-                    DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
-                };
-                if !group.matches(
-                    &scanned,
-                    id,
-                    group_embedding,
-                    dim as usize,
-                    &mut expr_scratch,
-                )? {
-                    continue 'rows;
-                }
-            }
-
-            // defense-in-depth（`RlsSafetyNet` と同趣旨）: デコード前判定が唯一の
-            // 防御線にならないよう、同じ `tenant_id`・`visibility` へ再適用する
-            // （security.md P0）。
-            if !ctx.is_visible(tenant_id, visibility) {
+                    Ok(keys)
+                },
+            )?;
+            let Some(keys) = candidate_keys else {
                 continue;
+            };
+            let candidate = HeapEntry {
+                keys,
+                tenant_id: key_tenant.to_string(),
+                id,
+                spec: Rc::clone(&spec),
+            };
+            if heap.len() < heap_capacity {
+                let bytes = heap_entry_bytes(&candidate);
+                heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
+                heap.push(candidate);
+            } else {
+                let should_replace = heap
+                    .peek()
+                    .map(|worst| candidate.cmp(worst) == Ordering::Less)
+                    .unwrap_or(false);
+                if should_replace {
+                    if let Some(popped) = heap.pop() {
+                        heap_budget = heap_budget.saturating_sub(heap_entry_bytes(&popped));
+                    }
+                    let bytes = heap_entry_bytes(&candidate);
+                    heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
+                    heap.push(candidate);
+                }
             }
+        }
 
-            // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` 段。ここまでに到達した行は
-            // 可視かつ WHERE 一致が確定済み（上記 2 回の `is_visible` 再適用・
-            // `metadata_filters`／`expr_filters` 評価をすべて通過している）ため、
-            // ここで数えても他テナントの存在・件数の漏えいにはならない。投影・
-            // `cells` 確保・byte 予算計上より前に読み飛ばすことで、スキップされた
-            // 行はメモリを消費しない（深いページングでも O(n) を保つ）。
+        // codex-review PR #1096 P1 是正: パス 1 のヒープ候補（`heap_budget`）と
+        // パス 2 の投影結果（`byte_budget`）を別々の予算カウンタで `max_result_bytes`
+        // 上限判定していたため、両者を同時に保持する実メモリ量が単独の上限判定を
+        // すり抜けて `max_result_bytes` の 2 倍近くまで達し得た（`DECLARE CURSOR` の
+        // 小さい予算指定でメモリ予算を実質迂回できる経路）。`heap.into_sorted_vec()`
+        // が返す全候補はパス 2 の投影完了までヒープ内で保持され続けるため
+        // （各要素は消費時に初めて破棄される）、パス 2 開始時点で候補が占める
+        // 実メモリは `heap_budget` 分そのまま残っている。ここで `byte_budget` を
+        // `heap_budget` から引き継ぐことで、候補・結果を跨いだ単一の共通予算
+        // カウンタとして扱い、以降の `try_accumulate_budget` 呼び出しが両者の
+        // 合計を `max_result_bytes` 以下に fail-closed で制限する。
+        byte_budget = heap_budget;
+
+        // パス 2: 全順序で確定してから（`BinaryHeap::into_sorted_vec` は
+        // `Ord` の昇順。`(tenant_id, id)` が一意な全順序のため安定性は
+        // 問題にならない）、同じ read txn 内で勝者のみを再取得し投影する
+        // （`sort_unstable_*` を使わない。`make sort-determinism-check`）。
+        // パス 1 のループが終わった後で定義することで、パス 1 の
+        // `with_visible_row` 呼び出し（`embedding_scratch`／
+        // `where_expr_scratch` を直接可変借用）と本クロージャの捕捉が
+        // 重ならないようにする（Issue #915）。
+        let mut build_visible_row = |key_tenant: &str, id: u64, buf: &[u8]| {
+            with_visible_row(
+                buf,
+                key_tenant,
+                id,
+                schema,
+                bound,
+                tier,
+                &scalar_mask,
+                expected_dim,
+                ctx,
+                &mut embedding_scratch,
+                &mut where_expr_scratch,
+                |dim, scanned, embedding| {
+                    byte_budget =
+                        try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
+                    let cells = build_projected_cells(
+                        schema,
+                        bound,
+                        tier,
+                        id,
+                        dim,
+                        embedding,
+                        scanned,
+                        &computed_programs,
+                        &mut proj_expr_scratch,
+                        &mut byte_budget,
+                        max_result_bytes,
+                    )?;
+                    Ok(ResultRow {
+                        id,
+                        score: 0.0,
+                        cells,
+                    })
+                },
+            )
+        };
+
+        // Issue #916・SQL-25 (b)・TASK-209: 経路 (B) の `OFFSET` は
+        // `docs/design/sql-offset-paging.md`「ORDER BY なし OFFSET の意味論」節が
+        // 申し送る #915 統合事項（ソート確定後にスキップする契約）を、上のパス 1
+        // でのヒープ容量を `bound.limit + bound.offset` へ広げることで満たす
+        // （`heap.len() < ...` の判定を参照）。ここでは `heap.into_sorted_vec()`
+        // が返す確定済み順序の先頭から `bound.offset` 件を読み飛ばしてから
+        // 投影する（不可視行・WHERE 不一致行は既に候補から除外済みのため、ここで
+        // 数えても他テナントの存在・件数は漏えいしない）。
+        for winner in heap.into_sorted_vec() {
             if skipped < bound.offset {
                 skipped += 1;
                 continue;
             }
-
-            // `cells`／`rows` 確保前に累計予算を検証（上記コメント参照。確保
-            // そのものを許可する前に拒否できるよう `Vec::try_reserve` 系より先に
-            // 判定する）。
-            byte_budget =
-                try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
-
-            // 投影段。確保失敗時に abort せず `Err` を返せるよう `try_reserve_exact`
-            // を使う（`try_alloc_text_for_budget`／`try_clone_embedding_for_budget`
-            // と同方針）。
-            let mut cells: Vec<Cell> = Vec::new();
-            cells
-                .try_reserve_exact(bound.projection.len())
-                .map_err(|e| SqlSurfaceError::Internal {
-                    detail: format!("failed to reserve scan result cells: {e}"),
-                })?;
-            for (col_idx, col) in bound.projection.iter().enumerate() {
-                match col {
-                    ProjectedColumn::Id => cells.push(Cell::Integer(id)),
-                    ProjectedColumn::Column { index, .. } => {
-                        let column = schema.columns.get(*index).ok_or_else(|| {
-                            SqlSurfaceError::Internal {
-                                detail: "projected column index out of range".to_string(),
-                            }
-                        })?;
-                        match &column.ty {
-                            ColumnType::Vector(_) => {
-                                // `dim == 0` は `VECTOR` 列が未設定（NULL。TABLE-5 の
-                                // 追加列を含む）という `storage::Row` の既存契約
-                                // （`sql::aggregate::RowVector` のドキュメント参照）。
-                                if dim == 0 {
-                                    cells.push(Cell::Null);
-                                } else {
-                                    let embedding = match tier {
-                                        DecodeTier::Embedding => embedding_scratch.as_slice(),
-                                        DecodeTier::Fast | DecodeTier::DimAndScalar => {
-                                            return Err(scan_bug(
-                                                "VECTOR column projected but tier did not decode embedding",
-                                            ))
-                                        }
-                                    };
-                                    cells.push(Cell::Vector(try_clone_embedding_for_budget(
-                                        embedding,
-                                        &mut byte_budget,
-                                        max_result_bytes,
-                                    )?));
-                                }
-                            }
-                            ColumnType::Text => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::Text(t))) => {
-                                    cells.push(Cell::Text(try_alloc_text_for_budget(
-                                        t,
-                                        &mut byte_budget,
-                                        max_result_bytes,
-                                    )?))
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                                Some(Some(_)) => {
-                                    return Err(SqlSurfaceError::Internal {
-                                        detail: "scalar payload type mismatch".to_string(),
-                                    })
-                                }
-                            },
-                            // F8（Issue #882 計画）: REAL/DOUBLE は `Cell::Float`
-                            // （REAL は f64 への無損失拡大）へ投影する。
-                            ColumnType::Real => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::Real(v))) => {
-                                    cells.push(Cell::Float(f64::from(*v)))
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                                Some(Some(_)) => {
-                                    return Err(SqlSurfaceError::Internal {
-                                        detail: "scalar payload type mismatch".to_string(),
-                                    })
-                                }
-                            },
-                            ColumnType::Double => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::Double(v))) => {
-                                    cells.push(Cell::Float(*v))
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                                Some(Some(_)) => {
-                                    return Err(SqlSurfaceError::Internal {
-                                        detail: "scalar payload type mismatch".to_string(),
-                                    })
-                                }
-                            },
-                            ColumnType::Integer => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::Integer(v))) => {
-                                    cells.push(Cell::SignedInteger(i64::from(*v)))
-                                }
-                                Some(Some(_)) => {
-                                    return Err(SqlSurfaceError::Internal {
-                                        detail: "scanned scalar type mismatch for INTEGER column"
-                                            .to_string(),
-                                    })
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            ColumnType::BigInt => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::BigInt(v))) => {
-                                    cells.push(Cell::SignedInteger(*v))
-                                }
-                                Some(Some(_)) => {
-                                    return Err(SqlSurfaceError::Internal {
-                                        detail: "scanned scalar type mismatch for BIGINT column"
-                                            .to_string(),
-                                    })
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            ColumnType::Boolean => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::Bool(b))) => {
-                                    cells.push(Cell::Bool(*b))
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                                Some(Some(_)) => {
-                                    return Err(SqlSurfaceError::Internal {
-                                        detail: "scalar payload type mismatch".to_string(),
-                                    })
-                                }
-                            },
-                            ColumnType::Date => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_date() {
-                                    Some(d) => cells.push(Cell::Date(d)),
-                                    None => {
-                                        return Err(scan_bug(
-                                            "DATE column scan yielded a non-Date scalar value",
-                                        ))
-                                    }
-                                },
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            ColumnType::Timestamp => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_timestamp() {
-                                    Some(t) => cells.push(Cell::Timestamp(t)),
-                                    None => {
-                                        return Err(scan_bug(
-                                            "TIMESTAMP column scan yielded a non-Timestamp scalar value",
-                                        ))
-                                    }
-                                },
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            ColumnType::Array(_) => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::Array(array_ref))) => {
-                                    let value = try_alloc_array_for_budget(
-                                        *array_ref,
-                                        &mut byte_budget,
-                                        max_result_bytes,
-                                    )?;
-                                    cells.push(Cell::Array(value));
-                                }
-                                Some(Some(_)) => {
-                                    return Err(scan_bug(
-                                        "ARRAY column scan yielded a non-Array scalar value",
-                                    ))
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            ColumnType::Bytea => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::Bytes(b))) => {
-                                    cells.push(Cell::Bytes(try_alloc_bytes_for_budget(
-                                        b,
-                                        &mut byte_budget,
-                                        max_result_bytes,
-                                    )?));
-                                }
-                                Some(Some(_)) => {
-                                    return Err(scan_bug(
-                                        "BYTEA column scan yielded a non-Bytea scalar value",
-                                    ))
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            ColumnType::Json | ColumnType::Jsonb => match scanned.get(*index) {
-                                Some(Some(row_codec::ScalarRef::Json(t))) => {
-                                    cells.push(Cell::Json(try_alloc_text_for_budget(
-                                        t,
-                                        &mut byte_budget,
-                                        max_result_bytes,
-                                    )?));
-                                }
-                                Some(Some(_)) => {
-                                    return Err(scan_bug(
-                                        "JSON column scan yielded a non-Json scalar value",
-                                    ))
-                                }
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            // ENUM 列は既存の `Cell::Text` へ写像する（Issue #890 D7。
-                            // `sql::exec` の投影と同じ扱い）。
-                            ColumnType::Enum(_) => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_dictionary_text() {
-                                    Some(t) => {
-                                        cells.push(Cell::Text(try_alloc_text_for_budget(
-                                            t,
-                                            &mut byte_budget,
-                                            max_result_bytes,
-                                        )?));
-                                    }
-                                    None => {
-                                        return Err(scan_bug(
-                                            "ENUM column scan yielded a non-Enum scalar value",
-                                        ))
-                                    }
-                                },
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            ColumnType::Numeric { .. } => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_numeric() {
-                                    Some(d) => cells.push(Cell::Numeric(d)),
-                                    None => return Err(scan_bug(
-                                        "NUMERIC column scan yielded a non-Numeric scalar value",
-                                    )),
-                                },
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                            ColumnType::Uuid => match scanned.get(*index) {
-                                Some(Some(v)) => match v.as_uuid() {
-                                    Some(u) => cells.push(Cell::Uuid(u)),
-                                    None => return Err(scan_bug(
-                                        "UUID column scan yielded a non-Uuid scalar value",
-                                    )),
-                                },
-                                Some(None) | None => cells.push(Cell::Null),
-                            },
-                        }
-                    }
-                    ProjectedColumn::Computed { .. } => {
-                        let (program, references_embedding) = computed_programs
-                            .get(col_idx)
-                            .and_then(|p| p.as_ref())
-                            .ok_or_else(|| SqlSurfaceError::Internal {
-                                detail: "computed projection program missing at evaluation time"
-                                    .to_string(),
-                            })?;
-                        // `dim == 0`（`VECTOR` 列が NULL）の行で embedding を参照する
-                        // 式を評価すると空スライスを実データと区別できず誤った数値
-                        // （例: `vec_norm` が `0.0`）を返してしまう（Cursor Bugbot
-                        // 指摘）。`ProjectedColumn::Column` の直接投影と同じく NULL を
-                        // 伝播させる。
-                        if *references_embedding && dim == 0 {
-                            cells.push(Cell::Null);
-                        } else {
-                            let embedding_for_eval: &[f32] = match tier {
-                                DecodeTier::Embedding => embedding_scratch.as_slice(),
-                                DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
-                            };
-                            match program.eval(id, embedding_for_eval, &mut expr_scratch)? {
-                                ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
-                                ExprValue::Vector(v) => {
-                                    // codex-review P1 指摘対応: `Computed` 列のベクトル
-                                    // 結果も `VECTOR` 列直接投影と同じ累計予算
-                                    // （`MAX_SCAN_RESULT_BYTES`）へ計上する。所有化
-                                    // （`into_owned_vector`）自体は `try_reserve_exact`
-                                    // 経由で単発の確保失敗には強いが、累計を見ないと
-                                    // 行数分の蓄積で予算を回避できてしまうため。
-                                    let owned = udf_call::into_owned_vector(v)?;
-                                    cells.push(Cell::Vector(try_accumulate_vector_budget(
-                                        owned,
-                                        &mut byte_budget,
-                                        max_result_bytes,
-                                    )?));
-                                }
-                                ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
-                            }
-                        }
-                    }
-                }
-            }
-            // `rows`（`Vec<ResultRow>`）の確保も `try_reserve` 系で行う
-            // （上記コメント参照。上限判定は既に `per_row_struct_bytes` の累計へ
-            // 反映済みのため、ここでは確保方式のみを abort 非経路へ切り替える）。
+            let guard = table
+                .get((winner.tenant_id.as_str(), winner.id))
+                .map_err(storage_internal)?;
+            let Some(guard) = guard else {
+                // 同じスナップショット内で消えることは本来起こらない
+                // （fail-closed。§検証方法「経路 (A) と (B) の等価性」）。
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scan row scan failed: ordered row missing on second pass".to_string(),
+                });
+            };
+            let buf = guard.value();
+            let row = build_visible_row(winner.tenant_id.as_str(), winner.id, buf)?;
+            let Some(row) = row else {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "scan row scan failed: ordered row became invisible on second pass"
+                        .to_string(),
+                });
+            };
             rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
                 detail: format!("failed to reserve scan result rows: {e}"),
             })?;
-            rows.push(ResultRow {
-                id,
-                score: 0.0,
-                cells,
-            });
+            rows.push(row);
         }
     }
 
@@ -911,6 +1524,7 @@ mod tests {
             expr_filter_programs: Vec::new(),
             or_filters: Vec::new(),
             limit,
+            order_by: Vec::new(),
             offset: 0,
         }
     }
@@ -968,6 +1582,156 @@ mod tests {
         let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 1)
             .expect_err("tiny caller-supplied budget must reject before default cap");
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review PR #1096 P1 是正の回帰: 経路 (B)（上位 N 件 2 パス。
+    /// `crates/engine/src/sql/scan.rs:1303` 付近）は、パス 1 のヒープ候補保持量
+    /// （`heap_budget`）とパス 2 の投影結果保持量（`byte_budget`）を別々に
+    /// `max_result_bytes` へ照合していたため、候補側・結果側それぞれ単独では
+    /// 予算内でも同時に保持する合計サイズが上限を超えうる（`DECLARE CURSOR` の
+    /// 小さい予算指定でメモリ予算を実質迂回できる経路）。ここでは、候補
+    /// （`ORDER BY` 対象の TEXT 値）と結果（同じ列の投影セル）の双方が同じ長さの
+    /// テキストを保持する行を用意し、単独では収まるが合計では超過する予算値を
+    /// 計算して渡す。修正後は `byte_budget` がパス 2 開始時に `heap_budget` を
+    /// 引き継ぐ単一の共通予算カウンタになるため、合計超過を行生成中に検出して
+    /// `54000` で打ち切る。
+    #[test]
+    fn execute_scan_with_budget_bounds_combined_candidate_and_result_bytes_on_path_b() {
+        let path = unique_db_path("scan-path-b-combined-budget");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true),
+                ColumnDef::new("tag", ColumnType::Text, true),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let tag_value = "x".repeat(2000);
+        let tenant_id = "tenant-a";
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            let metadata = crate::row_codec::encode_scalar_columns(
+                &schema,
+                &[
+                    crate::row_codec::Value::Null,
+                    crate::row_codec::Value::Text(tag_value.clone()),
+                ],
+            )
+            .expect("encode scalar columns");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id,
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &metadata,
+            })
+            .expect("encode row");
+            table
+                .insert((tenant_id, 1u64), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+
+        let ctx = PolicyContext::new(tenant_id).expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Column {
+                    index: 1,
+                    name: "tag".to_string(),
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+            limit: 1,
+            order_by: vec![crate::sql::parser::BoundOrderKey {
+                target: crate::sql::parser::BoundOrderTarget::Column(1),
+                kind: crate::sql::parser::OrderKind::Bytes,
+                descending: false,
+            }],
+            offset: 0,
+        };
+
+        // パス 1 のヒープ候補 1 件分（`heap_entry_bytes` と同じ計算式）と、
+        // パス 2 の投影結果 1 行分（`per_row_struct_bytes` + テキスト実体）を
+        // それぞれ単独で見積もる。
+        let heap_entry_bytes_estimate = std::mem::size_of::<HeapEntry>()
+            .saturating_add(
+                bound
+                    .order_by
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
+            )
+            .saturating_add(tag_value.len())
+            .saturating_add(tenant_id.len());
+        let cell_struct_bytes = bound
+            .projection
+            .len()
+            .saturating_mul(std::mem::size_of::<Cell>());
+        let result_row_struct_bytes = std::mem::size_of::<ResultRow>();
+        let per_row_bytes_estimate = cell_struct_bytes
+            .saturating_add(result_row_struct_bytes)
+            .saturating_add(tag_value.len());
+
+        // 単独ではどちらも収まるが合計では超過する予算（各見積りの大きい方に
+        // 小さな余白を足しただけの値）を用意する。
+        let cap = heap_entry_bytes_estimate.max(per_row_bytes_estimate) + 8;
+        assert!(
+            cap < heap_entry_bytes_estimate.saturating_add(per_row_bytes_estimate),
+            "test cap must fall strictly between the per-side estimate and their combined total \
+             to exercise the shared-budget fix"
+        );
+
+        // 十分大きい既定予算では成功する。
+        execute_scan(&read_txn, &ctx, &schema, &bound).expect("default budget should succeed");
+
+        // 候補側・結果側それぞれ単独では収まるが合計では超過する予算では、
+        // 行生成中に打ち切られる（旧実装は `heap_budget` と `byte_budget` を
+        // 独立に判定していたためここを通過してしまっていた）。
+        let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, cap).expect_err(
+            "combined candidate+result bytes must exceed the caller-supplied cap on path (B)",
+        );
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review PR #1096 P1 是正の回帰: `heap_entry_bytes` が `keys:
+    /// Vec<Option<OrderValue>>` 配列自体の確保量（容量ベース）を計上することを
+    /// 検証する。旧実装は構造体本体・TEXT 実体・`tenant_id` のみを数え、複数
+    /// キー指定時の配列本体を予算の外側に置いていた（Issue #915）。
+    #[test]
+    fn heap_entry_bytes_accounts_for_keys_array_capacity() {
+        let spec: Rc<[BoundOrderKey]> = Rc::from(Vec::<BoundOrderKey>::new());
+        let make_entry = |key_count: usize| HeapEntry {
+            keys: vec![None; key_count],
+            tenant_id: "tenant-a".to_string(),
+            id: 1,
+            spec: Rc::clone(&spec),
+        };
+
+        let one_key = make_entry(1);
+        let eight_keys = make_entry(8);
+        let option_order_value_size = std::mem::size_of::<Option<OrderValue>>();
+
+        // 8 キー分の配列は 1 キー分より少なくとも 7 要素分（`Option<OrderValue>`
+        // 換算）大きい。未計上のまま容量を無視すると差分は 0 になる。
+        let diff = heap_entry_bytes(&eight_keys) - heap_entry_bytes(&one_key);
+        assert!(
+            diff >= option_order_value_size * 7,
+            "keys 配列の容量差が heap_entry_bytes に反映されていない: diff={diff}, \
+             option_order_value_size={option_order_value_size}"
+        );
     }
 
     #[test]
@@ -1054,6 +1818,49 @@ mod tests {
         assert_eq!(ids, vec![2, 3]);
     }
 
+    /// PR #1096 レビュー指摘 P1（codex-review・cursor Bugbot 双方が独立検出）の
+    /// 回帰: `OFFSET` で読み飛ばす行は投影・`byte_budget` 加算のいずれも行わない
+    /// （既存の「スキップ行は投影・予算計上しない」契約）。修正前は
+    /// `build_visible_row` が可視性・`WHERE` 判定後に投影・予算計上を終えてから
+    /// `skipped < bound.offset` を判定していたため、読み飛ばされる行が大きい
+    /// `VECTOR` を持つだけで返却対象でない行の分まで予算に計上され、不要に
+    /// `54000`（payload_too_large）になっていた。読み飛ばし行の分を除けば収まる
+    /// 予算で、実際に収まることを確認する。
+    #[test]
+    fn offset_skipped_rows_do_not_count_toward_result_byte_budget() {
+        let path = unique_db_path("scan-offset-skip-budget");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        // 大きめの VECTOR（次元 5000 = 20000 バイト/行）で、スキップ行の予算
+        // 誤計上が閾値超過として顕在化するようにする。
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(5000), true)],
+        );
+        storage.create_table(&schema).expect("create table");
+        let big_embedding = vec![1.0f32; 5000];
+        // id 1..=5: OFFSET で読み飛ばされる行（返却されない）。
+        for id in 1..=5u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &big_embedding);
+        }
+        // id 6..=7: 返却される行。
+        for id in 6..=7u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &big_embedding);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut bound = bound_star_scan(10);
+        bound.offset = 5;
+
+        // 返却される 2 行分（約 40000 バイト＋構造体分）は収まるが、スキップ
+        // される 5 行分まで誤って計上すると（約 140000 バイト）超過する予算。
+        let result = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 60_000)
+            .expect("skipped rows must not count toward the result byte budget");
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![6, 7]);
+    }
+
     /// `vec_norm(embedding)` を投影する `Computed` 列を持つ `BoundScan` を組み立てる
     /// （Cursor Bugbot 指摘の回帰テスト用ヘルパー）。
     fn bound_scan_with_vec_norm_projection(limit: usize) -> BoundScan {
@@ -1074,6 +1881,7 @@ mod tests {
             expr_filter_programs: Vec::new(),
             or_filters: Vec::new(),
             limit,
+            order_by: Vec::new(),
             offset: 0,
         }
     }
@@ -1140,6 +1948,7 @@ mod tests {
             expr_filter_programs: vec![program],
             or_filters: Vec::new(),
             limit: 10,
+            order_by: Vec::new(),
             offset: 0,
         };
 
@@ -1188,6 +1997,7 @@ mod tests {
             expr_filter_programs: Vec::new(),
             or_filters: Vec::new(),
             limit: 10,
+            order_by: Vec::new(),
             offset: 0,
         };
 
@@ -1355,6 +2165,7 @@ mod tests {
             expr_filter_programs: Vec::new(),
             or_filters: Vec::new(),
             limit: 10,
+            order_by: Vec::new(),
             offset: 0,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
@@ -1373,6 +2184,7 @@ mod tests {
             expr_filter_programs: Vec::new(),
             or_filters: Vec::new(),
             limit: 10,
+            order_by: Vec::new(),
             offset: 0,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
@@ -1397,6 +2209,7 @@ mod tests {
             expr_filter_programs: Vec::new(),
             or_filters: Vec::new(),
             limit: 10,
+            order_by: Vec::new(),
             offset: 0,
         };
         let (tier, _mask) = decode_tier_for(&schema, &bound);
