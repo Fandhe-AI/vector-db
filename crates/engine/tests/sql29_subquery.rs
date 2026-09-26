@@ -371,6 +371,36 @@ fn in_subquery_multi_column_projection_is_rejected() {
     ));
 }
 
+// PR #1103 追加 codex-review P1 指摘の自己点検（EXISTS 側の資源上限修正と
+// 同種の問題が IN 側にも無いかの確認）: `IN (SELECT ...)` は投影列が
+// ちょうど 1 列であることを要求する契約だが、以前はこれを実行結果からしか
+// 検査しておらず、`SELECT *` のような不正な内側クエリでも束縛・全件走査を
+// 最後まで終えてから拒否していた。`sql::subquery::execute_inner_scan` は
+// 投影列数を実行前（束縛・走査より前）に静的検証するようになった
+// （`crates/engine/src/sql/subquery.rs` の単体テスト
+// `execute_inner_scan_existence_only_caps_projection_and_row_count` 等
+// 参照）。ここでは SQL 表層から見た拒否自体（`SELECT *` を含む）が
+// 変わらないことを固定する。
+#[test]
+fn in_subquery_select_star_projection_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN (SELECT * FROM {ALLOWED_LANGS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        err,
+        engine::sql::allowlist::SqlSurfaceError::UnsupportedSyntax { .. }
+    ));
+}
+
 // PR #1103 codex-review P1 指摘の回帰テスト（2 スレッド・同一趣旨）:
 // `<col> IN (SELECT ...)` の対象列 `<col>` が存在しない・非対応型の場合でも、
 // 内側サブクエリの結果が 0 行または NULL のみだと、以前は列名・型検証を
@@ -710,6 +740,82 @@ fn exists_subquery_combined_with_and_matches_independent_oracle() {
         ),
     );
     assert_eq!(ids, vec![1]);
+}
+
+// PR #1103 追加 codex-review P1 指摘の回帰テスト: `EXISTS (SELECT ...)` は
+// 可視行が 1 件以上存在するかどうかしか使わないため、内側を実質 `LIMIT 1`・
+// 投影不要で評価する（`sql::subquery::InnerScanIntent::ExistenceOnly`）。
+// 以前はユーザー指定の投影（`SELECT *` 等）・`LIMIT` をそのまま使っていた
+// ため、幅広い投影×大きい `LIMIT` の組合せでは可視行があっても
+// `execute_scan` の結果バイト上限に達し `EXISTS` 文全体が失敗しえた。
+// 大きな TEXT 列を持つ内側 `SELECT *` で、この経路（真・偽・RLS 境界）が
+// 資源上限に当たらず正しく動作することを固定する。
+
+fn large_text_value() -> String {
+    // 単一セルとしては大きいが、テスト実行時間・メモリを圧迫しない範囲
+    // （数百 KB オーダー）の TEXT 値。行数×投影列数に比例してバイト予算を
+    // 消費する旧実装では、`LIMIT` が大きいほど資源上限へ近づく設計だった
+    // ことの再現に十分な大きさ。
+    "x".repeat(500_000)
+}
+
+#[test]
+fn exists_subquery_select_star_with_large_text_column_succeeds_when_visible_row_exists() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    insert_visit(&core, &ctx, 1, &large_text_value());
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE EXISTS (SELECT * FROM {VISITS} LIMIT 9999) LIMIT 100"
+        ),
+    );
+    assert_eq!(ids, vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn exists_subquery_select_star_with_large_text_column_is_false_without_visible_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    // visits は空のまま（可視行なし）。
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE EXISTS (SELECT * FROM {VISITS} LIMIT 9999) LIMIT 100"
+        ),
+    );
+    assert!(ids.is_empty());
+}
+
+#[test]
+fn exists_subquery_select_star_with_large_text_column_is_false_for_other_tenant_only() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx_a = ctx_for("tenant-a");
+    let ctx_b = ctx_for("tenant-b");
+    seed_docs(&core, &ctx_a);
+    // tenant-b だけが（大きな TEXT 値を持つ）visits 行を持つ。
+    insert_visit(&core, &ctx_b, 1, &large_text_value());
+
+    let ids = select_ids(
+        &core,
+        &ctx_a,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE EXISTS (SELECT * FROM {VISITS} LIMIT 9999) LIMIT 100"
+        ),
+    );
+    assert!(
+        ids.is_empty(),
+        "tenant-a must not observe tenant-b's visits row via EXISTS"
+    );
 }
 
 // --- RLS 境界（RECOVER-4 と同型: テナント越境なし） -------------------------

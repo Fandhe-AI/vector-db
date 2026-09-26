@@ -41,6 +41,19 @@
 //!   指摘対応。内側最大可視行数 [`crate::core::MAX_SEARCH_K`] ×
 //!   [`MAX_SUBQUERY_EXECUTIONS`] の組合せだけでは、既存の `WHERE` 述語数上限
 //!   より 2 桁以上大きい評価コストを 1 文から発生させられた）。
+//! - `EXISTS (SELECT ...)` は可視行が 1 件以上存在するかどうかしか使わない
+//!   ため、[`InnerScanIntent::ExistenceOnly`] で内側を実質 `LIMIT 1`・投影
+//!   不要へ差し替えて評価する（`WHERE`・RLS の適用は変更しない＝可視性判定
+//!   を迂回しない。PR #1103 追加 codex-review P1 指摘対応: 以前はユーザー
+//!   指定の投影・`LIMIT` をそのまま使っていたため、可視行があっても
+//!   `SELECT *` 等の広い投影×大きい `LIMIT` の組合せで `execute_scan` の
+//!   結果バイト上限に達し `EXISTS` 文全体が失敗しえた）。
+//! - `IN (SELECT ...)` の投影列数（ちょうど 1 列である契約）も、実行結果
+//!   からではなく `validated.projection`／内側スキーマから実行前に静的検証
+//!   する（PR #1103 追加 codex-review P1 指摘の自己点検で発見: 上記
+//!   `EXISTS` の修正前と同種の「必要以上の投影で走査コストを払ってから
+//!   拒否する」問題が `IN` 側にも存在した。`SELECT *` 等の不正な内側クエリ
+//!   を、束縛・全件走査より前に `42601` で拒否する）。
 
 use super::allowlist::{Statement, TableLookup, WherePredicate};
 use super::exec::{Cell, ColumnMeta};
@@ -160,6 +173,22 @@ pub(crate) fn resolve_where_predicates(
     Ok(out)
 }
 
+/// [`execute_inner_scan`] が内側クエリをどう評価するかを表す（PR #1103 追加
+/// codex-review P1 指摘対応: `IN`／`EXISTS` で必要な情報量が異なるため、
+/// 同じ実行経路（`bind_scan` → `execute_scan`）を共有しつつ束縛直前の
+/// `ValidatedScan` だけを使い分ける）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InnerScanIntent {
+    /// `IN (SELECT ...)`: 内側の投影値そのものが必要なため、ユーザー指定の
+    /// 投影・`LIMIT` をそのまま使う。
+    Values,
+    /// `EXISTS (SELECT ...)`: 可視行が 1 件以上存在するかどうかしか使わない。
+    /// 投影を空へ、`LIMIT` を実質 1 へ差し替えて評価する（`ValidatedScan::
+    /// limit` のドキュメントが説明する早期終了を利用し、先頭の該当行を
+    /// 確認した時点で走査を打ち切る）。
+    ExistenceOnly,
+}
+
 /// 内側トークン列を検証・実行し、`sql::allowlist::Statement::Scan` として
 /// 妥当であることを確認した上で、束縛前の残りの解決（自身の WHERE に含まれる
 /// さらに深いサブクエリ）を行い、`sql::scan::execute_scan` で実行する。
@@ -170,10 +199,19 @@ pub(crate) fn resolve_where_predicates(
 /// このクエリ自身）。そのため `inner_schema` の取得を `bind_scan` 呼び出しより
 /// 前へ移し、ネストした `resolve_where_predicates` 呼び出しへ渡す
 /// （PR #1103 codex-review P1 指摘対応）。
+///
+/// `intent` が [`InnerScanIntent::ExistenceOnly`] の場合、`WHERE`・RLS の
+/// 適用（`where_predicates`・`ctx`）は通常の内側評価と完全に同一のまま、
+/// 投影・`LIMIT` のみを可視性判定に不要な形へ差し替える（PR #1103 追加
+/// codex-review P1 指摘対応: 以前は `EXISTS` もユーザー指定の投影・`LIMIT`
+/// をそのまま使っていたため、可視行があっても `SELECT *` 等の広い投影×
+/// 大きい `LIMIT` の組合せで `execute_scan` の結果バイト上限に達し、
+/// `EXISTS` 文全体が失敗しえた）。
 #[allow(clippy::too_many_arguments)]
 fn execute_inner_scan(
     inner_tokens: &[Token],
     depth: usize,
+    intent: InnerScanIntent,
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     lookup: &impl TableLookup,
@@ -209,6 +247,31 @@ fn execute_inner_scan(
             other => crate::catalog::table_lookup_error(other),
         })?;
 
+    if intent == InnerScanIntent::Values {
+        // `IN (SELECT ...)` は投影列がちょうど 1 列であることを要求する
+        // 契約（`resolve_in_subquery` の `result.columns.len() != 1` 検査）
+        // だが、以前はこれを実行結果からしか検査しておらず、`SELECT *` や
+        // 複数列を投影する不正な内側クエリでも、束縛・全件走査（ネストした
+        // サブクエリの解決・`bind_scan`・`execute_scan`）を最後まで終えて
+        // からようやく拒否していた（PR #1103 追加 codex-review P1 指摘の
+        // 自己点検: `EXISTS` と同種の「必要以上の投影で走査コストを払って
+        // から拒否する」問題が `IN` 側にも存在した）。`validated.projection`
+        // と `inner_schema` から投影列数を実行前に静的に確定できるため、
+        // ここで先に検査し、1 列でなければ実行前に `42601` で拒否する
+        // （`resolve_in_subquery` 側の実行後チェックは、この静的検査が
+        // 想定しない構成を取りこぼさないための多層防御として残す）。
+        let projected_len = match &validated.projection {
+            super::allowlist::Projection::All => 1 + inner_schema.columns.len(),
+            super::allowlist::Projection::Columns(names) => names.len(),
+            super::allowlist::Projection::Items(items) => items.len(),
+        };
+        if projected_len != 1 {
+            return Err(SqlSurfaceError::unsupported(
+                "subquery used with IN must select exactly one column",
+            ));
+        }
+    }
+
     // 自身の WHERE に含まれるさらに深いサブクエリを、束縛（`bind_scan`）の前に
     // 解決する（深さ優先。`depth` は構文解析段で `MAX_SUBQUERY_DEPTH` 検査
     // 済みのため、ここでは budget のみ検査すれば足りる）。`outer_schema` には
@@ -223,6 +286,20 @@ fn execute_inner_scan(
         budget,
         in_leaf_budget,
     )?;
+
+    if intent == InnerScanIntent::ExistenceOnly {
+        // ユーザー指定の `LIMIT` 自体の範囲検証（`bind_scan` が本来行う契約）
+        // は、これから使う値を 1 へ差し替えても迂回されないよう、差し替え前の
+        // 元の値に対して明示的に検証しておく（fail-closed。範囲外の `LIMIT`
+        // を指定した `EXISTS` が、値を使わないという理由だけで通ってしまう
+        // ことを防ぐ）。`OFFSET` は可視性判定に意味を持つため変更しない
+        // （`LIMIT` の範囲が 1 以上である契約と合わせ、`LIMIT` を 1 に
+        // 差し替えても「`OFFSET` 分だけ読み飛ばした後に可視行が 1 件以上
+        // あるか」という元の意味論と同値になる）。
+        super::parser::validate_search_limit(validated.limit)?;
+        validated.projection = super::allowlist::Projection::Columns(Vec::new());
+        validated.limit = 1;
+    }
 
     let bound = super::parser::bind_scan(&validated, &inner_schema, udfs)?;
     let result = super::scan::execute_scan(read_txn, ctx, &inner_schema, &bound)?;
@@ -358,6 +435,7 @@ fn resolve_in_subquery(
     let result = execute_inner_scan(
         inner_tokens,
         depth,
+        InnerScanIntent::Values,
         read_txn,
         ctx,
         lookup,
@@ -430,6 +508,9 @@ fn resolve_in_subquery(
 }
 
 /// `EXISTS (SELECT ...)` を解決し、可視行が 1 件以上存在するかどうかを返す。
+/// 内側は [`InnerScanIntent::ExistenceOnly`] で評価する（投影不要・実質
+/// `LIMIT` 1。PR #1103 追加 codex-review P1 指摘対応の詳細は
+/// [`execute_inner_scan`] のドキュメント参照）。
 #[allow(clippy::too_many_arguments)]
 fn resolve_exists_subquery(
     inner_tokens: &[Token],
@@ -444,6 +525,7 @@ fn resolve_exists_subquery(
     let result = execute_inner_scan(
         inner_tokens,
         depth,
+        InnerScanIntent::ExistenceOnly,
         read_txn,
         ctx,
         lookup,
@@ -508,5 +590,155 @@ fn cell_to_equality_predicate(
             "unsupported column type for subquery IN target (implementation scope: \
              TEXT / BOOLEAN / id only; INTEGER/BIGINT equality is not yet implemented)",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::ColumnDef;
+    use crate::storage::{encode_row, RowInput, Storage, Visibility};
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+    use redb::ReadableDatabase;
+
+    fn docs_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(3), true)],
+        )
+    }
+
+    /// 検証専用: `encode_row`（低レベル API）で直接行を書き込む
+    /// （`sql::scan` モジュール内テストの `write_row_direct` と同型）。
+    fn write_row_direct(storage: &Storage, tenant_id: &str, id: u64, embedding: &[f32]) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            let buf = encode_row(&RowInput {
+                tenant_id,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: &[],
+            })
+            .expect("encode row");
+            table
+                .insert((tenant_id, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    /// PR #1103 追加 codex-review P1 指摘の回帰テスト:
+    /// [`InnerScanIntent::ExistenceOnly`] で `execute_inner_scan` を呼ぶと、
+    /// 内側が `SELECT *`（全列投影）・大きい `LIMIT`（500）を指定していても、
+    /// 実際に返る `QueryResult` は投影列ゼロ（`columns.is_empty()`）・行数
+    /// 高々 1 件（`rows.len() <= 1`）に抑えられることを固定する（複数件の
+    /// 可視行が存在する場合でも同じ）。この O(1) 化が、`EXISTS` が
+    /// `execute_scan` の結果バイト上限（`sql::scan::MAX_SCAN_RESULT_BYTES`）
+    /// に達しなくなる根拠そのもの——以前は投影・`LIMIT` をユーザー指定の
+    /// ままユーザー指定した内側 `SELECT` を丸ごと実行していたため、幅広い
+    /// 投影×大きい `LIMIT` の組合せでは可視行があっても `EXISTS` 全体が
+    /// 資源上限で失敗しえた（列幅が大きいほど悪化するが、行数自体を 1 件に
+    /// 抑える本修正は列幅に関わらず効く）。
+    #[test]
+    fn execute_inner_scan_existence_only_caps_projection_and_row_count() {
+        let path = unique_db_path("subquery-exists-existence-only");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = docs_schema();
+        storage.create_table(&schema).expect("create table");
+        // 複数件の可視行を用意する（`LIMIT 500` を素通しした場合は全件が
+        // 返りうる状態）。
+        for id in 1..=5u64 {
+            write_row_direct(&storage, "tenant-a", id, &[1.0, 2.0, 3.0]);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let udfs = UdfRegistry::default();
+        let mut budget = MAX_SUBQUERY_EXECUTIONS;
+        let mut in_leaf_budget = MAX_SUBQUERY_IN_LEAVES;
+        let inner_tokens =
+            super::super::lexer::tokenize("SELECT * FROM docs LIMIT 500").expect("tokenize");
+
+        let result = execute_inner_scan(
+            &inner_tokens,
+            0,
+            InnerScanIntent::ExistenceOnly,
+            &read_txn,
+            &ctx,
+            &storage,
+            &udfs,
+            &mut budget,
+            &mut in_leaf_budget,
+        )
+        .expect("existence-only scan should succeed");
+
+        assert!(
+            result.columns.is_empty(),
+            "ExistenceOnly must project zero columns regardless of SELECT *, got {:?}",
+            result.columns
+        );
+        assert!(
+            result.rows.len() <= 1,
+            "ExistenceOnly must cap the row count at 1 regardless of LIMIT/visible row count, \
+             got {} rows",
+            result.rows.len()
+        );
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "5 visible rows exist, so exactly 1 must be returned"
+        );
+    }
+
+    /// 対照実験: [`InnerScanIntent::Values`]（`IN` が使う経路）はユーザー
+    /// 指定の投影・`LIMIT` をそのまま使う（挙動不変であることの固定）。
+    #[test]
+    fn execute_inner_scan_values_keeps_user_projection_and_limit() {
+        let path = unique_db_path("subquery-in-values-unchanged");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = docs_schema();
+        storage.create_table(&schema).expect("create table");
+        for id in 1..=5u64 {
+            write_row_direct(&storage, "tenant-a", id, &[1.0, 2.0, 3.0]);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let udfs = UdfRegistry::default();
+        let mut budget = MAX_SUBQUERY_EXECUTIONS;
+        let mut in_leaf_budget = MAX_SUBQUERY_IN_LEAVES;
+        let inner_tokens = super::super::lexer::tokenize("SELECT embedding FROM docs LIMIT 500")
+            .expect("tokenize");
+
+        let result = execute_inner_scan(
+            &inner_tokens,
+            0,
+            InnerScanIntent::Values,
+            &read_txn,
+            &ctx,
+            &storage,
+            &udfs,
+            &mut budget,
+            &mut in_leaf_budget,
+        )
+        .expect("values scan should succeed");
+
+        assert_eq!(
+            result.columns.len(),
+            1,
+            "user projection (embedding) must be preserved"
+        );
+        assert_eq!(
+            result.rows.len(),
+            5,
+            "all 5 visible rows must be returned (LIMIT 500 > 5)"
+        );
     }
 }

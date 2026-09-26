@@ -121,6 +121,24 @@ RLS は既存の実行器がそのまま適用するため、新しい可視性�
 は本 Issue のスコープ外で構文自体を提供しない（`sql::allowlist::Parser` が
 受理しない）ため同様に対象外。
 
+- `EXISTS (SELECT ...)` は可視行が 1 件以上存在するかどうかしか使わないため、
+  内側を `sql::subquery::InnerScanIntent::ExistenceOnly` で評価する（投影を
+  空へ、`LIMIT` を実質 1 へ差し替える。`WHERE`・RLS の適用は通常の内側評価と
+  完全に同一のまま＝可視性判定を迂回しない）。PR #1103 codex-review 指摘
+  対応: 以前はユーザー指定の投影・`LIMIT` をそのまま使っていたため、
+  可視行があっても `SELECT *` 等の広い投影×大きい `LIMIT` の組合せで
+  `sql::scan::execute_scan` の結果バイト上限に達し `EXISTS` 文全体が
+  失敗しえた。
+
+自己点検（同修正時。EXISTS 側の資源上限修正と同種の問題が `IN` 側にも無いか
+の確認）: `IN (SELECT ...)` の投影列数（ちょうど 1 列である契約）も、以前は
+実行結果（`result.columns.len()`）からしか検査しておらず、`SELECT *` 等の
+不正な内側クエリでも束縛・全件走査を最後まで終えてから拒否していた。
+`validated.projection`／内側スキーマから投影列数を実行前に静的に確定できる
+ため、`sql::subquery::execute_inner_scan` が束縛（`bind_scan`）・走査
+（`execute_scan`）より前に検査するよう修正した（`resolve_in_subquery` 側の
+実行後チェックは多層防御として残す）。
+
 ### 拡張クエリプロトコルでの非対応
 
 `sql::params::where_equality_literal_is_param` は Parse 時点の元トークン列
