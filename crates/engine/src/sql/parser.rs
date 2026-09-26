@@ -3494,6 +3494,11 @@ pub struct BoundAggregateItem {
     /// `AS <alias>` の指定値、省略時は関数名小文字
     /// （[`crate::sql::allowlist::AggregateFunc::default_alias`]）。
     pub(crate) name: String,
+    /// `COUNT(DISTINCT <expr>)` の修飾子（SQL-25 (c)・TASK-209）。`func !=
+    /// Count` では常に `false`（[`resolve_aggregate_input`] が `COUNT` 以外での
+    /// `DISTINCT` を構造的に拒否済み）。[`Self::bind`]（クレート外からの直接
+    /// 構築経路）は常に `false` 固定（NoSQL 表層での DISTINCT はスコープ外）。
+    pub(crate) distinct: bool,
 }
 
 impl BoundAggregateItem {
@@ -3535,7 +3540,12 @@ impl BoundAggregateItem {
         let input = resolve_aggregate_input(func, &arg, schema, &udfs, &mut node_budget)?;
         let name = func.default_alias().to_string();
 
-        Ok(BoundAggregateItem { func, input, name })
+        Ok(BoundAggregateItem {
+            func,
+            input,
+            name,
+            distinct: false,
+        })
     }
 
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`）。
@@ -3986,6 +3996,103 @@ fn resolve_aggregate_input(
     }
 }
 
+/// `COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）の入力解決。関数は常に
+/// `COUNT` のため `resolve_aggregate_input` と異なり `func` を引数に取らない。
+/// `resolve_aggregate_input` との差分:
+///
+/// - `id` は（`COUNT(id)` が `AllVisible` へ縮退するのと異なり）実際の値が
+///   異なり数の判定に必要なため常に [`AggregateInput::IdU64`] に束縛する。
+/// - `VECTOR` 列は正準等価の定義を持たないため `22000`
+///   （[`SqlSurfaceError::invalid_input`]）で拒否する（非 DISTINCT の
+///   `COUNT(<VECTOR 列>)` は `VectorColumnPresence` へ縮退するが、DISTINCT は
+///   実際の embedding 値同士の比較を要求するため対象外）。
+/// - `ARRAY`／`JSON`／`JSONB` 列も同じ理由（正準等価未定義）で `22000`。
+/// - それ以外の列型（`TEXT`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
+///   `BOOLEAN`／`DATE`／`TIMESTAMP`／`NUMERIC`／`BYTEA`／`UUID`／`ENUM`）は
+///   `resolve_aggregate_input` と同じ `AggregateInput::*Column` へ束縛する
+///   （`sql::aggregate::Accumulator::observe_distinct` が `scanned` から実値を
+///   直接読み、`Accumulator::observe` の「存在のみを数える」経路とは独立に
+///   異なり値を判定する）。
+/// - `<Scalar 式>`（組み込み関数・UDF・四則演算）は受理する（結果の `f64` を
+///   [`crate::sql::distinct::canon_f64`] で正準化してキーにする）。
+fn resolve_count_distinct_input(
+    arg: &crate::sql::allowlist::AggregateArg,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<AggregateInput, SqlSurfaceError> {
+    use crate::sql::allowlist::AggregateArg;
+    use crate::sql::udf_call::ExprType;
+
+    match arg {
+        // 構文層（`Parser::parse_aggregate_item`）が `COUNT(DISTINCT *)` を
+        // 既に `42601` で拒否しているため、ここへは到達しない想定だが、直接
+        // 構築経路が生まれた場合に備えて fail-closed に扱う。
+        AggregateArg::Star => Err(SqlSurfaceError::unsupported(
+            "COUNT(DISTINCT *) is not supported",
+        )),
+        AggregateArg::Expr(Expr::Ident(name)) => {
+            if let Some((index, column)) = schema
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| &c.name == name)
+            {
+                return match &column.ty {
+                    ColumnType::Text => Ok(AggregateInput::TextColumn(index)),
+                    ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is VECTOR and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    ColumnType::Integer => Ok(AggregateInput::IntegerColumn(index)),
+                    ColumnType::BigInt => Ok(AggregateInput::BigIntColumn(index)),
+                    ColumnType::Real => Ok(AggregateInput::RealColumn(index)),
+                    ColumnType::Double => Ok(AggregateInput::DoubleColumn(index)),
+                    ColumnType::Boolean => Ok(AggregateInput::BooleanColumn(index)),
+                    ColumnType::Date => Ok(AggregateInput::DateColumn(index)),
+                    ColumnType::Timestamp => Ok(AggregateInput::TimestampColumn(index)),
+                    ColumnType::Array(_) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is ARRAY and cannot be used with COUNT(DISTINCT ...)"
+                    ))),
+                    ColumnType::Bytea => Ok(AggregateInput::ByteaColumn(index)),
+                    ColumnType::Json | ColumnType::Jsonb => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is JSON and cannot be used with COUNT(DISTINCT ...)"
+                        )))
+                    }
+                    ColumnType::Enum(_) => Ok(AggregateInput::EnumColumn(index)),
+                    ColumnType::Numeric { precision, scale } => Ok(AggregateInput::NumericColumn {
+                        index,
+                        precision: *precision,
+                        scale: *scale,
+                    }),
+                    ColumnType::Uuid => Ok(AggregateInput::UuidColumn(index)),
+                };
+            }
+            if name == "id" {
+                return Ok(AggregateInput::IdU64);
+            }
+            Err(SqlSurfaceError::invalid_input(format!(
+                "unknown column: {name}"
+            )))
+        }
+        AggregateArg::Expr(expr) => {
+            let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+            match ty {
+                ExprType::Scalar => {
+                    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+                    Ok(AggregateInput::ScalarExpr {
+                        source: bound,
+                        program,
+                    })
+                }
+                ExprType::Vector | ExprType::Bool => Err(SqlSurfaceError::invalid_input(
+                    "aggregate argument must evaluate to a scalar",
+                )),
+            }
+        }
+    }
+}
+
 /// [`crate::sql::allowlist::ValidatedAggregate`] を `schema`・UDF レジストリ `udfs`
 /// と照合して [`BoundAggregate`] へ束縛する（TASK-166・SQL-13 の公開 API。
 /// TASK-167・SQL-14 で `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` の束縛を追加。
@@ -4045,8 +4152,15 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     for item in stmt.items() {
         match item {
             AggregateSelectItem::Aggregate(item) => {
-                let input =
-                    resolve_aggregate_input(item.func, &item.arg, schema, udfs, &mut node_budget)?;
+                // SQL-25 (c)・TASK-209: `DISTINCT` 修飾の有無で入力解決を分ける
+                // （`resolve_count_distinct_input` は `id`/`VECTOR`/`ARRAY`/
+                // `JSON` の扱いが非 DISTINCT の `resolve_aggregate_input` と
+                // 異なる。`item.distinct` は構文層で `COUNT` 限定に絞り込み済み）。
+                let input = if item.distinct {
+                    resolve_count_distinct_input(&item.arg, schema, udfs, &mut node_budget)?
+                } else {
+                    resolve_aggregate_input(item.func, &item.arg, schema, udfs, &mut node_budget)?
+                };
                 let name = item
                     .alias
                     .clone()
@@ -4056,6 +4170,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                     func: item.func,
                     input,
                     name: name.clone(),
+                    distinct: item.distinct,
                 });
                 projection.push(ProjectionColumn::Aggregate { item_index, name });
             }
@@ -6040,6 +6155,7 @@ mod tests {
                     rhs: Box::new(Expr::Number("1".to_string())),
                 }),
                 alias: None,
+                distinct: false,
             })],
             where_predicates: Vec::new(),
             group_by: None,
