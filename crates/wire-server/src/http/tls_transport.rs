@@ -208,13 +208,24 @@ pub(crate) fn reject_or_close_over_limit(stream: TcpStream, config: Arc<TlsServe
 /// （[`conn::reject_too_many_connections_on`]）を書く。ハンドシェイク失敗時は
 /// 応答を書かない（alert の送出・切断は driver 側が既に行っている契約。
 /// `serve_tls_connection` と同じ）。
+///
+/// `serve_tls_connection` と同じく `DeadlineStream` で包んでから
+/// `TlsStream` へ渡す（H8）。`TlsStream::fill_from_inner` は 1 レコード分
+/// 揃うまで下位ソケットの `read` を複数回呼び直すため、`DeadlineStream` を
+/// 挟まないと `drain_and_close`（[`conn::reject_too_many_connections_on`]
+/// が内部で呼ぶ）が `set_read_timeout` を都度呼び直しても各 `read` 呼び出し
+/// 単位のタイムアウトにしかならず、1 バイトずつ間隔を空けて送り続ける
+/// クライアントに対して `RejectWorkerLimiter` の 1 枠が
+/// `LINGER_DRAIN_TIMEOUT` を大幅に超えて専有され続けうる（トリクル攻撃で
+/// 拒否ワーカーの有界性が崩れる。TLS-7 が検証する `DeadlineStream` の
+/// 契約と同じ理由）。
 fn reject_over_limit_after_tls_handshake(mut stream: TcpStream, config: Arc<TlsServerConfig>) {
     let session = match crate::tls::server_handshake::perform_server_handshake(&mut stream, config)
     {
         Ok(session) => session,
         Err(_e) => return,
     };
-    let mut tls_stream = TlsStream::new(stream, session);
+    let mut tls_stream = TlsStream::new(DeadlineStream::new(stream), session);
     conn::reject_too_many_connections_on(&mut tls_stream);
 }
 

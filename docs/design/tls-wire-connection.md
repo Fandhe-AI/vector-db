@@ -245,10 +245,17 @@ TLS opt-in（`--tls-cert`／`--tls-key`／`--tls-mode`）を接続した
   閉じる（`require` 下で平文バイト列を送出しないため、かつ TLS
   ハンドシェイクをしていない相手には意味のない応答になるため）。`allow`
   は平文接続を受理するモードのため、拒否ワーカー（`RejectWorkerLimiter`
-  で有界化済み）の中で先頭バイトを期限付きで `peek` し、平文と判定した
-  場合のみ既存の 503／`53300` 応答を維持する（TLS レコードと判定した
-  場合はハンドシェイクをせず無応答クローズする。有界性を維持するため）。
-  TLS 未構成時は既存の 503／`53300` 経路とバイト単位で同一のまま。
+  で有界化済み）の中で先頭バイトを期限付きで `peek` し、平文なら既存の
+  503／`53300` 応答を維持する。TLS レコードと判定した場合も
+  （codex-review 再指摘・是正。旧実装はハンドシェイクをせず無応答
+  クローズしており、`allow` の下でも HTTPS クライアントだけがこの
+  エラー契約から取り残されていた）ハンドシェイクを完了したうえで同じ
+  503 応答を TLS 上で返す。`RejectWorkerLimiter` の 1 枠＝1 スレッドで
+  既に有界化済みのため、ハンドシェイク自体の絶対期限
+  （`HANDSHAKE_READ_TIMEOUT`）がそのままこの拒否ワーカーの専有時間の
+  上限になる。拒否応答の書き込み後も H8 と同じ `DeadlineStream` を経由
+  させ、トリクル送信によるワーカー専有の無期限化を防ぐ。TLS 未構成時は
+  既存の 503／`53300` 経路とバイト単位で同一のまま。
 - **H5（`--tls-scram-channel-binding enable` × nosql）**: 起動を拒否せず
   no-op として受理する（`--auth-method cleartext` と組み合わせたときと
   同じ扱い。NoSQL 表層は SASL 往復を持たないため実際には提示されない）。
@@ -276,13 +283,18 @@ TLS opt-in（`--tls-cert`／`--tls-key`／`--tls-mode`）を接続した
 
 既知の制約（対象外として持ち越し）:
 
-- TLS ハンドシェイク済み接続に対する同時接続超過を、TLS 上の 503／
-  `53300` として返すこと（H4。`allow` 下の平文接続は是正済みだが、TLS
-  レコードと判定した接続へはハンドシェイクをしないため引き続き無応答
-  クローズのまま）
 - curl 実クライアントとの接続試験（`tests/http10_curl_interop.rs`。
   `#[ignore]` の手動 gate。CI 常時実行化は対象外）
 - TLS 接続での緊急応答（RECOVER-6）対応（engine 側 API の変更が必要）
+
+追記（codex-review・Cursor Bugbot 指摘の是正。H4 更新）: `conn::
+reject_too_many_connections` は `write_all` 直後の `shutdown(Both)` から、
+`respond_and_close` と同じ「書き込み → 有界 lingering close
+（`drain_and_close`） → drop」の形へ変更した。呼び出し元（`tls_transport::
+serve_connection`／`reject_or_close_over_limit`）は判定のため先頭 1 バイトを
+`peek` 済みで要求本体が未読のまま残るため、旧実装では未読データありの
+クローズにより TCP RST が発生し、送出済みの 503 応答をクライアントが
+読めなくなりうる回帰があった。
 
 `crates/wire-server/tests/http10_tls_surface.rs`（新設・層 A・CI 常時実行）:
 TLS 完走（`/v1/session` → `/v1/query` → `/v1/session/close`）・`require` 下
