@@ -397,6 +397,112 @@ pub(crate) fn select_decode_tier(
     }
 }
 
+/// `EXPLAIN`（Issue #922・SQL-27）の集計文向け `scalar_plan`／`access_path` を
+/// 決定する。executor（本ファイルの [`execute_aggregate_with_cache`]・
+/// [`crate::sql::group_by::execute_grouped_aggregate`]）の実行時ゲートと
+/// **同じ判定式**（[`select_decode_tier`]・
+/// [`crate::sql::scalar_plan::classify_scalar_plan`]・[`crate::sql::
+/// group_by::has_text_min_max_aggregate`]）から静的に導出する単一情報源
+/// （D5「矛盾出力の防止」。呼び出し元 `core.rs::EngineCore::
+/// run_relational_explain_aggregate` がこの分類だけを使い、行走査・キャッシュ
+/// 消費は一切行わない）。`arena_cache`／`scalar_cache`（キャッシュの構築可否・
+/// ヒット/ミスという実行時の縮退結果）はテナント存在情報に繋がるため入力に
+/// 含めない（`schema`・`bound` の構文的形状のみで決まる）。
+pub(crate) fn classify_aggregate_access(
+    schema: &TableSchema,
+    bound: &BoundAggregate,
+) -> (
+    crate::sql::scalar_plan::ScalarPlan,
+    crate::sql::explain::AccessPath,
+) {
+    use crate::sql::explain::AccessPath;
+    use crate::sql::scalar_plan::{classify_scalar_plan, ScalarPlan, ScalarShapeInput};
+
+    let has_vector = schema.vector_dim().is_some();
+    let where_less = !bound.has_where_filters();
+    let scalar_shape = ScalarShapeInput {
+        scalar_prefilter: true,
+        metadata_filters: bound.metadata_filters(),
+        expr_filters: bound.expr_filters(),
+        or_filters: bound.or_filters(),
+    };
+    // Issue #475 の「索引対応述語のみで構成される」判定と同一
+    // （`execute_aggregate_with_cache`・`execute_grouped_aggregate` の
+    // `candidate_walk`／索引経路ゲートと同じ呼び出し）。`VECTOR` 列を持たない
+    // テーブルはこの索引の構築材料を持てないため `has_vector` で先にゲートする
+    // （D5: 矛盾出力〔`scalar_plan: index_equality` と `access_path: full_scan`
+    // の同時出力〕を防ぐ）。
+    let index_candidate_eligible =
+        has_vector && classify_scalar_plan(&scalar_shape) != ScalarPlan::PlainScan;
+    let scalar_plan = if has_vector {
+        classify_scalar_plan(&scalar_shape)
+    } else {
+        ScalarPlan::PlainScan
+    };
+
+    if bound.has_group_by() {
+        // SQL-25 (d)・Issue #1099: `execute_grouped_aggregate` は複数列
+        // `GROUP BY`（`key_count != 1`）を索引経路（列挙形・候補走査形）の
+        // 対象外とし常に全走査へ一本化する（`ScalarIndex::column_groups` が
+        // 単一キー専用のため）。ここも同じ `key_count == 1` ゲートを掛けないと
+        // 複数列 `GROUP BY` で `access_path: full_scan`（実行時の実態）と
+        // 異なる索引経路を EXPLAIN が返す D5 矛盾出力になる。
+        let single_key_group_by = bound
+            .group_by
+            .as_ref()
+            .is_some_and(|g| g.column_indices.len() == 1);
+        let text_min_max_blocks = crate::sql::group_by::has_text_min_max_aggregate(bound.items());
+        let access_path = if !single_key_group_by {
+            AccessPath::FullScan
+        } else if has_vector && where_less && !text_min_max_blocks {
+            AccessPath::ScalarIndexGroupEnumeration
+        } else if has_vector && !where_less && index_candidate_eligible {
+            AccessPath::ScalarIndexCandidates
+        } else {
+            AccessPath::FullScan
+        };
+        // codex-review P1（PR #1102）: `execute_grouped_aggregate` は複数列
+        // `GROUP BY` を常に全走査へ倒す（`ScalarIndex::column_groups` が単一
+        // キー専用のため、上の `single_key_group_by` ゲートで `access_path` は
+        // 既に `FullScan` に一本化されている）。`scalar_plan` はこのゲートより
+        // 前に `has_vector` のみで計算されるため、複数列 `GROUP BY` かつ
+        // 索引対応述語（`WHERE`）を伴う場合に `scalar_plan: index_equality`
+        // 等と `access_path: full_scan` が同時に出て D5「矛盾出力の防止」に
+        // 反していた。実行経路（全走査で述語索引を一切使わない）に合わせ、
+        // 複数列 `GROUP BY` では `scalar_plan` も `PlainScan` へ揃える。
+        let scalar_plan = if single_key_group_by {
+            scalar_plan
+        } else {
+            ScalarPlan::PlainScan
+        };
+        (scalar_plan, access_path)
+    } else {
+        // `GROUP BY` なし単一行集計の `DecodeTier::Fast` 判定
+        // （[`select_decode_tier`]）は `VECTOR` 列の有無を問わない
+        // （`COUNT(*)`・`id` 系のみなら可視ビットマップキャッシュを使える）。
+        let referenced = ReferencedColumns::derive(
+            schema,
+            bound.items(),
+            bound.metadata_filters(),
+            bound.expr_filters(),
+            bound.or_filters(),
+            &[],
+        );
+        let fast_tier = select_decode_tier(
+            &referenced,
+            !bound.expr_filters().is_empty() || !bound.or_filters().is_empty(),
+        ) == DecodeTier::Fast;
+        let access_path = if fast_tier {
+            AccessPath::VisibleBitmapCache
+        } else if index_candidate_eligible {
+            AccessPath::ScalarIndexCandidates
+        } else {
+            AccessPath::FullScan
+        };
+        (scalar_plan, access_path)
+    }
+}
+
 /// 集計項目 1 つの実行時アキュムレータ（TASK-166・SQL-13）。すべて O(1) 状態
 /// （`TextMin`/`TextMax` のみ、新しい極値を更新するたびに高々 1 本の `String` を
 /// 保持し直す。`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
