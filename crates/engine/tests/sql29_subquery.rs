@@ -212,6 +212,11 @@ fn in_subquery_bigint_column_in_target_is_rejected() {
     // ため、実装を追加するのではなく `IN` 対象値の対応型を `TEXT`/`BOOLEAN`
     // のみへ縮小し、`INTEGER`/`BIGINT` は明示的に `22000` へ倒したことを
     // 検証する（`docs/design/sql-subquery.md`「`IN` 対象値の型」節参照）。
+    // `detail` の内容まで検査するのは、修正前も `Equality` 束縛の「TEXT 列
+    // でない」という別経路の偶発的な `InvalidInput` で同じテストが素通り
+    // してしまい、レビュー指摘（テストカバレッジなし）への回帰テストとして
+    // 機能しなくなるのを防ぐため（`cell_to_equality_predicate` の明示的な
+    // 拒否理由であることをこのアサーションで固定する）。
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let ctx = ctx_for("tenant-a");
@@ -226,8 +231,9 @@ fn in_subquery_bigint_column_in_target_is_rejected() {
         ),
     );
     assert!(matches!(
-        err,
-        engine::sql::allowlist::SqlSurfaceError::InvalidInput { .. }
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("subquery IN target")
     ));
 }
 
