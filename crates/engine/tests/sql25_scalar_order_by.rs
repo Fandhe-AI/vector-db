@@ -214,6 +214,80 @@ fn limit_smaller_than_total_returns_prefix_of_oracle() {
     assert_eq!(result_ids(&result), vec![20, 19, 18]);
 }
 
+// ---------- `OFFSET` との統合（Issue #916・SQL-25 (b)・TASK-209） ----------
+
+/// 経路 (B)（先頭キーが非 `id` の 2 パス）で `OFFSET` は「ソート確定後にスキップ
+/// する」契約（`docs/design/sql-offset-paging.md`「ORDER BY なし OFFSET の意味論」
+/// 節）を満たす: `LIMIT` だけを変えた場合の先頭 `offset` 件を除いた続きと一致する。
+#[test]
+fn offset_skips_leading_sorted_rows_on_path_b_two_pass_heap() {
+    let path = unique_db_path("order-offset-path-b");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let ctx = ctx_for("tenant-a");
+    for id in 1..=20u64 {
+        insert_row(
+            &storage,
+            &ctx,
+            id,
+            Visibility::Public,
+            Some("ja"),
+            Some(id as i32),
+        );
+    }
+    let core = new_core(storage);
+
+    // オラクル: `OFFSET` なしで全件確定させた並び順の先頭 3 件を除いた続き。
+    let oracle = result_ids(
+        &core
+            .execute_sql(&ctx, "SELECT id FROM docs ORDER BY score DESC LIMIT 20")
+            .expect("oracle scan"),
+    );
+    let expected: Vec<u64> = oracle.into_iter().skip(3).take(4).collect();
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id FROM docs ORDER BY score DESC LIMIT 4 OFFSET 3",
+        )
+        .expect("ordered scan with offset should succeed");
+    assert_eq!(result_ids(&result), expected);
+    assert_eq!(expected, vec![17, 16, 15, 14]);
+}
+
+/// 経路 (A)（先頭キーが `id`）で `OFFSET` は物理走査順（＝ソート確定順）の先頭から
+/// 読み飛ばす。`private_only_ctx` で経路 (A) を強制する。
+#[test]
+fn offset_skips_leading_sorted_rows_on_path_a_id_range_scan() {
+    let path = unique_db_path("order-offset-path-a");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let write_ctx = ctx_for("tenant-a");
+    for id in 1..=10u64 {
+        insert_row(
+            &storage,
+            &write_ctx,
+            id,
+            Visibility::Private,
+            Some("ja"),
+            None,
+        );
+    }
+    let core = new_core(storage);
+    let ctx = private_only_ctx("tenant-a");
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id FROM docs ORDER BY id DESC LIMIT 3 OFFSET 4",
+        )
+        .expect("path (A) scan with offset should succeed");
+    // id DESC の全体順は 10..=1。先頭 4 件（10,9,8,7）を読み飛ばした続き 3 件。
+    assert_eq!(result_ids(&result), vec![6, 5, 4]);
+}
+
 /// 同一クエリを複数回実行しても同じ順序になる（決定性）。
 #[test]
 fn ordered_scan_result_is_deterministic_across_repeated_calls() {

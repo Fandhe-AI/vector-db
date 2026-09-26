@@ -1401,6 +1401,27 @@ pub fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
     Ok(limit)
 }
 
+/// 広域取得・`GROUP BY` 集計の `OFFSET` 生値 `raw` を検証し、`0..=`
+/// [`crate::core::MAX_SEARCH_K`] の範囲内であることを確認した `usize` を返す
+/// （Issue #916・SQL-25 (b)・TASK-209）。`validate_search_limit` と異なり `0`
+/// （no-op）を受理する。上限は LIMIT と同じ `MAX_SEARCH_K` を流用する
+/// （GROUP BY 側の `MAX_GROUPS` とは独立。現行値はどちらも 10,000 だが、意味論的には
+/// 「可視かつ WHERE 一致の行数」に対する上限であり `MAX_GROUPS`〔グループ数上限〕とは
+/// 別軸のため）。`pub` にして NoSQL 表層の `offset` 写像（TASK-224・NOSQL-15）からも
+/// 再利用できるようにする（第 2 の実装を作らない方針、`validate_search_limit` と
+/// 同じ理由）。
+pub fn validate_search_offset(raw: u32) -> Result<usize, SqlSurfaceError> {
+    let offset = usize::try_from(raw)
+        .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed OFFSET value: {raw}")))?;
+    if offset > crate::core::MAX_SEARCH_K {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "OFFSET {offset} out of range (must be 0..={})",
+            crate::core::MAX_SEARCH_K
+        )));
+    }
+    Ok(offset)
+}
+
 /// [`ValidatedStatement`] を `schema` と `session_mode`（呼び出し元の
 /// [`crate::sql::mode::SessionState::search_mode`]）と照合して [`BoundStatement`] へ
 /// 束縛する（TASK-161 の公開 API）。UDF レジストリを持たないエントリポイント向けの
@@ -3593,6 +3614,13 @@ pub(crate) struct BoundGroupBy {
     pub(crate) having: Vec<BoundHaving>,
     pub(crate) order_by: Option<BoundOrderBy>,
     pub(crate) limit: Option<usize>,
+    /// `OFFSET` の検証済み値（`0..=core::MAX_SEARCH_K`。Issue #916・SQL-25 (b)・
+    /// TASK-209）。ソート済みグループ列に対し `truncate(limit)` の前に適用する
+    /// （`sql::group_by`）。`limit` が `None`（`LIMIT` 句なし）のときは構文段
+    /// （`allowlist::parse_aggregate_shape`）が `OFFSET` 単独を `42601` へ落とすため
+    /// 常に `0`。[`BoundAggregate::new_grouped`]（TASK-186・NOSQL-5）は本 Issue の
+    /// 対象外のため `0` 固定（NoSQL 表層の offset 写像は #947・NOSQL-15 の管轄）。
+    pub(crate) offset: usize,
 }
 
 /// 束縛済みの集計 SELECT 文（TASK-166・SQL-13。TASK-167・SQL-14 で `group_by`・
@@ -3776,6 +3804,7 @@ impl BoundAggregate {
                 having: bound_having,
                 order_by: None,
                 limit: None,
+                offset: 0,
             }),
         })
     }
@@ -4147,6 +4176,10 @@ pub struct BoundScan {
     /// スコープで、既存の公開 API 契約を変えない）。クレート外へは公開しない
     /// （型 [`crate::sql::parser::BoundOrderKey`] 自体が `pub(crate)`）。
     pub(crate) order_by: Vec<BoundOrderKey>,
+    /// `OFFSET` の検証済み値（`0..=core::MAX_SEARCH_K`。[`validate_search_offset`]。
+    /// Issue #916・SQL-25 (b)・TASK-209）。既定は 0（no-op）で、[`Self::new`] 経由の
+    /// 直接構築（TASK-186・NOSQL-3）や既存呼び出し元との後方互換を保つ。
+    pub(crate) offset: usize,
 }
 
 /// スカラー `ORDER BY` の対象（Issue #915・SQL-25）。`Id` は疑似列
@@ -4294,7 +4327,25 @@ impl BoundScan {
             // Issue #915・SQL-25: NoSQL 表層からの直接構築（NOSQL-3）は
             // 対象外スコープ（NOSQL-15・別 Issue #946・#947）のため常に空。
             order_by: Vec::new(),
+            offset: 0,
         }
+    }
+
+    /// `offset` を設定した [`Self`] を返す（Issue #916・SQL-25 (b)・TASK-209。
+    /// TASK-186・NOSQL-3 の直接構築経路〔`Self::new`〕から `OFFSET` 付き広域取得を
+    /// 組み立てるための builder）。**ここでは検証しない**契約は [`Self::new`] の
+    /// `limit` と同じ（[`validate_search_offset`] の呼び出しは呼び出し元の任意
+    /// 判断に委ねる）。ただし [`crate::sql::scan::execute_scan`] はスキップ済み行を
+    /// 投影・確保しないため（結果セットの累計バイト予算・早期終了で有界）、未検証の
+    /// 巨大な `offset` を渡しても無制限なメモリ確保には至らない。
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// `OFFSET` 句の値（既定 0）。
+    pub fn offset(&self) -> usize {
+        self.offset
     }
 
     /// 束縛対象のテーブル名。
@@ -4387,6 +4438,9 @@ pub(crate) fn bind_scan_with_dummy_flags(
         )?;
 
     let limit = validate_search_limit(stmt.limit())?;
+    // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` と同じ束縛段で検証する
+    // （構文段の許可リストは値の上限を持たない生値のまま通すため）。
+    let offset = validate_search_offset(stmt.offset())?;
 
     // Issue #915・SQL-25: スカラー ORDER BY の列名解決・比較規約の割り当て。
     let order_by = bind_scalar_order_by(stmt.order_by(), schema)?;
@@ -4404,6 +4458,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         or_filters,
         limit,
         order_by,
+        offset,
     })
 }
 
@@ -4568,11 +4623,19 @@ fn bind_group_by_clause(
         }
     };
 
+    // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` を伴う場合のみ構文段が
+    // 受理する（`allowlist::parse_aggregate_shape`）ため、`clause.offset` は
+    // `limit.is_none()` のとき常に `0`。`MAX_SEARCH_K` を上限に用いる理由は
+    // `validate_search_offset` のドキュメント参照（`MAX_GROUPS`〔グループ数上限〕
+    // とは別軸の「可視かつ WHERE 一致の行数」に対する上限）。
+    let offset = validate_search_offset(clause.offset)?;
+
     Ok(BoundGroupBy {
         column_index,
         having,
         order_by,
         limit,
+        offset,
     })
 }
 
@@ -4945,6 +5008,23 @@ mod tests {
             crate::core::MAX_SEARCH_K + 1
         ))
         .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn validate_search_offset_accepts_zero_and_max() {
+        // Issue #916・SQL-25 (b)・TASK-209: `validate_search_limit` と異なり `0`
+        // （no-op）を受理する。
+        assert_eq!(validate_search_offset(0).unwrap(), 0);
+        assert_eq!(
+            validate_search_offset(crate::core::MAX_SEARCH_K as u32).unwrap(),
+            crate::core::MAX_SEARCH_K
+        );
+    }
+
+    #[test]
+    fn validate_search_offset_rejects_over_max() {
+        let err = validate_search_offset(crate::core::MAX_SEARCH_K as u32 + 1).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
 

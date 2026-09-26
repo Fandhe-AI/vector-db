@@ -1300,6 +1300,10 @@ pub struct GroupByClause {
     pub(crate) having: Vec<HavingPredicate>,
     pub(crate) order_by: Option<AggregateOrderBy>,
     pub(crate) limit: Option<u32>,
+    /// `OFFSET` の生値（Issue #916・SQL-25 (b)・TASK-209）。`limit` が `None` のとき
+    /// `OFFSET` 単独は構文段（[`parse_aggregate_shape`]）で `42601` に落ちるため常に
+    /// `0`。範囲検証は `sql::parser::bind_group_by_clause` が束縛時に行う。
+    pub(crate) offset: u32,
 }
 
 /// 許可形状の構造判定を通過した集計 `SELECT` 文（TASK-166・SQL-13。TASK-167・
@@ -1369,6 +1373,11 @@ pub struct ValidatedScan {
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25・TASK-209）。空ならソート
     /// なし（従来どおりの物理走査順。§1「広域取得」ドキュメント参照）。
     pub(crate) order_by: Vec<ScalarOrderKey>,
+    /// `OFFSET` 句の生値（既定 0。Issue #916・SQL-25 (b)・TASK-209）。可視かつ
+    /// WHERE を満たす行のうち先頭からこの件数だけ読み飛ばしてから `limit` を
+    /// 適用する（`sql::scan::execute_scan_with_budget`）。範囲検証は
+    /// `sql::parser::bind_scan_with_dummy_flags` が束縛時に行う。
+    pub(crate) offset: u32,
 }
 
 impl ValidatedScan {
@@ -1396,6 +1405,12 @@ impl ValidatedScan {
     /// スカラー列 `ORDER BY` のキー列（Issue #915・SQL-25）。空ならソートなし。
     pub fn order_by(&self) -> &[ScalarOrderKey] {
         &self.order_by
+    }
+
+    /// `OFFSET` 句の値（構造検証済みの生値。既定 0。範囲検証は
+    /// `sql::parser::validate_search_offset` が束縛時に行う）。
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
 }
 
@@ -2044,6 +2059,24 @@ impl<'a> Parser<'a> {
                 "expected number, got {other:?}"
             ))),
         }
+    }
+
+    /// `LIMIT n` の直後に現れうる任意の `OFFSET m` を判定・消費する（Issue #916・
+    /// SQL-25 (b)・TASK-209）。`USING`・`SET` と同じ理由（[`Self::peek_ident_matches`]
+    /// 参照）で `OFFSET` は [`crate::sql::lexer::Keyword`] に追加せず、この位置限定の
+    /// 文脈識別子として扱う（既存の列名・テーブル名 `offset` を壊さない）。値の構文
+    /// エラー（小数・`u32` 超過）は呼び出し元と同じ `42601` に分類する。範囲上限の
+    /// 検証はここでは行わない（束縛段の `sql::parser::validate_search_offset`）。
+    fn parse_optional_offset(&mut self) -> Result<Option<u32>, SqlSurfaceError> {
+        if !self.peek_ident_matches("OFFSET") {
+            return Ok(None);
+        }
+        self.advance();
+        let offset_str = self.expect_number()?;
+        let offset: u32 = offset_str.parse().map_err(|_| {
+            SqlSurfaceError::unsupported(format!("malformed OFFSET value: {offset_str}"))
+        })?;
+        Ok(Some(offset))
     }
 
     /// SELECT リストの許可形状（`*`・単純な列名リスト・TASK-79（SQL-9）で追加した
@@ -4509,6 +4542,7 @@ struct ParsedScanShape {
     limit: u32,
     /// スカラー列 `ORDER BY`（Issue #915・SQL-25）。空ならソートなし。
     order_by: Vec<ScalarOrderKey>,
+    offset: u32,
 }
 
 /// [`parse_select_shape`] の戻り値。`WHERE`（省略可）の直後に現れる分岐トークン
@@ -4585,6 +4619,11 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
             SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
         })?;
 
+        // Issue #916・SQL-25 (b)・TASK-209: `LIMIT n` の直後に任意で `OFFSET m` を
+        // 受理する（広域取得のみ。検索 SELECT の `ORDER BY`／`USING PLAN` 経路は
+        // 対象外のまま `expect_end_of_statement` が `42601` に落とす）。
+        let offset = p.parse_optional_offset()?.unwrap_or(0);
+
         p.expect_end_of_statement()?;
 
         return Ok(ParsedSelect::Scan(ParsedScanShape {
@@ -4593,6 +4632,7 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
             where_predicates,
             limit,
             order_by: Vec::new(),
+            offset,
         }));
     }
 
@@ -4619,10 +4659,18 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
             SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
         })?;
 
-        // スカラー ORDER BY 付き広域取得は `LIMIT` 直後も文末専用（ベクトル
-        // 順位付け専用の `USING MODE`・`HINT ORDER` はいずれも受理しない。
-        // 上のベクトル順位付け経路と同じ「取得モード・評価順の余地を持たない」
-        // 契約——§受入基準 3）。
+        // Issue #916・SQL-25 (b)・TASK-209: スカラー `ORDER BY` 付き広域取得も
+        // `LIMIT n` 直後の任意 `OFFSET m` を受理する（`ORDER BY` なし広域取得と
+        // 同じ許可リスト。docs/design/sql-offset-paging.md「ORDER BY なし
+        // OFFSET の意味論」節が申し送る #915 統合事項——ソート確定後に
+        // OFFSET を適用する契約は `sql::scan::execute_scan_with_budget` 側で
+        // 満たす）。
+        let offset = p.parse_optional_offset()?.unwrap_or(0);
+
+        // スカラー ORDER BY 付き広域取得は `LIMIT`／`OFFSET` 直後も文末専用
+        // （ベクトル順位付け専用の `USING MODE`・`HINT ORDER` はいずれも受理
+        // しない。上のベクトル順位付け経路と同じ「取得モード・評価順の余地を
+        // 持たない」契約——§受入基準 3）。
         p.expect_end_of_statement()?;
 
         return Ok(ParsedSelect::Scan(ParsedScanShape {
@@ -4631,6 +4679,7 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
             where_predicates,
             limit,
             order_by,
+            offset,
         }));
     }
 
@@ -4736,16 +4785,22 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
         } else {
             None
         };
-        let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
-            Some(p.parse_aggregate_limit()?)
+        let (limit, offset) = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+            let limit = p.parse_aggregate_limit()?;
+            // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `LIMIT` を伴う場合のみ
+            // 受理する（`LIMIT` なしの `OFFSET` 単独は後続の `expect_end_of_statement`
+            // が `42601` へ落とす。§計画 3.1）。
+            let offset = p.parse_optional_offset()?.unwrap_or(0);
+            (Some(limit), offset)
         } else {
-            None
+            (None, 0)
         };
         Some(GroupByClause {
             column,
             having,
             order_by,
             limit,
+            offset,
         })
     } else {
         // `GROUP BY` 句が無いのに SELECT リストへ裸の識別子（`GroupKey` 候補）が
@@ -4932,6 +4987,7 @@ pub(crate) fn validate_sql_tokens(
                         where_predicates: shape.where_predicates,
                         limit: shape.limit,
                         order_by: shape.order_by,
+                        offset: shape.offset,
                     })),
                     super::view::Resolved::View {
                         base_table,
@@ -4959,6 +5015,7 @@ pub(crate) fn validate_sql_tokens(
                             where_predicates,
                             limit: shape.limit,
                             order_by: shape.order_by,
+                            offset: shape.offset,
                         }))
                     }
                 }
@@ -8914,6 +8971,32 @@ mod tests {
     }
 
     #[test]
+    fn accepts_group_by_limit_with_offset() {
+        // Issue #916・SQL-25 (b)・TASK-209: GROUP BY 集計の `LIMIT n OFFSET m`。
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT lang, COUNT(*) AS n FROM documents GROUP BY lang LIMIT 3 OFFSET 2",
+            &lookup,
+        );
+        let group_by = agg.group_by().expect("GROUP BY clause must be accepted");
+        assert_eq!(group_by.limit, Some(3));
+        assert_eq!(group_by.offset, 2);
+    }
+
+    #[test]
+    fn rejects_group_by_offset_without_limit() {
+        // Issue #916・SQL-25 (b)・TASK-209: `LIMIT` を伴わない `OFFSET` 単独は
+        // `GROUP BY` 集計でも受理しない（後続の `expect_end_of_statement` が拒否）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang OFFSET 2",
+            &lookup,
+        )
+        .expect_err("OFFSET without LIMIT must be rejected for GROUP BY aggregates");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
     fn rejects_group_key_not_in_select_list_alone() {
         // 集計項目を 1 つも持たない SELECT リスト（`DISTINCT` 相当）は許可しない。
         let lookup = catalog_with(&["documents"]);
@@ -9179,6 +9262,85 @@ mod tests {
         );
         assert_eq!(scan.where_predicates().len(), 1);
         assert!(matches!(scan.projection(), Projection::Columns(cols) if cols == &["id", "body"]));
+    }
+
+    // --- OFFSET（Issue #916・SQL-25 (b)・TASK-209） ----------------------------
+
+    #[test]
+    fn accepts_scan_with_limit_and_offset() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan("SELECT * FROM documents LIMIT 5 OFFSET 10", &lookup);
+        assert_eq!(scan.limit(), 5);
+        assert_eq!(scan.offset(), 10);
+    }
+
+    #[test]
+    fn accepts_scan_with_offset_zero() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan("SELECT * FROM documents LIMIT 5 OFFSET 0", &lookup);
+        assert_eq!(scan.offset(), 0);
+    }
+
+    #[test]
+    fn accepts_scan_without_offset_defaults_to_zero() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan("SELECT * FROM documents LIMIT 5", &lookup);
+        assert_eq!(scan.offset(), 0);
+    }
+
+    #[test]
+    fn offset_does_not_shadow_offset_as_column_or_table_name() {
+        // `OFFSET` は `lexer::Keyword` に追加していない（`peek_ident_matches` による
+        // この位置限定の文脈識別子）ため、列名・テーブル名としての `offset` は
+        // 従来どおり使える。
+        let lookup = catalog_with(&["offset"]);
+        let scan = expect_scan("SELECT offset FROM offset LIMIT 5", &lookup);
+        assert_eq!(scan.table_name(), "offset");
+        assert!(matches!(scan.projection(), Projection::Columns(cols) if cols == &["offset"]));
+    }
+
+    #[test]
+    fn rejects_offset_before_limit() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents OFFSET 10 LIMIT 5");
+    }
+
+    #[test]
+    fn rejects_offset_without_limit() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents OFFSET 10");
+    }
+
+    #[test]
+    fn rejects_offset_rows_suffix() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents LIMIT 5 OFFSET 10 ROWS");
+    }
+
+    #[test]
+    fn rejects_negative_offset() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents LIMIT 5 OFFSET -1");
+    }
+
+    #[test]
+    fn rejects_fractional_offset() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents LIMIT 5 OFFSET 1.5");
+    }
+
+    #[test]
+    fn rejects_offset_exceeding_u32() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents LIMIT 5 OFFSET 4294967296");
+    }
+
+    #[test]
+    fn rejects_offset_with_trailing_using_mode() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents LIMIT 5 OFFSET 10 USING MODE 'precision'",
+        );
+    }
+
+    #[test]
+    fn rejects_search_select_with_using_plan_and_offset() {
+        // `USING PLAN(...)` 経路（ランキング段を `USING PLAN` の展開結果が決める）も
+        // 検索 SELECT の一種であり、`OFFSET` は構造上受理しない（§計画 3.1）。
+        assert_rejected_as_syntax_error("SELECT * FROM documents USING PLAN('q') LIMIT 5 OFFSET 1");
     }
 
     #[test]

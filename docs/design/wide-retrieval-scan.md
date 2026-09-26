@@ -50,7 +50,8 @@ SELECT <投影（既存許可形: *, 列名列, 式項目〔UDF 含む〕）> FR
 | --- | --- |
 | 受理条件 | `WHERE`（省略可）の直後に `LIMIT` が現れる形のみ。`ORDER BY`・`USING PLAN` は従来どおり検索 SELECT として別経路 |
 | `LIMIT` | 必須。`sql::parser::validate_search_limit` を再利用し `1..=core::MAX_SEARCH_K`（10,000）。範囲外は `22000`（既存契約と同一） |
-| `USING MODE`／`HINT ORDER`／`OFFSET` | 構造上受理しない（`LIMIT n` の後は文末のみ）。集計文が `USING MODE` を受理しない既存判断（「取得モードの余地を持たない」）と同じ理由 |
+| `USING MODE`／`HINT ORDER` | 構造上受理しない（`LIMIT n [OFFSET m]` の後は文末のみ）。集計文が `USING MODE` を受理しない既存判断（「取得モードの余地を持たない」）と同じ理由 |
+| `OFFSET`（Issue #916・SQL-25 (b)・TASK-209） | `LIMIT n` の直後に任意で受理する。詳細（受理範囲・順序保証との関係・カーソル方式との選択・深いページングのコスト特性）は [sql-offset-paging.md](sql-offset-paging.md) 参照。本節「順序」の性質（順序保証なし・同一スナップショット内で決定的）はそのまま `OFFSET` の前提になる |
 | セッション変数 `SET search_mode` | 広域取得は参照しない（ランキング段・確信度ゲートが存在しないため） |
 | `EXPLAIN` 前置 | 従来どおり `42601`（`USING PLAN` を伴わないため） |
 | 順序 | **順序保証なし**。実装は同一スナップショット内で決定的（redb 行テーブルのキー順＝`(tenant_id, id)` 昇順。他テナントの `Public` 行が可視な場合はテナント文字列順で交錯し、`id` 昇順が成り立つのは同一テナント内のみ）。グローバル `id` 順へ「修正」しない・決定性テストの前提として明記する |
