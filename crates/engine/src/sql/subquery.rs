@@ -243,14 +243,25 @@ fn resolve_exists_subquery(
 
 /// 内側の投影セル 1 件を `<column> = <値>` 相当の `WherePredicate` 葉へ変換する。
 /// `NULL` は `Ok(None)`（呼び出し元が集合から除外する）。対応するのは `TEXT`
-/// （`Cell::Text`）・`INTEGER`/`BIGINT`（`Cell::SignedInteger`）・`BOOLEAN`
-/// （`Cell::Bool`）のみ。`Cell::Integer`（疑似列 `id`／`COUNT` 相当）は本関数の
-/// 到達範囲としては残すが、外側の対象列に疑似列 `id` を指定する形
-/// （`id IN (SELECT ...)`）は本 Issue の実測範囲外（このリポの既存
-/// `WherePredicate::Equality` 束縛自体が疑似列 `id` を対象にしていないため。
-/// `tests/sql29_subquery.rs` 参照）。それ以外（`VECTOR`・`DATE`・`TIMESTAMP`・
-/// `NUMERIC`・`UUID`・`BYTEA`・配列・JSON・式評価の `Float`）は `22000`
-/// （実装既定値のスコープ外。`docs/design/sql-subquery.md` 参照）。
+/// （`Cell::Text`）・`BOOLEAN`（`Cell::Bool`）のみ。
+///
+/// `INTEGER`/`BIGINT` 列（`Cell::SignedInteger`）は対象外とする（レビュー
+/// 指摘対応。Issue #927 push 前 Review）。`WherePredicate::Equality` は
+/// `TEXT`／`ENUM` 列専用で `INTEGER`/`BIGINT` 列を「TEXT 列でない」として
+/// 拒否する契約であり（`sql::parser::bind_where_predicates_recursive`）、
+/// `INTEGER`/`BIGINT` 列の等価比較自体がこのリポでは未実装（`レーン A`。
+/// `sql::udf_call::bind_expr_in` が `INTEGER`/`BIGINT` 列参照を式評価から
+/// 一律拒否する契約。`sql::check_constraint` モジュールコメント参照）。
+/// 通常の `<col> = <整数リテラル>` も同じ理由で現状は受理されないため、
+/// 本関数だけが先取りして対応する処置は取らず、既存の実装既定値の範囲外
+/// （`22000`）として明示的に拒否する（`docs/design/sql-subquery.md` 参照）。
+///
+/// `Cell::Integer`（疑似列 `id`／`COUNT` 相当）も同じ理由で本関数の到達範囲
+/// としては残すが対象外（このリポの既存 `WherePredicate::Equality` 束縛
+/// 自体が疑似列 `id` を対象にしていないため。`tests/sql29_subquery.rs`
+/// 参照）。それ以外（`VECTOR`・`DATE`・`TIMESTAMP`・`NUMERIC`・`UUID`・
+/// `BYTEA`・配列・JSON・式評価の `Float`）も同様に `22000`（実装既定値の
+/// スコープ外。`docs/design/sql-subquery.md` 参照）。
 fn cell_to_equality_predicate(
     column: &str,
     cell: &Cell,
@@ -267,15 +278,12 @@ fn cell_to_equality_predicate(
             column: column.to_string(),
             value: n.to_string(),
         })),
-        Cell::SignedInteger(n) => Ok(Some(WherePredicate::Equality {
-            column: column.to_string(),
-            value: n.to_string(),
-        })),
         Cell::Bool(b) => Ok(Some(WherePredicate::BoolEquality {
             column: column.to_string(),
             value: *b,
         })),
-        Cell::Vector(_)
+        Cell::SignedInteger(_)
+        | Cell::Vector(_)
         | Cell::Float(_)
         | Cell::Date(_)
         | Cell::Timestamp(_)
@@ -285,7 +293,7 @@ fn cell_to_equality_predicate(
         | Cell::Numeric(_)
         | Cell::Uuid(_) => Err(SqlSurfaceError::invalid_input(
             "unsupported column type for subquery IN target (implementation scope: \
-             TEXT / INTEGER / BIGINT / BOOLEAN / id only)",
+             TEXT / BOOLEAN / id only; INTEGER/BIGINT equality is not yet implemented)",
         )),
     }
 }

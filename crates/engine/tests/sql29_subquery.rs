@@ -33,6 +33,11 @@ fn docs_schema() -> TableSchema {
         vec![
             ColumnDef::new("embedding", ColumnType::Vector(2), false),
             ColumnDef::new("lang", ColumnType::Text, false),
+            // INTEGER/BIGINT 列を対象にした `IN (SELECT ...)`（レビュー指摘対応。
+            // `sql::subquery::cell_to_equality_predicate` の `Cell::SignedInteger`
+            // 分岐が `WherePredicate::Equality` 経由で常に失敗していたバグの
+            // 回帰テスト用。`insert_doc` は指定しないため NULL 許容にする）。
+            ColumnDef::new("priority", ColumnType::BigInt, true),
         ],
     )
 }
@@ -41,6 +46,15 @@ fn allowed_langs_schema() -> TableSchema {
     TableSchema::new(
         ALLOWED_LANGS,
         vec![ColumnDef::new("lang", ColumnType::Text, false)],
+    )
+}
+
+const PRIORITIES: &str = "priorities";
+
+fn priorities_schema() -> TableSchema {
+    TableSchema::new(
+        PRIORITIES,
+        vec![ColumnDef::new("priority", ColumnType::BigInt, false)],
     )
 }
 
@@ -61,6 +75,9 @@ fn new_core() -> (EngineCore, std::path::PathBuf) {
     storage
         .create_table(&visits_schema())
         .expect("create visits");
+    storage
+        .create_table(&priorities_schema())
+        .expect("create priorities");
     (
         EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
         path,
@@ -82,6 +99,36 @@ fn insert_doc(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str) {
         ),
     )
     .unwrap_or_else(|e| panic!("insert doc id={id} should succeed: {e:?}"));
+}
+
+fn insert_doc_with_priority(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    id: u64,
+    lang: &str,
+    priority: i64,
+) {
+    core.execute_sql_in_session(
+        ctx,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {DOCS} (id, embedding, lang, priority) VALUES \
+             ({id}, '[0.{id},0.1]', '{lang}', {priority}) USING OPERATION_ID 'doc-{id}'"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("insert doc id={id} should succeed: {e:?}"));
+}
+
+fn insert_priority(core: &EngineCore, ctx: &PolicyContext, id: u64, priority: i64) {
+    core.execute_sql_in_session(
+        ctx,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {PRIORITIES} (id, priority) VALUES ({id}, {priority}) \
+             USING OPERATION_ID 'priority-{id}'"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("insert priority id={id} should succeed: {e:?}"));
 }
 
 fn insert_allowed_lang(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str) {
@@ -151,6 +198,37 @@ fn in_subquery_text_column_matches_independent_oracle() {
         ),
     );
     assert_eq!(ids, vec![1, 3]);
+}
+
+#[test]
+fn in_subquery_bigint_column_in_target_is_rejected() {
+    // レビュー指摘の回帰テスト（Issue #927 push 前 Review）: `sql::subquery::
+    // cell_to_equality_predicate` が以前は `BIGINT`/`INTEGER` 列（`Cell::
+    // SignedInteger`）を `WherePredicate::Equality`（`TEXT`/`ENUM` 列専用）へ
+    // 変換していたため、`<BIGINT/INTEGER 列> IN (SELECT ...)` は常に「TEXT
+    // 列でない」で拒否されていた（ドキュメント上の「対応済み」表明と実装が
+    // 矛盾する機能バグ）。`INTEGER`/`BIGINT` 列の等価比較自体がこのリポでは
+    // まだ実装されていない（レーン A。`sql::udf_call::bind_expr_in` 参照）
+    // ため、実装を追加するのではなく `IN` 対象値の対応型を `TEXT`/`BOOLEAN`
+    // のみへ縮小し、`INTEGER`/`BIGINT` は明示的に `22000` へ倒したことを
+    // 検証する（`docs/design/sql-subquery.md`「`IN` 対象値の型」節参照）。
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_priority(&core, &ctx, 1, "ja", 10);
+    insert_priority(&core, &ctx, 1, 10);
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE priority IN (SELECT priority FROM {PRIORITIES} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { .. }
+    ));
 }
 
 // 疑似列 `id` を対象にした `IN`／`EXISTS`（`id IN (SELECT id FROM ...)`）は
