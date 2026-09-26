@@ -2052,6 +2052,17 @@ struct Parser<'a> {
     /// 対で管理する（構文段の計測。束縛段の独立検査は `udf_call::BindEnv::
     /// case_nesting` 参照）。
     case_nesting: usize,
+    /// `NULL` を裸の識別子ではなくリテラル（[`Expr::Null`]）として解釈してよい
+    /// 文脈かどうか（codex-review P1 指摘対応。Issue #921 PR #1101）。既存の
+    /// VECTOR 列名 `null` を参照するクエリ（例: `vec_norm(null)`）が
+    /// `parse_primary_expr` の無条件リテラル化で列参照として束縛されなくなる
+    /// 破壊的変更を防ぐため、`Expr::Null` の束縛が実際に許可される 3 箇所
+    /// （`CASE` の THEN／ELSE 値・`COALESCE`／`NULLIF` の引数。`udf_call::
+    /// bind_expr_in` の `Expr::Null` 分岐参照）を解析する呼び出しの直前でのみ
+    /// `true` へ切り替える。それ以外（`CASE WHEN` 条件式・通常の関数呼び出し
+    /// 引数など）では `false` のままとし、`NULL` は列名としての後方互換を
+    /// 優先して裸の識別子（`Expr::Ident`）へ解析する。
+    allow_null_literal: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -2061,7 +2072,25 @@ impl<'a> Parser<'a> {
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
             case_nesting: 0,
+            allow_null_literal: false,
         }
+    }
+
+    /// [`Self::allow_null_literal`] を一時的に `allowed` へ切り替えて `depth+1`
+    /// で式を解析し、呼び出し前の値へ復元する（ネストした式の中で文脈が変わる
+    /// 場合に備えた save/restore。呼び出し元は `CASE` の THEN／ELSE 値・
+    /// `COALESCE`／`NULLIF` の引数・`CASE WHEN` 条件式・通常の関数呼び出し引数の
+    /// いずれかで、それぞれ許可すべき値が異なる）。
+    fn parse_value_expr_with_null_context(
+        &mut self,
+        depth: usize,
+        allowed: bool,
+    ) -> Result<Expr, SqlSurfaceError> {
+        let prev = self.allow_null_literal;
+        self.allow_null_literal = allowed;
+        let result = self.parse_value_expr(depth);
+        self.allow_null_literal = prev;
+        result
     }
 
     /// 式ノードを 1 つ生成する直前に呼び、予算を消費する。予算枯渇時は
@@ -2818,12 +2847,26 @@ impl<'a> Parser<'a> {
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.check_expr_depth(depth)?;
         match self.peek().cloned() {
-            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("NULL") => {
+            // codex-review P1 指摘対応（Issue #921 PR #1101）: `NULL` は
+            // `self.allow_null_literal` が立っている文脈（`CASE` の THEN／ELSE
+            // 値・`COALESCE`／`NULLIF` の引数。[`Self::allow_null_literal`]
+            // 参照）でのみリテラル化する。それ以外では既存の VECTOR 列名 `null`
+            // の後方互換を優先し、下の一般識別子分岐へフォールスルーして列参照
+            // （`Expr::Ident`）として扱う。
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("NULL") && self.allow_null_literal =>
+            {
                 self.advance();
                 self.consume_expr_node()?;
                 Ok(Expr::Null)
             }
-            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CASE") => {
+            // codex-review P1 指摘対応（Issue #921 PR #1101）: `parse_select_item`
+            // と同じ方針で、次のトークンが `WHEN` のときのみ `CASE` 式として扱う。
+            // 先読み無しで無条件に消費すると既存の VECTOR 列名 `case` の参照
+            // （例: `vec_norm(case)`）が構文エラー化する破壊的変更になる。
+            Some(Token::Ident(name))
+                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") =>
+            {
                 self.advance();
                 self.parse_case_expr(depth)
             }
@@ -2894,16 +2937,23 @@ impl<'a> Parser<'a> {
         self.expect_ident_matching("WHEN")?;
         let mut whens = Vec::new();
         loop {
-            let lhs = self.parse_value_expr(depth + 1)?;
+            // WHEN 条件式（`<value_expr> <cmp_op> <value_expr>`）は
+            // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL` は
+            // ここでは常に列参照として解析する（`allow_null_literal` を強制的に
+            // false にする。[`Self::allow_null_literal`] 参照）。
+            let lhs = self.parse_value_expr_with_null_context(depth + 1, false)?;
             let op = self.expect_cmp_op()?;
-            let rhs = self.parse_value_expr(depth + 1)?;
+            let rhs = self.parse_value_expr_with_null_context(depth + 1, false)?;
             let cond = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
             };
             self.expect_ident_matching("THEN")?;
-            let result = self.parse_value_expr(depth + 1)?;
+            // THEN の結果値は `Expr::Null` の束縛が許可される 3 箇所の 1 つ
+            // （`udf_call::bind_expr_in` 参照）のため、ここでは `NULL` を
+            // リテラルとして解析する。
+            let result = self.parse_value_expr_with_null_context(depth + 1, true)?;
             whens.push((cond, result));
             if whens.len() > MAX_CASE_BRANCHES {
                 return Err(SqlSurfaceError::payload_too_large(
@@ -2918,7 +2968,10 @@ impl<'a> Parser<'a> {
         }
         let else_result = if self.peek_ident_matches("ELSE") {
             self.advance();
-            Some(Box::new(self.parse_value_expr(depth + 1)?))
+            // ELSE の結果値も THEN と同じく `Expr::Null` 許可箇所。
+            Some(Box::new(
+                self.parse_value_expr_with_null_context(depth + 1, true)?,
+            ))
         } else {
             None
         };
@@ -2940,7 +2993,10 @@ impl<'a> Parser<'a> {
 
     fn parse_coalesce_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.expect_punct('(')?;
-        let mut args = vec![self.parse_value_expr(depth + 1)?];
+        // `COALESCE` の引数は `Expr::Null` の束縛が許可される 3 箇所の 1 つ
+        // （`udf_call::bind_expr_in` 参照）のため、ここでは `NULL` をリテラル
+        // として解析する（[`Self::allow_null_literal`] 参照）。
+        let mut args = vec![self.parse_value_expr_with_null_context(depth + 1, true)?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
             if args.len() >= MAX_CALL_ARGS {
@@ -2948,7 +3004,7 @@ impl<'a> Parser<'a> {
                     "too many call arguments",
                 ));
             }
-            args.push(self.parse_value_expr(depth + 1)?);
+            args.push(self.parse_value_expr_with_null_context(depth + 1, true)?);
         }
         self.expect_punct(')')?;
         self.consume_expr_node()?;
@@ -2966,9 +3022,12 @@ impl<'a> Parser<'a> {
 
     fn parse_nullif_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.expect_punct('(')?;
-        let lhs = self.parse_value_expr(depth + 1)?;
+        // `NULLIF` の引数も `Expr::Null` の束縛が許可される 3 箇所の 1 つ
+        // （`udf_call::bind_expr_in` 参照）のため、`NULL` をリテラルとして
+        // 解析する（[`Self::allow_null_literal`] 参照）。
+        let lhs = self.parse_value_expr_with_null_context(depth + 1, true)?;
         self.expect_punct(',')?;
-        let rhs = self.parse_value_expr(depth + 1)?;
+        let rhs = self.parse_value_expr_with_null_context(depth + 1, true)?;
         self.expect_punct(')')?;
         self.consume_expr_node()?;
         Ok(Expr::NullIf(Box::new(lhs), Box::new(rhs)))
@@ -3003,7 +3062,13 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
-            args.push(self.parse_value_expr(depth + 1)?);
+            // 通常の関数呼び出し（`COALESCE`／`NULLIF` 以外）の引数は
+            // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL`
+            // は常に列参照として解析する（外側が `COALESCE`／`NULLIF` の引数
+            // 中でネストして呼ばれた場合でも、この関数自身の引数については
+            // `allow_null_literal` を強制的に false へ戻す。
+            // [`Self::allow_null_literal`] 参照）。
+            args.push(self.parse_value_expr_with_null_context(depth + 1, false)?);
             while matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
                 if args.len() >= MAX_CALL_ARGS {
@@ -3011,7 +3076,7 @@ impl<'a> Parser<'a> {
                         "too many call arguments",
                     ));
                 }
-                args.push(self.parse_value_expr(depth + 1)?);
+                args.push(self.parse_value_expr_with_null_context(depth + 1, false)?);
             }
         }
         self.expect_punct(')')?;
@@ -11132,6 +11197,133 @@ mod tests {
             stmt.projection,
             Projection::Columns(vec!["case".to_string(), "null".to_string()])
         );
+    }
+
+    #[test]
+    fn call_argument_named_case_or_null_without_when_is_a_plain_column_reference() {
+        // codex-review P1 指摘対応（Issue #921 PR #1101）:
+        // `select_item_named_case_or_null_without_when_is_a_plain_column_reference`
+        // は `parse_select_item` の頂点位置のみを検証しており、`parse_primary_expr`
+        // （関数呼び出し引数・WHERE 式述語などの一般式位置）には先読み無しの
+        // 無条件トリガーが残っていた。既存の VECTOR 列名 `case`／`null` を引数に
+        // 渡す `vec_norm(case)`／`vec_norm(null)` が「列参照として束縛されず
+        // 破壊的変更になる」（`case`）・「構文エラーになる」（実際は
+        // `Expr::Null` へ変換された後 `bind_expr_in` で `0A000` へ落ちる。
+        // `null`）を防ぐ回帰テスト。`vec_norm` は SELECT 式項目の頂点では
+        // `ident '('` 形として `parse_call_expr` を経由するため、
+        // `parse_primary_expr` の `CASE`／`NULL` 分岐を直接踏む。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT vec_norm(case), vec_norm(null) FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("vec_norm(case)/vec_norm(null) should parse with case/null as column refs");
+        let items = select_expr_items(&stmt);
+        assert_eq!(items.len(), 2);
+        for (item, expected_arg) in items.iter().zip(["case", "null"]) {
+            match item {
+                SelectItem::Expr {
+                    expr: Expr::Call { name, args },
+                    ..
+                } => {
+                    assert_eq!(name, "vec_norm");
+                    assert_eq!(args.len(), 1);
+                    assert_eq!(args[0], Expr::Ident(expected_arg.to_string()));
+                }
+                other => panic!("expected SelectItem::Expr(Call), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn where_predicate_call_argument_named_case_or_null_is_a_plain_column_reference() {
+        // 上のテストの WHERE 式述語版（`parse_where_leaf` の式フォールバック
+        // 経由でも `parse_primary_expr` の同じ分岐を踏む）。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT id FROM documents WHERE vec_norm(case) > 0 AND vec_norm(null) > 0 \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect(
+            "WHERE with vec_norm(case)/vec_norm(null) should fall back to the expression predicate",
+        );
+        assert_eq!(stmt.where_predicates.len(), 2);
+        for (pred, expected_arg) in stmt.where_predicates.iter().zip(["case", "null"]) {
+            match pred {
+                WherePredicate::Expression(Expr::Binary { lhs, op, .. }) => {
+                    assert_eq!(*op, BinOp::Gt);
+                    match lhs.as_ref() {
+                        Expr::Call { name, args } => {
+                            assert_eq!(name, "vec_norm");
+                            assert_eq!(args[0], Expr::Ident(expected_arg.to_string()));
+                        }
+                        other => panic!("expected Call, got {other:?}"),
+                    }
+                }
+                other => {
+                    panic!("expected WherePredicate::Expression(Binary(Call, ...)), got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn null_literal_remains_usable_inside_case_coalesce_nullif_and_nested_calls() {
+        // 上 2 件の回帰修正（`allow_null_literal` を既定 false にする）が、
+        // `Expr::Null` の束縛が実際に許可される 3 箇所（`CASE` の THEN／ELSE・
+        // `COALESCE`／`NULLIF` の引数。`udf_call::bind_expr_in` 参照）での
+        // 明示的 `NULL` リテラルの既存挙動を壊していないことを確認する。
+        // あわせて、`COALESCE` の引数中にネストした通常の関数呼び出し
+        // （`vec_norm(null)`）では `null` が引き続き列参照として解析される
+        // ことも検証する（`parse_call_expr` の一般呼び出し分岐が
+        // `allow_null_literal` を強制的に false へ戻すことの回帰テスト）。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE WHEN id > 1 THEN NULL ELSE 0 END, \
+             COALESCE(NULL, vec_norm(null), 0), NULLIF(id, NULL) \
+             FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("explicit NULL literal should remain accepted in CASE/COALESCE/NULLIF");
+        let items = select_expr_items(&stmt);
+        assert_eq!(items.len(), 3);
+        match &items[0] {
+            SelectItem::Expr {
+                expr: Expr::Case { whens, else_result },
+                ..
+            } => {
+                assert_eq!(whens[0].1, Expr::Null);
+                assert_eq!(else_result.as_deref(), Some(&Expr::Number("0".to_string())));
+            }
+            other => panic!("expected SelectItem::Expr(Case), got {other:?}"),
+        }
+        match &items[1] {
+            SelectItem::Expr {
+                expr: Expr::Coalesce(args),
+                ..
+            } => {
+                assert_eq!(args[0], Expr::Null);
+                assert_eq!(
+                    args[1],
+                    Expr::Call {
+                        name: "vec_norm".to_string(),
+                        args: vec![Expr::Ident("null".to_string())],
+                    }
+                );
+            }
+            other => panic!("expected SelectItem::Expr(Coalesce), got {other:?}"),
+        }
+        match &items[2] {
+            SelectItem::Expr {
+                expr: Expr::NullIf(_, rhs),
+                ..
+            } => {
+                assert_eq!(**rhs, Expr::Null);
+            }
+            other => panic!("expected SelectItem::Expr(NullIf), got {other:?}"),
+        }
     }
 
     #[test]
