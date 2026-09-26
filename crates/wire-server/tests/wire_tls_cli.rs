@@ -979,20 +979,17 @@ fn connect_tls_and_read_sasl_mechanisms(addr: std::net::SocketAddr) -> Vec<Strin
     read_authentication_sasl_mechanisms(&mut channel)
 }
 
-/// [`write_valid_tls_pair`] と同じ鍵材料（RFC8032 TEST1）だが、
-/// `signature_oid` で署名アルゴリズムだけを差し替えた証明書・鍵の組を
-/// 書き出す（Issue #1088。SPKI は常に Ed25519 のまま）。
-fn write_tls_pair_with_signature_oid(
+/// [`write_valid_tls_pair`] の実 CA 署名版（codex-review P2
+/// 指摘・Issue #1088）: 手組み DER の全 0 埋め `signatureValue` ではなく、
+/// [`tls_client::ca_signed_ecdsa_sha256_leaf_certificate_der`] が返す
+/// 実際に CA が `ecdsa-with-SHA256` で署名した葉証明書を使う。鍵材料は
+/// [`tls_client::RFC8032_TEST1_SEED`] で他ヘルパーと共通のため、
+/// `drive_client_handshake_over_socket`／SCRAM の鍵一致検査はそのまま通る。
+fn write_ca_signed_ecdsa_leaf_tls_pair(
     fixture: &TempFixtureDir,
-    signature_oid: &[u8],
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let seed = tls_client::hex_decode32(tls_client::RFC8032_TEST1_SEED);
-    let cert_der = tls_client::build_ed25519_leaf_certificate_der_with_signature_algorithm(
-        &tls_client::RFC8032_TEST1_PUBLIC_KEY,
-        "160801121924Z",
-        "401231235959Z",
-        signature_oid,
-    );
+    let cert_der = tls_client::ca_signed_ecdsa_sha256_leaf_certificate_der();
     let cert_path = fixture.path("cert.pem");
     tls_client::write_pem_file(&cert_path, &tls_client::pem_wrap("CERTIFICATE", &cert_der));
     let key_path = fixture.path("key.pem");
@@ -1135,13 +1132,14 @@ fn tls_scram_channel_binding_explicit_disable_does_not_advertise_plus_mechanism(
 /// Issue #1088: ECDSA-SHA256 署名の葉証明書（鍵は本サーバーが要求する
 /// Ed25519 のまま）であれば、`enable` は受理され `SCRAM-SHA-256-PLUS` が
 /// 提示される（判定が SPKI ではなく署名アルゴリズムを見ていることの、
-/// CLI 結線を通した確認）。
+/// CLI 結線を通した確認）。codex-review P2 指摘への対応
+/// （`write_ca_signed_ecdsa_leaf_tls_pair` 参照）で、手組みの全 0 埋め
+/// `signatureValue` ではなく実際に CA が署名した葉証明書を使う。
 #[test]
 fn tls_scram_channel_binding_enable_with_ecdsa_sha256_signed_leaf_advertises_plus_mechanism() {
     let fixture = TempFixtureDir::new("r8-scram-cb-ecdsa-accepted");
     let (users_path, mock_key_path) = write_scram_user_store_and_mock_key(&fixture);
-    let (cert_path, key_path) =
-        write_tls_pair_with_signature_oid(&fixture, &tls_client::OID_ECDSA_WITH_SHA256_BYTES);
+    let (cert_path, key_path) = write_ca_signed_ecdsa_leaf_tls_pair(&fixture);
 
     let mut server = common::SpawnedServer::spawn(&[
         "--users",

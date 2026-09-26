@@ -393,21 +393,24 @@ fn tls_plus_channel_binding_authenticates_successfully() {
 /// 接続で機能し、PLUS 交換が最後まで成功して `ReadyForQuery` へ到達する
 /// こと。`tls_channel_binding.rs::ecdsa_signed_ed25519_key_leaf_is_rfc5929_
 /// defined_and_enable_is_accepted` は判定関数の単体確認に留まるため、本
-/// テストは同じ OID 差し替え証明書を実際にサーバーへ載せ、クライアント
-/// 接続・SCRAM-PLUS 交換の最後まで駆動する（`signatureValue` は
-/// `x509.rs` モジュール doc が明記するとおり本実装のスコープ外＝
-/// 検証されないため、テスト専用の全 0 埋めのままでよい）。
+/// テストは実際にサーバーへ証明書を載せ、クライアント接続・SCRAM-PLUS
+/// 交換の最後まで駆動する。証明書は
+/// [`tls_client::ca_signed_ecdsa_sha256_leaf_certificate_der`] が返す
+/// 実際に CA が署名した DER（README/ADR が案内する「RSA/ECDSA CA 署名済み
+/// 葉証明書」を代表する fixture。codex-review 再指摘で全 0 埋め
+/// `signatureValue` から差し替えた）を使う。`signatureValue` 自体の
+/// 暗号学的検証は `x509.rs` モジュール doc が明記するとおり本実装の
+/// スコープ外（発行者鍵の検証はクライアントの責務）で、実 CA 署名か
+/// どうかでサーバー側の受理判定は変わらないが、本テストは判定を
+/// 変えるためではなく、現実の CA 署名済み証明書が持つ形状（実サイズの
+/// ECDSA 署名・拡張・非空 issuer/subject）でもパーサと PLUS 交換一式が
+/// 通ることを検証する。
 #[test]
 fn tls_plus_channel_binding_authenticates_successfully_with_ecdsa_signed_leaf() {
     let password = b"correct horse battery staple";
     let users_path = write_scram_user_store_file(password);
 
-    let der = tls_client::build_ed25519_leaf_certificate_der_with_signature_algorithm(
-        &tls_client::RFC8032_TEST1_PUBLIC_KEY,
-        "160801121924Z",
-        "401231235959Z",
-        &tls_client::OID_ECDSA_WITH_SHA256_BYTES,
-    );
+    let der = tls_client::ca_signed_ecdsa_sha256_leaf_certificate_der();
     let chain = ServerCertificateChain::from_der_chain(
         vec![der],
         &tls_client::RFC8032_TEST1_PUBLIC_KEY,
