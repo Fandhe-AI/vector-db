@@ -488,7 +488,7 @@ fn udf_named_union_in_select_list_is_not_routed_to_set_operation() {
             &tenant_ctx,
             &mut session,
             "SELECT id, union(embedding) AS n FROM docs \
-             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+             ORDER BY embedding <=> '[3.0,4.0]' LIMIT 3",
         )
         .expect("SELECT calling a UDF named union should succeed");
     let result = expect_query(outcome);
@@ -521,7 +521,7 @@ fn udf_named_intersect_and_except_in_select_list_is_not_routed_to_set_operation(
             &tenant_ctx,
             &mut session,
             "SELECT id, intersect(embedding) AS a, except(embedding) AS b FROM docs \
-             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+             ORDER BY embedding <=> '[3.0,4.0]' LIMIT 3",
         )
         .expect("SELECT calling UDFs named intersect/except should succeed");
     let result = expect_query(outcome);
@@ -548,7 +548,7 @@ fn udf_named_union_in_where_clause_is_not_routed_to_set_operation() {
             &tenant_ctx,
             &mut session,
             "SELECT id FROM docs WHERE union(embedding) > 0.0 \
-             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+             ORDER BY embedding <=> '[3.0,4.0]' LIMIT 3",
         )
         .expect("SELECT with a WHERE predicate calling a UDF named union should succeed");
     let _ = expect_query(outcome);
@@ -586,7 +586,7 @@ fn column_named_union_is_still_usable_as_an_ordinary_identifier() {
     let result = run(
         &core,
         "tenant-a",
-        "SELECT union FROM labels WHERE union = 'x'",
+        "SELECT union FROM labels WHERE union = 'x' LIMIT 10",
     );
     assert_eq!(result.rows.len(), 1);
 }
