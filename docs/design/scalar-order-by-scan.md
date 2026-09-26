@@ -32,7 +32,7 @@
 SELECT <投影> FROM <table | view>
   [WHERE <既存許可述語>]
   ORDER BY <col> [ASC|DESC] [, <col> [ASC|DESC]]*
-  LIMIT <n>
+  LIMIT <n> [OFFSET <m>]
 ```
 
 - `ORDER BY` 直後の先頭トークンが距離演算子形・関数呼び出し形（`sql::allowlist::
@@ -42,9 +42,13 @@ SELECT <投影> FROM <table | view>
 - `ASC`/`DESC` は予約語化せず文脈的（大文字小文字非区別）に照合し、省略時は
   昇順。キー数の上限は `MAX_SCALAR_ORDER_KEYS`（8。NOSQL-15 の同種上限と揃えた
   実装既定値）。超過は `54000`。
-- `LIMIT` 直後は文末のみを許可する（`USING MODE`／`HINT ORDER`／`OFFSET`／
-  `NULLS FIRST|LAST` はいずれも `42601`）。取得モード・評価順の余地を持たない
-  という広域取得本体の契約（TASK-161・SQL-12 との関係）をそのまま引き継ぐ。
+- `LIMIT <n> [OFFSET <m>]` の後は文末のみを許可する（`USING MODE`／
+  `HINT ORDER`／`NULLS FIRST|LAST` はいずれも `42601`）。取得モード・評価順の
+  余地を持たないという広域取得本体の契約（TASK-161・SQL-12 との関係）をその
+  まま引き継ぐ。`OFFSET` は #916（`docs/design/sql-offset-paging.md`）で
+  `LIMIT` に後続する任意句として受理されており、本 `ORDER BY` との組み合わせ
+  も同様に受理する（下記「スコープ外」節は本 ORDER BY 機能の対象外事項の一覧
+  であり、`OFFSET` 自体は含まない）。
 - `OrderByForm`（検索 SELECT のランキング段）へはバリアントを追加しない。
   スカラーキーは `ParsedScanShape`／`ValidatedScan` にのみ `order_by:
   Vec<ScalarOrderKey>` として載る。`ScalarOrderKey { column, descending }` は
@@ -167,7 +171,7 @@ security.md P0）を保ったまま、次のいずれかで決定的な順序を
 
 - 集計文（SQL-13／14）の複数キー `ORDER BY` と NULL 位置の PG 既定化
   （`group_by.rs` は単一キー・NULL 常に末尾の既存規約のまま）
-- `OFFSET`（#916）・`DISTINCT`（#917）・複数列 `GROUP BY`（#918）
+- `DISTINCT`（#917）・複数列 `GROUP BY`（#918）
 - NoSQL 表層の `sort`（NOSQL-15・別 Issue #946・#947）
 - ランキング段の二次ソートキーとしての利用
 - 3 クライアントでの層 B 実測（spec 確定作業）
