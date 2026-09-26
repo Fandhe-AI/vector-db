@@ -24,6 +24,11 @@ codex-review 指摘・PR #210）。
   `SET search_mode` を先行実行してから本体の `SELECT` を送る、セッション複数文の
   検証（SQL-12）に使う。配列でない・要素が文字列でない場合は fail-closed で
   エラー終了する（stdin／argv を使わない現行方針を維持。security.md P0）。
+- WIRE_SSLMODE（任意・Issue #969・WIRE-9）: 指定時のみ `psycopg.connect(...,
+  sslmode=<値>)` を渡す（TLS 越しの接続検証用）。閉じた語彙
+  （`disable`／`allow`／`prefer`／`require`／`verify-ca`／`verify-full`。
+  psycopg／libpq が受理する値のみ）に限り、語彙外は fail-closed でエラー
+  終了する。未指定なら従来どおり kwarg を渡さない（挙動不変）。
 
 成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
 出力し、終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう
@@ -68,11 +73,24 @@ def main() -> int:
             return 1
         prelude = parsed
 
+    sslmode = os.environ.get("WIRE_SSLMODE")
+    allowed_sslmodes = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+    if sslmode is not None and sslmode not in allowed_sslmodes:
+        print(
+            f"psycopg_client: WIRE_SSLMODE must be one of {sorted(allowed_sslmodes)}, got {sslmode!r}",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         import psycopg
     except ImportError as e:
         print(f"psycopg_client: psycopg is not installed: {e}", file=sys.stderr)
         return 1
+
+    connect_kwargs = {}
+    if sslmode is not None:
+        connect_kwargs["sslmode"] = sslmode
 
     try:
         with psycopg.connect(
@@ -83,6 +101,7 @@ def main() -> int:
             dbname="irrelevant-db-name",
             autocommit=True,
             connect_timeout=5,
+            **connect_kwargs,
         ) as conn:
             with psycopg.ClientCursor(conn) as cur:
                 for stmt in prelude:

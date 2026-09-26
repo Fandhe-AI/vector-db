@@ -284,6 +284,61 @@ fn build_client_hello(client_pub: [u8; 32]) -> (Record, RawHandshake) {
     (record, raw)
 }
 
+/// [`build_client_hello`] が組む正規の ClientHello を、レコード層まで直列化
+/// した生バイト列として返す（`wire9_tls.rs` の切り詰めハンドシェイク負の
+/// テストが、意図的に途中で止めたバイト列を組むために使う）。
+pub fn build_client_hello_record_bytes(client_pub: [u8; 32]) -> Vec<u8> {
+    let (record, _raw) = build_client_hello(client_pub);
+    let mut buf = Vec::new();
+    record
+        .serialize_into(&mut buf, RecordKind::Plaintext)
+        .expect("serialize ClientHello record");
+    buf
+}
+
+/// TLS 1.2 以下しか提示しない ClientHello を 2 変種で組む（Issue #969・
+/// WIRE-9 の負のテスト用）。`negotiate`（`client_hello.rs`）の判定順序は
+/// legacy_version・`supported_versions` の TLS 1.3 有無をバージョン以外の
+/// 検査より先に見るため、他フィールドは最小構成のままで
+/// `protocol_version` alert に到達する。
+///
+/// - `variant 1`（`with_supported_versions_extension = false`）:
+///   `supported_versions` 拡張自体を持たない旧クライアント相当
+/// - `variant 2`（`true`）: `supported_versions` を提示するが TLS 1.2
+///   （`0x0303`）のみを含む
+pub fn tls12_only_client_hello_record_bytes(with_supported_versions_extension: bool) -> Vec<u8> {
+    let mut extensions = Vec::new();
+    if with_supported_versions_extension {
+        extensions.push(handshake::Extension {
+            extension_type: 43,
+            // ProtocolVersion リスト長 1 バイト（0x02）+ TLS 1.2（0x0303）のみ。
+            extension_data: vec![0x02, 0x03, 0x03],
+        });
+    }
+    let ch = handshake::ClientHello {
+        legacy_version: 0x0303,
+        random: [0x24u8; 32],
+        legacy_session_id: Vec::new(),
+        // TLS 1.2 の代表的な cipher suite（ECDHE-RSA-AES128-GCM-SHA256 等）。
+        // TLS 1.3 専用スイート（0x1301 等）を含めない。
+        cipher_suites: vec![0xC02F, 0xC02B],
+        legacy_compression_methods: vec![0x00],
+        extensions,
+    };
+    let mut body = Vec::new();
+    ch.serialize_body_into(&mut body).expect("valid body");
+    let raw = RawHandshake {
+        msg_type: HandshakeType::ClientHello,
+        body,
+    };
+    let record = plaintext_handshake_record(raw.to_bytes().expect("valid wire bytes"));
+    let mut buf = Vec::new();
+    record
+        .serialize_into(&mut buf, RecordKind::Plaintext)
+        .expect("serialize ClientHello record");
+    buf
+}
+
 impl TestClient {
     fn new() -> Self {
         TestClient {
@@ -395,12 +450,21 @@ impl TestClient {
     }
 }
 
-/// 実ソケット越しにフルハンドシェイクを駆動し、application epoch まで
-/// 切り替え済みの [`TestClient`] を返す（`tests/tls_server_handshake.rs::
-/// drive_client_handshake_over_socket` と同じ手順）。以後は
-/// `client.sealer.seal_fragmented(ContentType::ApplicationData, ..)`／
-/// `client.opener.open(&record)` で pg wire バイト列を直接やり取りできる。
-pub fn drive_client_handshake_over_socket(client_socket: &mut std::net::TcpStream) -> TestClient {
+/// server flight 受信・ハンドシェイク鍵導入までの共通手順（[`TestClient`]
+/// の `sealer`／`opener` には handshake epoch の鍵のみが入った状態で返す）。
+/// [`drive_client_handshake_over_socket`]（client Finished まで送出して
+/// application epoch へ切り替える）と
+/// [`drive_client_handshake_stop_before_finished`]（`wire9_tls.rs` の負の
+/// テストが「client Finished を送らずに諦める」挙動を確認するために使う。
+/// client Finished を送らないまま止める）の共通前半部分を 1 箇所に持つ。
+struct HandshakeUpToServerFlight {
+    client: TestClient,
+    handshake_secret: wire_server::tls::key_schedule::HandshakeSecret,
+    th_ch_sf: [u8; 32],
+    client_hs_traffic: wire_server::tls::key_schedule::TrafficSecret,
+}
+
+fn drive_up_to_server_flight(client_socket: &mut std::net::TcpStream) -> HandshakeUpToServerFlight {
     let client_priv = [0x33u8; 32];
     let client_ephemeral = EphemeralSecret::from_bytes(client_priv);
     let client_pub = *client_ephemeral.public_key().as_bytes();
@@ -486,6 +550,37 @@ pub fn drive_client_handshake_over_socket(client_socket: &mut std::net::TcpStrea
         &traffic.server,
     );
 
+    HandshakeUpToServerFlight {
+        client,
+        handshake_secret,
+        th_ch_sf,
+        client_hs_traffic: traffic.client,
+    }
+}
+
+/// server flight 受信・ハンドシェイク鍵導入までを行い、client Finished は
+/// 送らずに返す（Issue #969・WIRE-9 の負のテスト
+/// `handshake_abandoned_before_client_finished_closes_without_wire_data`
+/// 専用。返る [`TestClient`] は application epoch へ遷移していない）。
+pub fn drive_client_handshake_stop_before_finished(
+    client_socket: &mut std::net::TcpStream,
+) -> TestClient {
+    drive_up_to_server_flight(client_socket).client
+}
+
+/// 実ソケット越しにフルハンドシェイクを駆動し、application epoch まで
+/// 切り替え済みの [`TestClient`] を返す（`tests/tls_server_handshake.rs::
+/// drive_client_handshake_over_socket` と同じ手順）。以後は
+/// `client.sealer.seal_fragmented(ContentType::ApplicationData, ..)`／
+/// `client.opener.open(&record)` で pg wire バイト列を直接やり取りできる。
+pub fn drive_client_handshake_over_socket(client_socket: &mut std::net::TcpStream) -> TestClient {
+    let HandshakeUpToServerFlight {
+        mut client,
+        handshake_secret,
+        th_ch_sf,
+        client_hs_traffic,
+    } = drive_up_to_server_flight(client_socket);
+
     let master = handshake_secret
         .into_master()
         .expect("valid HKDF parameters");
@@ -496,8 +591,7 @@ pub fn drive_client_handshake_over_socket(client_socket: &mut std::net::TcpStrea
     let server_ap_keys = app.server.traffic_keys().expect("valid HKDF parameters");
 
     // client Finished を構成し、handshake epoch のまま送る。
-    let client_finished_key = traffic
-        .client
+    let client_finished_key = client_hs_traffic
         .finished_key()
         .expect("valid HKDF parameters");
     let verify_data = finished::compute_verify_data(&client_finished_key, &th_ch_sf);

@@ -13,6 +13,11 @@
 // `SET search_mode` を先行実行してから本体の SELECT を送る、セッション複数文の
 // 検証（SQL-12）に使う。配列でない・要素が文字列でない場合は fail-closed で
 // エラー終了する（stdin／argv を使わない現行方針を維持。security.md P0）。
+// WIRE_SSL（任意・Issue #969・WIRE-9）: `no-verify` のときのみ
+// `ssl: { rejectUnauthorized: false }` を pg.Client へ渡す（TLS 越しの接続
+// 検証用。テスト証明書は検証対象外＝chain 検証は行わない構成のため）。
+// 語彙外（`no-verify` 以外の非空値）は fail-closed でエラー終了する。未指定
+// なら従来どおり ssl オプションを渡さない（挙動不変）。
 // 成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
 // 出力し終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう全列を
 // 出力する。`crates/wire-server/tests/three_client_e2e.rs` の `run_psql`／
@@ -54,6 +59,12 @@ if (preludeRaw) {
   prelude = parsed;
 }
 
+const wireSsl = process.env.WIRE_SSL;
+if (wireSsl !== undefined && wireSsl !== "no-verify") {
+  process.stderr.write(`pg_client: WIRE_SSL must be "no-verify" if set, got ${JSON.stringify(wireSsl)}\n`);
+  process.exit(1);
+}
+
 let pg;
 try {
   pg = require("pg");
@@ -62,14 +73,18 @@ try {
   process.exit(1);
 }
 
-const client = new pg.Client({
+const clientOptions = {
   host,
   port: Number(port),
   user,
   password,
   database: "irrelevant-db-name",
   connectionTimeoutMillis: 5000,
-});
+};
+if (wireSsl === "no-verify") {
+  clientOptions.ssl = { rejectUnauthorized: false };
+}
+const client = new pg.Client(clientOptions);
 
 // ErrorResponse 受信直後の接続断（緊急応答経路。Issue #706）で pg が
 // 後追いの "error" イベントを emit することがあり、リスナー未登録だと

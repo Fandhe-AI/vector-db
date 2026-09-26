@@ -463,9 +463,13 @@ fn vocabulary_outside_six_ops_rejects_with_0a000_and_has_no_side_effect() {
     // 受理形（`vector`／`limit` 等）の残りフィールドを備えた本文で送り、
     // 「op 判定が実行可能な状態でも手前で止まる」ことを固定する。
     let unsupported_ops = [
-        "create_table",
-        "alter_table",
-        "drop_table",
+        // `create_table`／`alter_table`／`drop_table` は Issue #910 で
+        // 語彙へ加わったため対象から外す（`nosql13_ddl.rs` が固定する）。
+        // NOSQL-13 の対象外である index／view 系 DDL 相当を代わりに使う。
+        "create_index",
+        "drop_index",
+        "create_view",
+        "drop_view",
         "call",
         "udf",
         "begin",
@@ -890,7 +894,9 @@ fn rejected_requests_do_not_consume_or_expire_the_session() {
     let unsupported_op_rejected = post(
         addr,
         &token,
-        br#"{"op":"drop_table","table":"docs","vector":[1.0,0.0],"limit":10}"#,
+        // `drop_table` は Issue #910 で語彙へ加わったため、引き続き語彙外の
+        // `drop_index`（NOSQL-13 の対象外）を使う。
+        br#"{"op":"drop_index","table":"docs","vector":[1.0,0.0],"limit":10}"#,
     );
     assert_eq!(
         unsupported_op_rejected.status, 501,

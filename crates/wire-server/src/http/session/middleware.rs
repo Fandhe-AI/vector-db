@@ -54,12 +54,25 @@ use crate::http::session::store::SessionStore;
 /// 型的な強制（HTTP-7）。
 pub struct SessionPrincipal {
     ctx: PolicyContext,
+    /// DDL 実行権限（NOSQL-13・TASK-207、Issue #910）。`SessionStore::
+    /// lookup_grant` がセッション発行時（`issue.rs`）に確定させた値を運ぶ
+    /// だけで、DDL 実行権限ゲートそのものは
+    /// `engine::sql::ddl::require_ddl_permission` 一箇所が担う
+    /// （`http/query/ddl.rs` のみがこのフラグを読んで
+    /// `SessionState::allow_ddl` を呼ぶ）。
+    ddl_allowed: bool,
 }
 
 impl SessionPrincipal {
     /// この要求に束縛されたテナント文脈。
     pub fn policy_context(&self) -> &PolicyContext {
         &self.ctx
+    }
+
+    /// このセッションが DDL（`create_table`／`alter_table`／`drop_table`）を
+    /// 実行できるか（NOSQL-13・TASK-207、Issue #910）。
+    pub fn ddl_allowed(&self) -> bool {
+        self.ddl_allowed
     }
 }
 
@@ -110,8 +123,11 @@ pub fn authenticate(
     now_mono: impl Fn() -> Instant,
 ) -> Result<SessionPrincipal, MiddlewareError> {
     let token = bearer::extract_bearer_token(headers).map_err(MiddlewareError::Bearer)?;
-    match sessions.lookup(&token, now_mono()) {
-        Some(ctx) => Ok(SessionPrincipal { ctx }),
+    match sessions.lookup_grant(&token, now_mono()) {
+        Some(grant) => Ok(SessionPrincipal {
+            ctx: grant.ctx,
+            ddl_allowed: grant.ddl_allowed,
+        }),
         None => Err(MiddlewareError::Unknown),
     }
 }
@@ -267,6 +283,35 @@ mod tests {
 
         let principal = authenticate(&sessions, &headers, move || now).expect("authenticate");
         assert_eq!(principal.policy_context(), &ctx("tenant-a"));
+    }
+
+    #[test]
+    fn authenticate_carries_ddl_allowed_from_session_grant() {
+        // NOSQL-13・TASK-207、Issue #910: `authenticate` は
+        // `SessionStore::lookup_grant` 経由で DDL 実行権限を
+        // `SessionPrincipal` へ運ぶ（`lookup` ではなく）。
+        let sessions = SessionStore::new();
+        let now = Instant::now();
+        let token = sessions
+            .issue_with_ddl(ctx("tenant-a"), true, now)
+            .expect("issue_with_ddl");
+        let raw = format!("Authorization: Bearer {}\r\n", token.encoded());
+        let headers = headers_from(raw.as_bytes());
+
+        let principal = authenticate(&sessions, &headers, move || now).expect("authenticate");
+        assert!(principal.ddl_allowed());
+    }
+
+    #[test]
+    fn authenticate_defaults_ddl_allowed_to_false_for_plain_issue() {
+        let sessions = SessionStore::new();
+        let now = Instant::now();
+        let token = sessions.issue(ctx("tenant-a"), now).expect("issue");
+        let raw = format!("Authorization: Bearer {}\r\n", token.encoded());
+        let headers = headers_from(raw.as_bytes());
+
+        let principal = authenticate(&sessions, &headers, move || now).expect("authenticate");
+        assert!(!principal.ddl_allowed());
     }
 
     #[test]
