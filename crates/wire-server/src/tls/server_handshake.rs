@@ -172,6 +172,21 @@ impl TlsServerConfig {
         self.channel_binding.is_some()
             && super::channel_binding::has_rfc5929_defined_hash(self.chain.leaf_der())
     }
+
+    /// [`Self::tls_server_end_point_is_rfc5929_defined`] が `false` を返す
+    /// 理由を区別して返す（Issue #1089 レビュー是正）。`tls_opt::
+    /// check_scram_channel_binding` が拒否メッセージを「証明書を別の CA で
+    /// 再発行すべきケース」と「本実装側が未対応なハッシュのケース（例:
+    /// SHA-384）」とで書き分けるために使う唯一の入口。`tls_server_end_point()`
+    /// が `Some`（`channel_binding` 算出済み）かどうかに関わらず、常に
+    /// 葉証明書 DER から独立に再判定する（[`super::channel_binding::
+    /// rfc5929_hash_gap`] に委譲。`None` を返すのは
+    /// `tls_server_end_point_is_rfc5929_defined()` が `true` の場合のみ）。
+    pub fn tls_server_end_point_rfc5929_gap(
+        &self,
+    ) -> Option<super::channel_binding::Rfc5929HashGap> {
+        super::channel_binding::rfc5929_hash_gap(self.chain.leaf_der())
+    }
 }
 
 /// サーバー側ハンドシェイクが必要とする乱数源（server random・一時鍵）を

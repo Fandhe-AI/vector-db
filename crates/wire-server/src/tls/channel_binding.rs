@@ -47,6 +47,17 @@ const OID_ECDSA_WITH_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03,
 /// 署名方式を定義していないため、Ed25519 署名の証明書へ SHA-256 を使うのは
 /// 本リポの実装既定値（`docs/design/tls-channel-binding.md` 参照）。
 const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+/// sha384WithRSAEncryption（1.2.840.113549.1.1.12）。RFC 5929 はこの
+/// アルゴリズムに対して SHA-384 を明確に定義しているが、本リポは自作
+/// SHA-384 実装を持たないため [`classify_signature_oid`] では分類できない
+/// （[`ChannelBindingError::UnsupportedSignatureAlgorithm`] へ縮退）。
+/// [`recognized_but_unimplemented_hash_oid`] が「RFC 5929 は定義しているが
+/// 本実装が未対応」の理由を Ed25519（RFC 5929 が単一ハッシュを定義しない
+/// ケース）と区別するために使う（Issue #1089 レビュー是正）。
+const OID_SHA384_WITH_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+/// ecdsa-with-SHA384（1.2.840.10045.4.3.3）。[`OID_SHA384_WITH_RSA`] と同じ
+/// 理由で「RFC 5929 は定義しているが本実装が未対応」に分類する。
+const OID_ECDSA_WITH_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 
 /// RFC 5929 が単一ハッシュを定義しない署名アルゴリズムのうち、本リポが
 /// [`classify_signature_oid`] で独自にハッシュを割り当てているものの一覧
@@ -55,6 +66,14 @@ const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 /// 際に、この独自割り当てを「RFC が定義したハッシュ」とは区別するために使う
 /// （Issue #1088）。
 const IMPLEMENTATION_ASSIGNED_SIGNATURE_OIDS: [&[u8]; 1] = [OID_ED25519];
+
+/// RFC 5929 がハッシュを明確に定義しているが、本リポがそのハッシュ関数
+/// （SHA-384）を自作していないために [`classify_signature_oid`] が分類
+/// できない署名アルゴリズムの一覧（Issue #1089 レビュー是正）。
+/// [`IMPLEMENTATION_ASSIGNED_SIGNATURE_OIDS`]（Ed25519 = RFC 5929 に
+/// そもそも定義が無い）とは拒否理由が異なるため区別する。
+const RFC5929_DEFINED_BUT_UNIMPLEMENTED_HASH_OIDS: [&[u8]; 2] =
+    [OID_SHA384_WITH_RSA, OID_ECDSA_WITH_SHA384];
 
 /// [`tls_server_end_point`] が返すハッシュ値（署名アルゴリズムに応じて
 /// SHA-256／SHA-512 のいずれか。長さ固定のため可変長 `Vec` を使わない）。
@@ -204,25 +223,65 @@ pub fn tls_server_end_point(cert_der: &[u8]) -> Result<TlsServerEndPoint, Channe
     }
 }
 
+/// [`rfc5929_hash_gap`] が返す、`--tls-scram-channel-binding enable` を
+/// 拒否すべき理由の分類（Issue #1088 の是正・Issue #1089 レビュー指摘）。
+/// `tls_opt::check_scram_channel_binding` がこれを見て、運用者へ提示する
+/// 拒否理由を「証明書を別の CA で再発行すべきケース」（RFC 5929 に単一
+/// ハッシュの定義が無い）と「本実装側の制約であるケース」（RFC 5929 は
+/// ハッシュを定義しているが自作実装が未対応）とで区別する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Rfc5929HashGap {
+    /// 署名アルゴリズム（Ed25519 など）に RFC 5929 が単一ハッシュを定義
+    /// していない。RSA／ECDSA 系の CA が署名した葉証明書へ替える以外に
+    /// 解決策が無い。
+    NotDefinedByRfc5929,
+    /// RFC 5929 はハッシュ（SHA-384）を明確に定義しているが、本リポが
+    /// そのハッシュ関数を自作していないため算出できない
+    /// （[`RFC5929_DEFINED_BUT_UNIMPLEMENTED_HASH_OIDS`]）。CA の変更では
+    /// なく、証明書の署名ハッシュを本実装が対応する SHA-256／SHA-512 系へ
+    /// 変えることで解決する（もしくは本実装への SHA-384 対応追加を待つ）。
+    UnsupportedHashAlgorithm,
+    /// DER が整形式でない、または [`classify_signature_oid`] の表・上記
+    /// いずれの一覧にも無い未知の OID（fail-closed。原因を確定できない）。
+    Unknown,
+}
+
+/// `cert_der`（葉証明書の DER 全体）の `signatureAlgorithm` が RFC 5929 の
+/// 定義するハッシュを持つ署名アルゴリズムかを判定し、そうでない場合は
+/// 理由（[`Rfc5929HashGap`]）を返す（Issue #1088・#1089・WIRE-9・
+/// TASK-228）。`has_rfc5929_defined_hash` は本関数の bool 版。
+pub fn rfc5929_hash_gap(cert_der: &[u8]) -> Option<Rfc5929HashGap> {
+    let Ok(oid) = signature_algorithm_oid(cert_der) else {
+        return Some(Rfc5929HashGap::Unknown);
+    };
+    if IMPLEMENTATION_ASSIGNED_SIGNATURE_OIDS.contains(&oid) {
+        return Some(Rfc5929HashGap::NotDefinedByRfc5929);
+    }
+    if RFC5929_DEFINED_BUT_UNIMPLEMENTED_HASH_OIDS.contains(&oid) {
+        return Some(Rfc5929HashGap::UnsupportedHashAlgorithm);
+    }
+    if classify_signature_oid(oid).is_some() {
+        None
+    } else {
+        Some(Rfc5929HashGap::Unknown)
+    }
+}
+
 /// `cert_der`（葉証明書の DER 全体）の `signatureAlgorithm` が、RFC 5929
 /// が定義するハッシュを持つ署名アルゴリズムかを判定する（Issue #1088・
 /// WIRE-9・TASK-228）。`tls_opt::check_scram_channel_binding` が
 /// `--tls-scram-channel-binding enable` の起動時拒否判定に使う。
 ///
 /// `false` を返すのは次のいずれか（fail-closed。曖昧な場合は「RFC が
-/// 定義していない」側に倒す）:
+/// 定義していない」側に倒す）。理由を区別したい呼び出し元は
+/// [`rfc5929_hash_gap`] を使う:
 /// - DER が整形式でない、または非対応の OID（[`classify_signature_oid`]
 ///   の表に無い。例: sha384WithRSA）である
 /// - OID が [`IMPLEMENTATION_ASSIGNED_SIGNATURE_OIDS`]（本リポの独自割り当て。
 ///   現時点では Ed25519 のみ）に含まれる
 pub fn has_rfc5929_defined_hash(cert_der: &[u8]) -> bool {
-    let Ok(oid) = signature_algorithm_oid(cert_der) else {
-        return false;
-    };
-    if IMPLEMENTATION_ASSIGNED_SIGNATURE_OIDS.contains(&oid) {
-        return false;
-    }
-    classify_signature_oid(oid).is_some()
+    rfc5929_hash_gap(cert_der).is_none()
 }
 
 #[cfg(test)]
@@ -341,6 +400,45 @@ mod tests {
         // あって RFC 5929 が定義したハッシュではないため `false`。
         let der = synthetic_certificate_der(OID_ED25519);
         assert!(!has_rfc5929_defined_hash(&der));
+    }
+
+    #[test]
+    fn rfc5929_hash_gap_distinguishes_ed25519_from_sha384_and_unknown() {
+        // Issue #1089 レビュー是正: 「RFC 5929 に定義が無い」（Ed25519）と
+        // 「RFC 5929 は定義しているが本実装が未対応」（sha384WithRSA・
+        // ecdsa-with-SHA384）は拒否理由が異なるため、`rfc5929_hash_gap` が
+        // 別の variant を返すことを固定する。
+        let ed25519_der = synthetic_certificate_der(OID_ED25519);
+        assert_eq!(
+            rfc5929_hash_gap(&ed25519_der),
+            Some(Rfc5929HashGap::NotDefinedByRfc5929)
+        );
+
+        let sha384_rsa_oid: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+        let sha384_rsa_der = synthetic_certificate_der(sha384_rsa_oid);
+        assert_eq!(
+            rfc5929_hash_gap(&sha384_rsa_der),
+            Some(Rfc5929HashGap::UnsupportedHashAlgorithm)
+        );
+
+        let ecdsa_sha384_oid: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+        let ecdsa_sha384_der = synthetic_certificate_der(ecdsa_sha384_oid);
+        assert_eq!(
+            rfc5929_hash_gap(&ecdsa_sha384_der),
+            Some(Rfc5929HashGap::UnsupportedHashAlgorithm)
+        );
+
+        // まったく未知の OID・不正な DER は `Unknown`（fail-closed）。
+        let bogus_oid: &[u8] = &[0x2a, 0x03, 0x04];
+        let bogus_der = synthetic_certificate_der(bogus_oid);
+        assert_eq!(rfc5929_hash_gap(&bogus_der), Some(Rfc5929HashGap::Unknown));
+
+        let oversized = vec![0u8; MAX_CERTIFICATE_DER_LEN + 1];
+        assert_eq!(rfc5929_hash_gap(&oversized), Some(Rfc5929HashGap::Unknown));
+
+        // RFC 5929 が定義し、本実装も対応済みのアルゴリズムは `None`。
+        let sha256_rsa_der = synthetic_certificate_der(OID_SHA256_WITH_RSA);
+        assert_eq!(rfc5929_hash_gap(&sha256_rsa_der), None);
     }
 
     #[test]

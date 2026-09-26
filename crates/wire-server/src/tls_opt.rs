@@ -144,10 +144,24 @@ impl std::error::Error for TlsConfigLoadError {}
 #[non_exhaustive]
 pub enum ScramChannelBindingRejection {
     /// `--tls-scram-channel-binding enable` が指定されたが、葉証明書の
-    /// 署名アルゴリズムに RFC 5929 が定義するハッシュが無い（Ed25519 など。
-    /// [`crate::tls::channel_binding::has_rfc5929_defined_hash`]）ため、
-    /// libpq の `channel_binding=prefer`／`require` が接続失敗しうる構成。
+    /// 署名アルゴリズムに RFC 5929 が単一ハッシュを定義していない
+    /// （Ed25519 など。[`crate::tls::channel_binding::Rfc5929HashGap::
+    /// NotDefinedByRfc5929`]）ため、libpq の `channel_binding=prefer`／
+    /// `require` が接続失敗しうる構成。CA を RSA／ECDSA 系へ替える以外に
+    /// 解決策が無い。
     NoRfc5929Hash,
+    /// `--tls-scram-channel-binding enable` が指定され、葉証明書の署名
+    /// アルゴリズムに RFC 5929 がハッシュ（SHA-384）を定義してはいるが、
+    /// 本リポがそのハッシュ関数を自作していないため算出できない
+    /// （[`crate::tls::channel_binding::Rfc5929HashGap::
+    /// UnsupportedHashAlgorithm`]）。`NoRfc5929Hash` と異なり CA の変更は
+    /// 不要で、証明書の署名ハッシュを本実装が対応する SHA-256／SHA-512 系
+    /// （例: `sha256WithRSAEncryption`）へ揃えれば解決する（Issue #1089
+    /// レビュー是正: 拒否理由を運用者が誤認しないよう区別する）。
+    UnsupportedHashAlgorithm,
+    /// 葉証明書の署名アルゴリズムを判定できなかった（DER が整形式でない、
+    /// または未知の OID）。fail-closed で拒否する。
+    UnknownSignatureAlgorithm,
 }
 
 impl std::fmt::Display for ScramChannelBindingRejection {
@@ -162,6 +176,25 @@ impl std::fmt::Display for ScramChannelBindingRejection {
                  cannot compute SCRAM-SHA-256-PLUS channel binding; use \
                  {SCRAM_CHANNEL_BINDING_FLAG} disable or a leaf certificate issued by an \
                  RSA/ECDSA CA (see docs/design/tls-channel-binding.md)"
+            ),
+            ScramChannelBindingRejection::UnsupportedHashAlgorithm => write!(
+                f,
+                "{SCRAM_CHANNEL_BINDING_FLAG} enable requires a leaf certificate signature \
+                 hash this server implements for tls-server-end-point; RFC 5929 does define \
+                 a hash for the configured leaf certificate's signature algorithm (e.g. \
+                 SHA-384), but this server has not implemented that hash function, so \
+                 SCRAM-SHA-256-PLUS channel binding cannot be computed; use \
+                 {SCRAM_CHANNEL_BINDING_FLAG} disable or reissue the leaf certificate with a \
+                 signature hash this server supports (e.g. SHA-256/SHA-512 with RSA/ECDSA; \
+                 see docs/design/tls-channel-binding.md)"
+            ),
+            ScramChannelBindingRejection::UnknownSignatureAlgorithm => write!(
+                f,
+                "{SCRAM_CHANNEL_BINDING_FLAG} enable requires a leaf certificate with a \
+                 signature algorithm this server can recognize for tls-server-end-point; the \
+                 configured leaf certificate's signature algorithm could not be determined; \
+                 use {SCRAM_CHANNEL_BINDING_FLAG} disable or a certificate with a recognized \
+                 RSA/ECDSA signature algorithm (see docs/design/tls-channel-binding.md)"
             ),
         }
     }
@@ -185,13 +218,22 @@ pub fn check_scram_channel_binding(
     config: &TlsServerConfig,
     enabled: bool,
 ) -> Result<(), ScramChannelBindingRejection> {
+    use crate::tls::channel_binding::Rfc5929HashGap;
+
     if !enabled {
         return Ok(());
     }
-    if config.tls_server_end_point_is_rfc5929_defined() {
-        Ok(())
-    } else {
-        Err(ScramChannelBindingRejection::NoRfc5929Hash)
+    match config.tls_server_end_point_rfc5929_gap() {
+        None => Ok(()),
+        Some(Rfc5929HashGap::NotDefinedByRfc5929) => {
+            Err(ScramChannelBindingRejection::NoRfc5929Hash)
+        }
+        Some(Rfc5929HashGap::UnsupportedHashAlgorithm) => {
+            Err(ScramChannelBindingRejection::UnsupportedHashAlgorithm)
+        }
+        Some(Rfc5929HashGap::Unknown) => {
+            Err(ScramChannelBindingRejection::UnknownSignatureAlgorithm)
+        }
     }
 }
 
@@ -408,6 +450,34 @@ mod tests {
         assert!(message.contains("Ed25519"));
     }
 
+    #[test]
+    fn check_scram_channel_binding_enabled_rejects_sha384_rsa_signed_leaf_with_distinct_reason() {
+        // Issue #1089 レビュー是正: sha384WithRSA 署名の葉証明書は
+        // Ed25519（`NoRfc5929Hash`）とは異なる理由
+        // （`UnsupportedHashAlgorithm`）で拒否される。RFC 5929 自体は
+        // ハッシュを定義しているが、本実装が SHA-384 を自作していないだけ
+        // なので、運用者向けメッセージも CA 変更ではなく署名ハッシュの
+        // 変更を案内する内容にする。
+        let sha384_rsa = tls_client_test_helpers::config_with_sha384_rsa_signed_leaf();
+        assert_eq!(
+            check_scram_channel_binding(&sha384_rsa, true),
+            Err(ScramChannelBindingRejection::UnsupportedHashAlgorithm)
+        );
+    }
+
+    #[test]
+    fn scram_channel_binding_rejection_display_distinguishes_unsupported_hash_from_ed25519() {
+        // sha384WithRSA の拒否メッセージは「RFC 5929 に定義が無い」とは
+        // 言わず（Ed25519 用の文言と混同させない）、本実装側の制約として
+        // SHA-384 に言及する。
+        let message = ScramChannelBindingRejection::UnsupportedHashAlgorithm.to_string();
+        assert!(message.contains(SCRAM_CHANNEL_BINDING_FLAG));
+        assert!(message.contains("RFC 5929"));
+        assert!(message.contains("SHA-384"));
+        assert!(!message.contains("Ed25519"));
+        assert!(message.contains("has not implemented"));
+    }
+
     /// 本 crate の `tests/common/tls_client.rs` は統合テスト専用で
     /// unit テストから import できないため、`tls_opt` の unit テストに必要な
     /// 最小限（Ed25519 自己署名の `TlsServerConfig` 1 つ）だけを重複して
@@ -441,13 +511,30 @@ mod tests {
         }
 
         const OID_ED25519: [u8; 3] = [0x2b, 0x65, 0x70];
+        /// sha384WithRSAEncryption（1.2.840.113549.1.1.12）。RFC 5929 は
+        /// 定義しているが本実装は SHA-384 を自作していない OID
+        /// （`channel_binding::RFC5929_DEFINED_BUT_UNIMPLEMENTED_HASH_OIDS`
+        /// と同一。Issue #1089 レビュー是正の回帰テスト用）。
+        const OID_SHA384_WITH_RSA: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
 
         fn ed25519_algorithm_identifier() -> Vec<u8> {
             sequence(&[&tlv(0x06, &OID_ED25519)])
         }
 
         fn build_ed25519_leaf_certificate_der(public_key: &[u8; 32]) -> Vec<u8> {
-            let signature_algorithm = ed25519_algorithm_identifier();
+            build_leaf_certificate_der_with_signature_oid(public_key, &OID_ED25519)
+        }
+
+        /// [`build_ed25519_leaf_certificate_der`] の一般化版。SPKI は常に
+        /// Ed25519（鍵は Ed25519 のまま）だが、`tbsCertificate.signature`・
+        /// 外側 `signatureAlgorithm` に任意の OID を差し込める（CA が
+        /// RSA／ECDSA で署名した Ed25519 葉証明書を模擬する。Issue #1089
+        /// レビュー是正: sha384WithRSA 署名の回帰テストに使う）。
+        fn build_leaf_certificate_der_with_signature_oid(
+            public_key: &[u8; 32],
+            signature_oid: &[u8],
+        ) -> Vec<u8> {
+            let signature_algorithm = sequence(&[&tlv(0x06, signature_oid)]);
             let mut spki_bits = vec![0x00u8];
             spki_bits.extend_from_slice(public_key);
             let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
@@ -482,6 +569,22 @@ mod tests {
             let key = SigningKey::from_seed_bytes(SEED);
             let public_key = key.public_key();
             let der = build_ed25519_leaf_certificate_der(&public_key);
+            let chain =
+                ServerCertificateChain::from_der_chain(vec![der], &public_key, 1_600_000_000)
+                    .expect("valid synthetic chain");
+            TlsServerConfig::new(chain, key).expect("matching leaf/key")
+        }
+
+        /// `tbsCertificate.signature`／外側 `signatureAlgorithm` を
+        /// sha384WithRSA にした葉証明書（鍵自体は Ed25519）から構築した
+        /// [`TlsServerConfig`]。RFC 5929 がハッシュを定義していながら本実装
+        /// が未対応（`Rfc5929HashGap::UnsupportedHashAlgorithm`）な構成の
+        /// 回帰テスト用（Issue #1089 レビュー是正）。
+        pub fn config_with_sha384_rsa_signed_leaf() -> TlsServerConfig {
+            let key = SigningKey::from_seed_bytes(SEED);
+            let public_key = key.public_key();
+            let der =
+                build_leaf_certificate_der_with_signature_oid(&public_key, &OID_SHA384_WITH_RSA);
             let chain =
                 ServerCertificateChain::from_der_chain(vec![der], &public_key, 1_600_000_000)
                     .expect("valid synthetic chain");
