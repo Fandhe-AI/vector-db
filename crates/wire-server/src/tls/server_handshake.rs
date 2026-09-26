@@ -67,12 +67,19 @@ pub struct TlsServerConfig {
     channel_binding: Option<TlsServerEndPoint>,
     /// SCRAM-SHA-256-PLUS（`p=tls-server-end-point`）を機構リストへ
     /// 提示するか（[`Self::with_scram_channel_binding`]）。既定 `false`
-    /// （非提示）。psql 18.6・OpenSSL 3.5.5 での実測（Issue #970 §3 ブロック
-    /// C。`tests/wire_scram_plus_psql_interop.rs`）で、本サーバーが受理する
-    /// 唯一の葉鍵種別（Ed25519）の証明書に対し libpq の既定設定
-    /// （`channel_binding=prefer`）が `could not find digest for NID UNDEF`
-    /// で TLS 接続自体に失敗することを確認したため、既定を非提示側へ倒す
-    /// （`channel_binding=disable` は成功）。詳細・実測結果・opt-in 手順は
+    /// （非提示）。TLS ハンドシェイク自体は本フラグの値に関わらず同じ
+    /// Ed25519 葉証明書で成立する（本フラグは TLS 確立後の SASL 機構
+    /// リストのみを変える）。psql 18.6・OpenSSL 3.5.5 での実測（Issue #970
+    /// §3 ブロック C。`tests/wire_scram_plus_psql_interop.rs`）では、本
+    /// フラグを有効化して `PLUS` を提示した場合に限り、libpq の既定設定
+    /// （`channel_binding=prefer`）・`channel_binding=require` の両方が
+    /// TLS 確立後の SCRAM 交換（tls-server-end-point の算出）で
+    /// `could not find digest for NID UNDEF` により失敗する（本サーバーが
+    /// 受理する唯一の葉鍵種別である Ed25519 の署名アルゴリズムに対し
+    /// libpq 側がダイジェストを解決できないため）。既定 `false`（非提示）
+    /// では `disable`・`prefer` の両方が認証成功し、`require` は
+    /// libpq がクライアント側で拒否する（サーバーが `PLUS` を提示しない
+    /// ため）。詳細・実測結果・opt-in 手順は
     /// `docs/design/tls-channel-binding.md` 参照。
     advertise_scram_channel_binding: bool,
 }

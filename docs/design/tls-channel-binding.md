@@ -47,18 +47,30 @@ SCRAM-SHA-256（無印）はこの値を一切参照しない。
 **根拠（実測）**: `crates/wire-server/tests/wire_scram_plus_psql_interop.rs`
 （手動専用・`#[ignore]`。CI 非配線）で psql 18.6・OpenSSL 3.5.5 を用い、
 `sslmode=require` かつ `channel_binding` を `disable`／`prefer`／`require`
-と変えた 3 通りを本サーバー（Ed25519 葉証明書・`PLUS` 提示 opt-in 有効）
-に対して実測した。`channel_binding=disable` は成功する一方、libpq の
-既定設定である `channel_binding=prefer` は TLS 接続自体が
-`could not find digest for NID UNDEF` で失敗することを確認した。libpq
-側の具体的な実装箇所・原因の特定は本 Issue の対象外（下記「スコープ外」）
-とし、ここでは実測結果（Ed25519 葉証明書に対し `prefer` が失敗し
-`disable` が成功する）のみを判断根拠として記録する。
+と変えた 3 通りを、`PLUS` 提示（`advertise_scram_channel_binding`）の
+有効・無効それぞれについて本サーバー（Ed25519 葉証明書）に対して実測
+した。いずれの組み合わせでも TLS ハンドシェイク自体は成立する
+（本フラグは TLS 確立後の SASL 機構リストのみを変えるため）。差は
+その後の SCRAM 交換（tls-server-end-point の算出）に現れる:
+
+| `PLUS` 提示 | `disable` | `prefer` | `require` |
+| ----------- | --------- | -------- | --------- |
+| 無効（既定） | 成功 | 成功 | libpq がクライアント側で拒否（"channel binding is required, but server did not offer ..."）。サーバーが `PLUS` を提示しないため |
+| 有効（opt-in） | 成功 | 失敗（`could not find digest for NID UNDEF`） | 失敗（`could not find digest for NID UNDEF`） |
+
+`PLUS` 提示が有効な場合の `prefer`／`require` 失敗は、libpq が
+SCRAM-SHA-256-PLUS を選び tls-server-end-point 用のダイジェストを
+算出しようとした際に、本サーバーが受理する唯一の葉鍵種別である
+Ed25519 の署名アルゴリズムに対応するダイジェストを libpq 側が解決
+できないために起きる（TLS ハンドシェイクの失敗ではない）。libpq
+側の具体的な実装箇所の特定は本 Issue の対象外（下記「スコープ外」）
+とする。
 
 この実測結果に基づき、`PLUS` 機構を既定で提示しないことで、libpq の
-既定設定（`channel_binding=prefer`）を使う一般的なクライアントが接続
-不能になる回帰を避ける。`PLUS` を使いたい運用（`channel_binding=require`
-かつクライアント側が本サーバーの制約を把握している場合）は
+既定設定（`channel_binding=prefer`）を使う一般的なクライアントが
+（`disable`・`prefer` いずれでも）認証成功する状態を維持する。`PLUS`
+を使いたい運用（`channel_binding=require` かつクライアント側が本
+サーバーの制約を把握している場合）は
 `TlsServerConfig::with_scram_channel_binding(true)` の opt-in で有効化
 できる。CLI からの結線は #967 の担当範囲。
 
