@@ -1044,6 +1044,10 @@ fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected() {
         !stderr.contains("listening on"),
         "rejected startup must not reach listen: {stderr}"
     );
+    assert!(
+        !stderr.contains("TLS enabled"),
+        "rejected startup must not reach the TLS-enabled log line: {stderr}"
+    );
     let lines: Vec<String> = stderr.lines().map(str::to_string).collect();
     assert_no_secret_leak(&lines, &fixture);
 }
@@ -1051,7 +1055,10 @@ fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected() {
 /// Issue #1088: `--auth-method` 未指定（既定 cleartext）でも、`enable` と
 /// Ed25519 署名の葉証明書の組合せは同じく拒否される（判定を
 /// `--auth-method` に依存させないことの確認。「フラグが効かないまま受理
-/// される」経路を作らない）。
+/// される」経路を作らない）。`assert_startup_rejected` の期待文字列に
+/// `RFC 5929` を使い、単独指定拒否（`tls_scram_channel_binding_alone_
+/// is_rejected` 等）の別経路のエラーと取り違えないようにする（そちらは
+/// フラグ名しか含まない）。
 #[test]
 fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected_under_cleartext_auth() {
     let fixture = TempFixtureDir::new("r8-scram-cb-ed25519-rejected-cleartext");
@@ -1073,7 +1080,7 @@ fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected_under_c
             "--tls-scram-channel-binding",
             "enable",
         ],
-        "--tls-scram-channel-binding",
+        "RFC 5929",
     );
 }
 

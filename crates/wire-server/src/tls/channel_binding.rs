@@ -15,7 +15,7 @@
 //! （`docs/design/tls-channel-binding.md` 参照）。
 //!
 //! ただし CLI の `--tls-scram-channel-binding enable`
-//! （[`super::tls_opt::check_scram_channel_binding`]。Issue #1088・
+//! （[`crate::tls_opt::check_scram_channel_binding`]。Issue #1088・
 //! WIRE-9・TASK-228）は、この縮退に頼らず起動時に拒否する。
 //! [`has_rfc5929_defined_hash`] はその判定に使う「RFC 5929 が定義する
 //! ハッシュを持つ署名アルゴリズムか」だけを返す純粋関数で、実際の
