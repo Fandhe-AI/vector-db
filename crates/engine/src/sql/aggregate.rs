@@ -461,6 +461,20 @@ pub(crate) fn classify_aggregate_access(
         } else {
             AccessPath::FullScan
         };
+        // codex-review P1（PR #1102）: `execute_grouped_aggregate` は複数列
+        // `GROUP BY` を常に全走査へ倒す（`ScalarIndex::column_groups` が単一
+        // キー専用のため、上の `single_key_group_by` ゲートで `access_path` は
+        // 既に `FullScan` に一本化されている）。`scalar_plan` はこのゲートより
+        // 前に `has_vector` のみで計算されるため、複数列 `GROUP BY` かつ
+        // 索引対応述語（`WHERE`）を伴う場合に `scalar_plan: index_equality`
+        // 等と `access_path: full_scan` が同時に出て D5「矛盾出力の防止」に
+        // 反していた。実行経路（全走査で述語索引を一切使わない）に合わせ、
+        // 複数列 `GROUP BY` では `scalar_plan` も `PlainScan` へ揃える。
+        let scalar_plan = if single_key_group_by {
+            scalar_plan
+        } else {
+            ScalarPlan::PlainScan
+        };
         (scalar_plan, access_path)
     } else {
         // `GROUP BY` なし単一行集計の `DecodeTier::Fast` 判定
