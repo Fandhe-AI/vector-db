@@ -4559,21 +4559,33 @@ fn is_set_operator_ident(name: &str) -> bool {
 }
 
 /// `tokens[op_idx]` が集合演算子であるという前提で、その直後（`ALL`／
-/// `DISTINCT` を 1 個挟んでもよい）に次の枝（`SELECT` または `(`）が続くかを
-/// 判定する（誤検出防止: 列名・テーブル名としての `union`/`intersect`/`except`
-/// の通常の用法ではこの並びにならない）。
+/// `DISTINCT` を 1 個挟んでもよい）に次の枝（`SELECT`、または `(` の連なりの先
+/// に `SELECT` が続く形）が続くかを判定する（誤検出防止: 列名・テーブル名として
+/// の `union`/`intersect`/`except` の通常の用法ではこの並びにならない）。
+///
+/// `(` は「そこから括弧を読み飛ばした先が `SELECT` かどうか」まで確認する
+/// （[`starts_with_select_after_parens`] を後続スライスへ適用）。単に次が `(`
+/// であることのみを条件にすると、`union(score)`（宣言的 UDF・組み込み関数の
+/// 呼び出し）の呼び出し括弧まで集合演算の枝開始と誤検出し、UDF 呼び出しが
+/// 集合演算枝の解析経路（`Computed` 投影項目を拒否する）に誤って回されてしまう
+/// （Issue #929 最終レビュー指摘の回帰）。
 fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
+    let branch_starts_at = |idx: usize| -> bool {
+        match tokens.get(idx) {
+            Some(Token::Keyword(Keyword::Select)) => true,
+            Some(Token::Punct('(')) => tokens
+                .get(idx..)
+                .is_some_and(starts_with_select_after_parens),
+            _ => false,
+        }
+    };
     match tokens.get(op_idx + 1) {
-        Some(Token::Keyword(Keyword::Select)) | Some(Token::Punct('(')) => true,
         Some(Token::Ident(w))
             if w.eq_ignore_ascii_case("ALL") || w.eq_ignore_ascii_case("DISTINCT") =>
         {
-            matches!(
-                tokens.get(op_idx + 2),
-                Some(Token::Keyword(Keyword::Select)) | Some(Token::Punct('('))
-            )
+            branch_starts_at(op_idx + 2)
         }
-        _ => false,
+        _ => branch_starts_at(op_idx + 1),
     }
 }
 
@@ -10537,5 +10549,50 @@ mod tests {
         let v = parse_create_table_ok(&sql);
         assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
         assert_eq!(v.checks.len(), 2);
+    }
+
+    // ---------- 集合演算検出の誤検出防止（Issue #929 最終レビュー指摘の回帰） ----------
+
+    /// `looks_like_set_operation` は `union`/`intersect`/`except` を
+    /// 宣言的 UDF・組み込み関数の呼び出し（`union(score)` のように呼び出し括弧が
+    /// 直後に続く形）としては検出しない。呼び出し括弧の先が `SELECT` に到達
+    /// しない限り集合演算の枝開始とみなさない（`set_operator_is_followed_by_branch`
+    /// のドキュメンテーションコメント参照）。
+    fn looks_like_set_operation_of(sql: &str) -> bool {
+        let tokens = lexer::tokenize(sql).expect("valid tokens");
+        looks_like_set_operation(&tokens)
+    }
+
+    #[test]
+    fn udf_call_in_select_list_is_not_detected_as_set_operation() {
+        assert!(!looks_like_set_operation_of("SELECT union(score) FROM t"));
+        assert!(!looks_like_set_operation_of(
+            "SELECT a, intersect(x) FROM t"
+        ));
+        assert!(!looks_like_set_operation_of("SELECT except(x) FROM t"));
+    }
+
+    #[test]
+    fn udf_call_in_where_clause_is_not_detected_as_set_operation() {
+        assert!(!looks_like_set_operation_of(
+            "SELECT a FROM t WHERE except(x) > 1"
+        ));
+    }
+
+    #[test]
+    fn genuine_set_operation_with_select_branch_is_detected() {
+        assert!(looks_like_set_operation_of(
+            "SELECT a FROM t UNION SELECT b FROM u"
+        ));
+    }
+
+    #[test]
+    fn genuine_set_operation_with_parenthesized_branch_is_detected() {
+        assert!(looks_like_set_operation_of(
+            "SELECT a FROM t UNION (SELECT b FROM u)"
+        ));
+        assert!(looks_like_set_operation_of(
+            "(SELECT a FROM t) UNION ALL ((SELECT b FROM u))"
+        ));
     }
 }

@@ -76,11 +76,14 @@ branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
 
 `UNION`／`INTERSECT`/`EXCEPT` は [`crate::sql::lexer::Keyword`] 化しない
 （既存の列名・テーブル名としての用法を壊さないため）。検出は「演算子ident
-の直後（`ALL`／`DISTINCT` を 1 個挟んでもよい）に `SELECT` または `(` が
-続く」という並びのみを対象にし、`validate_sql_tokens` の集計形状判定
-（`is_aggregate_select`・`contains_group_by`）より前に行う（これらはトークン
-列全体を走査するため、`SELECT ... UNION SELECT ...` の 2 つ目以降に集計形が
-現れる場合の誤判定を避ける）。
+の直後（`ALL`／`DISTINCT` を 1 個挟んでもよい）に `SELECT`、または括弧を
+読み飛ばした先が `SELECT` になる `(` の連なりが続く」という並びのみを対象
+にし、`validate_sql_tokens` の集計形状判定（`is_aggregate_select`・
+`contains_group_by`）より前に行う（これらはトークン列全体を走査するため、
+`SELECT ... UNION SELECT ...` の 2 つ目以降に集計形が現れる場合の誤判定を
+避ける）。「次が `(`」だけを条件にすると `union(score)`（宣言的 UDF・組み込み
+関数の呼び出し）の呼び出し括弧まで枝開始と誤検出するため、`(` の先読みは
+必ず `SELECT` への到達まで確認する（Issue #929 最終レビュー指摘の回帰修正）。
 
 ## 束縛時の型整合（受入基準 1・ERR-6 `42804`）
 

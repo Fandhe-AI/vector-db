@@ -269,6 +269,27 @@ fn explicit_parens_change_result_vs_default_precedence() {
     assert_eq!(paren_got, vec!["x".to_string()]);
 }
 
+/// 演算子の右枝が丸括弧で囲まれた形（`UNION (SELECT ...)`）が
+/// `set_operator_is_followed_by_branch` の `(` 先読み厳密化後も引き続き集合演算
+/// として検出・実行されること（Issue #929 最終レビュー指摘の回帰防止）。
+#[test]
+fn union_with_parenthesized_right_branch_is_detected_and_executed() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM docs UNION (SELECT lang FROM other_docs)",
+    );
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["en".to_string(), "fr".to_string(), "ja".to_string()]
+    );
+}
+
 // ---------- 型整合（42804） ----------
 
 #[test]
@@ -440,6 +461,134 @@ fn paren_nesting_depth_exceeding_limit_is_rejected() {
     let too_deep = "(((((SELECT lang FROM docs))))) UNION SELECT lang FROM other_docs";
     let err = run_err(&core, "tenant-a", too_deep);
     assert_eq!(err.wire_code(), "54000");
+}
+
+// ---------- 誤検出防止（UDF・列名・テーブル名としての union/intersect/except。
+// Issue #929 最終レビュー指摘の回帰） ----------
+
+/// `union`/`intersect`/`except` という名前の宣言的 UDF を `SELECT` リストで
+/// 呼び出しても、集合演算の枝解析経路（`Computed` 投影項目を拒否する）へ誤って
+/// 回されないこと（`set_operator_is_followed_by_branch` のドキュメンテーション
+/// コメント参照）。
+#[test]
+fn udf_named_union_in_select_list_is_not_routed_to_set_operation() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let tenant_ctx = ctx("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &tenant_ctx,
+        &mut session,
+        "CREATE FUNCTION union(v) AS vec_norm(v)",
+    )
+    .expect("CREATE FUNCTION named union should succeed");
+    let outcome = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "SELECT id, union(embedding) AS n FROM docs \
+             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+        )
+        .expect("SELECT calling a UDF named union should succeed");
+    let result = expect_query(outcome);
+    assert_eq!(result.rows.len(), 3);
+}
+
+/// 上と同じ回帰防止を `intersect`・`except` という UDF 名でも確認する。
+#[test]
+fn udf_named_intersect_and_except_in_select_list_is_not_routed_to_set_operation() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let tenant_ctx = ctx("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &tenant_ctx,
+        &mut session,
+        "CREATE FUNCTION intersect(v) AS vec_norm(v)",
+    )
+    .expect("CREATE FUNCTION named intersect should succeed");
+    core.execute_sql_in_session(
+        &tenant_ctx,
+        &mut session,
+        "CREATE FUNCTION except(v) AS vec_norm(v)",
+    )
+    .expect("CREATE FUNCTION named except should succeed");
+
+    let outcome = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "SELECT id, intersect(embedding) AS a, except(embedding) AS b FROM docs \
+             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+        )
+        .expect("SELECT calling UDFs named intersect/except should succeed");
+    let result = expect_query(outcome);
+    assert_eq!(result.rows.len(), 3);
+}
+
+/// `union`/`intersect`/`except` という名前の UDF 呼び出しが `WHERE` 句にあっても
+/// 集合演算の枝解析経路へ誤って回されないこと。
+#[test]
+fn udf_named_union_in_where_clause_is_not_routed_to_set_operation() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let tenant_ctx = ctx("tenant-a");
+    let mut session = SessionState::default();
+    core.execute_sql_in_session(
+        &tenant_ctx,
+        &mut session,
+        "CREATE FUNCTION union(v) AS vec_norm(v)",
+    )
+    .expect("CREATE FUNCTION named union should succeed");
+    let outcome = core
+        .execute_sql_in_session(
+            &tenant_ctx,
+            &mut session,
+            "SELECT id FROM docs WHERE union(embedding) > 0.0 \
+             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+        )
+        .expect("SELECT with a WHERE predicate calling a UDF named union should succeed");
+    let _ = expect_query(outcome);
+}
+
+/// `union` を列名として使う通常の用法（列名・テーブル名としての互換性維持）が
+/// 引き続き動くこと。
+#[test]
+fn column_named_union_is_still_usable_as_an_ordinary_identifier() {
+    let path = unique_db_path("set-op-column-named-union");
+    let storage = Storage::open(&path).expect("open storage");
+    let _guard = CleanupGuard(path);
+    let schema = TableSchema::new(
+        "labels",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+            ColumnDef::new("union", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create labels");
+    let tenant_ctx = ctx("tenant-a");
+    engine::tenant::insert_typed_row(
+        &storage,
+        "labels",
+        &tenant_ctx,
+        1,
+        Visibility::Public,
+        &[Value::Vector(vec![1.0, 0.0]), Value::Text("x".to_string())],
+        &engine::recovery::required_op_id::OperationId::parse("seed-labels-1")
+            .expect("valid operation_id"),
+    )
+    .expect("insert row");
+    let core = new_core(storage);
+
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT union FROM labels WHERE union = 'x'",
+    );
+    assert_eq!(result.rows.len(), 1);
 }
 
 // ---------- RLS（他テナントの不可視行が中間結果・重複除去・件数に影響しない） ----------
