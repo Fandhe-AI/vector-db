@@ -1668,6 +1668,12 @@ mod tests {
         // パス 2 の投影結果 1 行分（`per_row_struct_bytes` + テキスト実体）を
         // それぞれ単独で見積もる。
         let heap_entry_bytes_estimate = std::mem::size_of::<HeapEntry>()
+            .saturating_add(
+                bound
+                    .order_by
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
+            )
             .saturating_add(tag_value.len())
             .saturating_add(tenant_id.len());
         let cell_struct_bytes = bound
