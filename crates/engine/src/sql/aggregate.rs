@@ -441,8 +441,20 @@ pub(crate) fn classify_aggregate_access(
     };
 
     if bound.has_group_by() {
+        // SQL-25 (d)・Issue #1099: `execute_grouped_aggregate` は複数列
+        // `GROUP BY`（`key_count != 1`）を索引経路（列挙形・候補走査形）の
+        // 対象外とし常に全走査へ一本化する（`ScalarIndex::column_groups` が
+        // 単一キー専用のため）。ここも同じ `key_count == 1` ゲートを掛けないと
+        // 複数列 `GROUP BY` で `access_path: full_scan`（実行時の実態）と
+        // 異なる索引経路を EXPLAIN が返す D5 矛盾出力になる。
+        let single_key_group_by = bound
+            .group_by
+            .as_ref()
+            .is_some_and(|g| g.column_indices.len() == 1);
         let text_min_max_blocks = crate::sql::group_by::has_text_min_max_aggregate(bound.items());
-        let access_path = if has_vector && where_less && !text_min_max_blocks {
+        let access_path = if !single_key_group_by {
+            AccessPath::FullScan
+        } else if has_vector && where_less && !text_min_max_blocks {
             AccessPath::ScalarIndexGroupEnumeration
         } else if has_vector && !where_less && index_candidate_eligible {
             AccessPath::ScalarIndexCandidates
@@ -460,7 +472,7 @@ pub(crate) fn classify_aggregate_access(
             bound.metadata_filters(),
             bound.expr_filters(),
             bound.or_filters(),
-            None,
+            &[],
         );
         let fast_tier = select_decode_tier(
             &referenced,
