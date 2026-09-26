@@ -133,17 +133,20 @@
 //! 本 Issue の対象外のまま。
 //!
 //! `--tls-scram-channel-binding`（`enable`／`disable`。未指定時の既定は
-//! `disable`。Issue #970・WIRE-18 ポインタ）: SCRAM-SHA-256-PLUS
-//! （`p=tls-server-end-point`）を機構リストへ提示するか
+//! `disable`。Issue #970・#1088・WIRE-9・WIRE-18 ポインタ）: SCRAM-SHA-256-
+//! PLUS（`p=tls-server-end-point`）を機構リストへ提示するか
 //! （`TlsServerConfig::with_scram_channel_binding`）を選ぶ CLI からの
 //! 唯一の入口。`--tls-mode` と同じく `--tls-cert`／`--tls-key` を指定した
 //! ときのみ意味を持ち、単独指定は組合せ不正として fail-closed 拒否する。
-//! 本サーバーが受理する唯一の葉鍵種別（Ed25519）に対し、libpq の既定設定
-//! `channel_binding=prefer`・`channel_binding=require` は `enable` 選択時に
-//! 限り TLS 確立後の SCRAM 交換で失敗しうる（TLS ハンドシェイク自体は
-//! 成立する。実測結果・訂正済みの記述は `docs/design/
-//! tls-channel-binding.md` 参照）ため既定は `disable`。`enable` 有効時は
-//! 起動ログへ運用上の注意を 1 行追加で出す（後述）。
+//! `enable` を選び、かつ葉証明書の署名アルゴリズムに RFC 5929 が定義する
+//! ハッシュが無い（Ed25519 など。libpq の既定設定 `channel_binding=prefer`・
+//! `channel_binding=require` が TLS 確立後の SCRAM 交換で `could not find
+//! digest for NID UNDEF` により失敗しうる。実測結果は `docs/design/
+//! tls-channel-binding.md` 参照）場合は、`tls_opt::
+//! check_scram_channel_binding` により起動時に非 0 終了で拒否する
+//! （黙って PLUS 非提示へ縮退させない。fail-closed）。RSA／ECDSA の CA が
+//! 署名した葉証明書であれば `enable` は受理され、起動ログへ運用上の注意を
+//! 1 行追加で出す（後述）。
 //!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
@@ -802,7 +805,21 @@ fn run_server(args: &[String]) -> ExitCode {
                 key,
                 *scram_channel_binding,
             ) {
-                Ok(cfg) => Some(cfg),
+                Ok(cfg) => {
+                    // Issue #1088: 読み込み・証明書/鍵の整合性検査を通った
+                    // 構成でも、`enable` と RFC 5929 が定義するハッシュを
+                    // 持たない署名アルゴリズムの葉証明書（Ed25519 など）の
+                    // 組合せは libpq と相互運用できないため、bind 検証・
+                    // listen へ進む前にここで拒否する（fail-closed）。
+                    if let Err(e) = wire_server::tls_opt::check_scram_channel_binding(
+                        &cfg,
+                        *scram_channel_binding,
+                    ) {
+                        eprintln!("wire-server: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    Some(cfg)
+                }
                 Err(e) => {
                     eprintln!("wire-server: failed to load TLS configuration: {e}");
                     return ExitCode::FAILURE;
@@ -1060,23 +1077,21 @@ fn run_server(args: &[String]) -> ExitCode {
     // 同じ方針。`listening on` より前・bind 成功後に置く）。
     if let Some((_, _, mode, scram_channel_binding)) = &tls_options {
         eprintln!("wire-server: TLS enabled (mode={})", mode.token());
-        // Issue #970: `--tls-scram-channel-binding enable` を選んだ場合のみ、
-        // Ed25519 葉証明書での libpq 相互運用上の既知の注意を 1 行追加する
-        // （既定 `disable` では従来どおりこの行を出さず stderr をビット同一の
-        // まま保つ）。
+        // Issue #970・#1088: `--tls-scram-channel-binding enable` を選んだ
+        // 場合のみ注意を 1 行追加する（既定 `disable` では従来どおりこの行を
+        // 出さず stderr をビット同一のまま保つ）。この行に到達している時点で
+        // `check_scram_channel_binding` は通過済み（葉証明書は RFC 5929 が
+        // 定義するハッシュを持つ）なので、Ed25519 特有の失敗を警告する必要は
+        // もう無い。
         if *scram_channel_binding {
             // codex-review PR #1087 P2 是正: この行は `--tls-scram-channel-binding
             // enable` 指定の事実のみを示す（「実際に提示された」という確定的な
-            // 主張はしない）。実際の提示は `--auth-method scram-sha-256` かつ
-            // 当該接続で `tls-server-end-point` を算出できた場合に限る
-            // （`--auth-method cleartext` では SASL 自体を送らないため PLUS は
-            // 一切提示されない。非対応の署名アルゴリズムの証明書でも同様）。
+            // 主張はしない）。実際の提示は `--auth-method scram-sha-256` の
+            // 接続に限る（`--auth-method cleartext` では SASL 自体を送らない
+            // ため PLUS は一切提示されない）。
             eprintln!(
                 "wire-server: SCRAM-SHA-256-PLUS advertisement enabled ({} enable); only takes \
-                 effect for scram-sha-256 authentication when tls-server-end-point could be \
-                 computed for this server's certificate; libpq's default \
-                 channel_binding=prefer/require may then fail against this server's Ed25519 \
-                 leaf certificate (see docs/design/tls-channel-binding.md)",
+                 effect for scram-sha-256 authentication (see docs/design/tls-channel-binding.md)",
                 wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG
             );
         }

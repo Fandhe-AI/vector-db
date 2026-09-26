@@ -14,6 +14,14 @@
 //! `None`（チャネルバインディング非提供）へ縮退させる契約とする
 //! （`docs/design/tls-channel-binding.md` 参照）。
 //!
+//! ただし CLI の `--tls-scram-channel-binding enable`
+//! （[`super::tls_opt::check_scram_channel_binding`]。Issue #1088・
+//! WIRE-9・TASK-228）は、この縮退に頼らず起動時に拒否する。
+//! [`has_rfc5929_defined_hash`] はその判定に使う「RFC 5929 が定義する
+//! ハッシュを持つ署名アルゴリズムか」だけを返す純粋関数で、実際の
+//! ハッシュ選択（[`tls_server_end_point`]）や起動拒否の判断そのものは
+//! 行わない。
+//!
 //! ## 定数時間性
 //!
 //! 証明書は公開データであり、`signatureAlgorithm` の OID による分岐は
@@ -39,6 +47,14 @@ const OID_ECDSA_WITH_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03,
 /// 署名方式を定義していないため、Ed25519 署名の証明書へ SHA-256 を使うのは
 /// 本リポの実装既定値（`docs/design/tls-channel-binding.md` 参照）。
 const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+
+/// RFC 5929 が単一ハッシュを定義しない署名アルゴリズムのうち、本リポが
+/// [`classify_signature_oid`] で独自にハッシュを割り当てているものの一覧
+/// （現時点では Ed25519 のみ）。[`has_rfc5929_defined_hash`] が「CLI の
+/// `--tls-scram-channel-binding enable` を許容してよい構成か」を判定する
+/// 際に、この独自割り当てを「RFC が定義したハッシュ」とは区別するために使う
+/// （Issue #1088）。
+const IMPLEMENTATION_ASSIGNED_SIGNATURE_OIDS: [&[u8]; 1] = [OID_ED25519];
 
 /// [`tls_server_end_point`] が返すハッシュ値（署名アルゴリズムに応じて
 /// SHA-256／SHA-512 のいずれか。長さ固定のため可変長 `Vec` を使わない）。
@@ -130,19 +146,18 @@ fn read_algorithm_oid(tlv_value: &[u8]) -> Result<&[u8], ChannelBindingError> {
     Ok(oid)
 }
 
-/// RFC 5929 §4 の `tls-server-end-point` チャネルバインディング値を算出する。
-///
-/// `cert_der` は葉証明書の DER 全体（[`super::x509::ServerCertificateChain::
-/// leaf_der`] が返す値）を想定する。手順:
+/// `cert_der`（葉証明書の DER 全体）から `signatureAlgorithm` の OID を
+/// 取り出す。[`tls_server_end_point`]・[`has_rfc5929_defined_hash`] が共有
+/// する検査手順（Issue #1088 で切り出し。挙動はそれまでの
+/// `tls_server_end_point` 内インライン処理とビット同一）:
 ///
 /// 1. `cert_der.len() > MAX_CERTIFICATE_DER_LEN` を確保前に拒否する
 /// 2. `Certificate` 外側 `SEQUENCE` を読み、`tbsCertificate`（`SEQUENCE`。
 ///    中身は解釈しない）・`signatureAlgorithm`（`SEQUENCE`）・
 ///    `signatureValue`（`BIT STRING`）の 3 要素のみで構成されることを
 ///    検査する（後続バイトは拒否）
-/// 3. `signatureAlgorithm` の OID を [`classify_signature_oid`] でハッシュへ
-///    分類し、`cert_der` 全体をそのハッシュでダイジェストする
-pub fn tls_server_end_point(cert_der: &[u8]) -> Result<TlsServerEndPoint, ChannelBindingError> {
+/// 3. `signatureAlgorithm` の中身から OID を読み取って返す
+fn signature_algorithm_oid(cert_der: &[u8]) -> Result<&[u8], ChannelBindingError> {
     if cert_der.len() > MAX_CERTIFICATE_DER_LEN {
         return Err(ChannelBindingError::Malformed);
     }
@@ -169,7 +184,17 @@ pub fn tls_server_end_point(cert_der: &[u8]) -> Result<TlsServerEndPoint, Channe
         .expect_end()
         .map_err(|_| ChannelBindingError::Malformed)?;
 
-    let oid = read_algorithm_oid(signature_algorithm)?;
+    read_algorithm_oid(signature_algorithm)
+}
+
+/// RFC 5929 §4 の `tls-server-end-point` チャネルバインディング値を算出する。
+///
+/// `cert_der` は葉証明書の DER 全体（[`super::x509::ServerCertificateChain::
+/// leaf_der`] が返す値）を想定する。[`signature_algorithm_oid`] で
+/// `signatureAlgorithm` の OID を取り出し、[`classify_signature_oid`] で
+/// ハッシュへ分類したうえで `cert_der` 全体をそのハッシュでダイジェストする。
+pub fn tls_server_end_point(cert_der: &[u8]) -> Result<TlsServerEndPoint, ChannelBindingError> {
+    let oid = signature_algorithm_oid(cert_der)?;
     match classify_signature_oid(oid) {
         Some(HashChoice::Sha256) => Ok(TlsServerEndPoint::Sha256(engine::crypto::sha256::digest(
             cert_der,
@@ -177,6 +202,27 @@ pub fn tls_server_end_point(cert_der: &[u8]) -> Result<TlsServerEndPoint, Channe
         Some(HashChoice::Sha512) => Ok(TlsServerEndPoint::Sha512(super::sha512::digest(cert_der))),
         None => Err(ChannelBindingError::UnsupportedSignatureAlgorithm),
     }
+}
+
+/// `cert_der`（葉証明書の DER 全体）の `signatureAlgorithm` が、RFC 5929
+/// が定義するハッシュを持つ署名アルゴリズムかを判定する（Issue #1088・
+/// WIRE-9・TASK-228）。`tls_opt::check_scram_channel_binding` が
+/// `--tls-scram-channel-binding enable` の起動時拒否判定に使う。
+///
+/// `false` を返すのは次のいずれか（fail-closed。曖昧な場合は「RFC が
+/// 定義していない」側に倒す）:
+/// - DER が整形式でない、または非対応の OID（[`classify_signature_oid`]
+///   の表に無い。例: sha384WithRSA）である
+/// - OID が [`IMPLEMENTATION_ASSIGNED_SIGNATURE_OIDS`]（本リポの独自割り当て。
+///   現時点では Ed25519 のみ）に含まれる
+pub fn has_rfc5929_defined_hash(cert_der: &[u8]) -> bool {
+    let Ok(oid) = signature_algorithm_oid(cert_der) else {
+        return false;
+    };
+    if IMPLEMENTATION_ASSIGNED_SIGNATURE_OIDS.contains(&oid) {
+        return false;
+    }
+    classify_signature_oid(oid).is_some()
 }
 
 #[cfg(test)]
@@ -265,6 +311,53 @@ mod tests {
             tls_server_end_point(&der),
             Err(ChannelBindingError::UnsupportedSignatureAlgorithm)
         );
+    }
+
+    #[test]
+    fn has_rfc5929_defined_hash_is_true_for_rfc_defined_algorithms() {
+        // Issue #1088: RFC 5929 が単一ハッシュを定義する署名アルゴリズム
+        // （本モジュールの独自割り当てである Ed25519 を除く）はすべて
+        // `true` を返す。
+        for oid in [
+            OID_MD5_WITH_RSA,
+            OID_SHA1_WITH_RSA,
+            OID_ECDSA_WITH_SHA1,
+            OID_SHA256_WITH_RSA,
+            OID_ECDSA_WITH_SHA256,
+            OID_SHA512_WITH_RSA,
+            OID_ECDSA_WITH_SHA512,
+        ] {
+            let der = synthetic_certificate_der(oid);
+            assert!(
+                has_rfc5929_defined_hash(&der),
+                "expected OID {oid:?} to have an RFC 5929 defined hash"
+            );
+        }
+    }
+
+    #[test]
+    fn has_rfc5929_defined_hash_is_false_for_ed25519() {
+        // Issue #1088: Ed25519 は本モジュールの独自割り当て（SHA-256）で
+        // あって RFC 5929 が定義したハッシュではないため `false`。
+        let der = synthetic_certificate_der(OID_ED25519);
+        assert!(!has_rfc5929_defined_hash(&der));
+    }
+
+    #[test]
+    fn has_rfc5929_defined_hash_is_false_for_unsupported_or_malformed() {
+        // sha384WithRSAEncryption（非対応 OID）。
+        let unsupported_oid: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+        let der = synthetic_certificate_der(unsupported_oid);
+        assert!(!has_rfc5929_defined_hash(&der));
+
+        // 構造違反（長さ超過）は fail-closed に `false`。
+        let oversized = vec![0u8; MAX_CERTIFICATE_DER_LEN + 1];
+        assert!(!has_rfc5929_defined_hash(&oversized));
+
+        // 切り詰め DER（malformed）。
+        let truncated_source = synthetic_certificate_der(OID_SHA256_WITH_RSA);
+        let truncated = &truncated_source[..truncated_source.len() - 1];
+        assert!(!has_rfc5929_defined_hash(truncated));
     }
 
     #[test]
