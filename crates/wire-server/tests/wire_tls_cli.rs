@@ -1012,7 +1012,7 @@ fn tls_scram_channel_binding_enable_advertises_plus_mechanism() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("SCRAM-SHA-256-PLUS advertised")),
+            .any(|l| l.contains("SCRAM-SHA-256-PLUS advertisement enabled")),
         "expected an advisory line for --tls-scram-channel-binding enable: {lines:?}"
     );
     assert_no_secret_leak(&lines, &fixture);
@@ -1055,7 +1055,7 @@ fn tls_scram_channel_binding_unset_does_not_advertise_plus_mechanism() {
     assert!(
         !lines
             .iter()
-            .any(|l| l.contains("SCRAM-SHA-256-PLUS advertised")),
+            .any(|l| l.contains("SCRAM-SHA-256-PLUS advertisement enabled")),
         "unexpected PLUS advisory line with the default (disable): {lines:?}"
     );
 }

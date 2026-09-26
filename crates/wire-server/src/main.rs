@@ -1065,10 +1065,18 @@ fn run_server(args: &[String]) -> ExitCode {
         // （既定 `disable` では従来どおりこの行を出さず stderr をビット同一の
         // まま保つ）。
         if *scram_channel_binding {
+            // codex-review PR #1087 P2 是正: この行は `--tls-scram-channel-binding
+            // enable` 指定の事実のみを示す（「実際に提示された」という確定的な
+            // 主張はしない）。実際の提示は `--auth-method scram-sha-256` かつ
+            // 当該接続で `tls-server-end-point` を算出できた場合に限る
+            // （`--auth-method cleartext` では SASL 自体を送らないため PLUS は
+            // 一切提示されない。非対応の署名アルゴリズムの証明書でも同様）。
             eprintln!(
-                "wire-server: SCRAM-SHA-256-PLUS advertised ({} enable); libpq's default \
-                 channel_binding=prefer/require may fail against this server's Ed25519 leaf \
-                 certificate (see docs/design/tls-channel-binding.md)",
+                "wire-server: SCRAM-SHA-256-PLUS advertisement enabled ({} enable); only takes \
+                 effect for scram-sha-256 authentication when tls-server-end-point could be \
+                 computed for this server's certificate; libpq's default \
+                 channel_binding=prefer/require may then fail against this server's Ed25519 \
+                 leaf certificate (see docs/design/tls-channel-binding.md)",
                 wire_server::tls_opt::SCRAM_CHANNEL_BINDING_FLAG
             );
         }
