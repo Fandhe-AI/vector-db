@@ -4995,7 +4995,20 @@ pub(crate) fn is_create_table_statement(tokens: &[Token]) -> bool {
 /// （既存テーブル名との衝突判定）は行わない——[`ValidatedCreateTable`] の
 /// ドキュメント参照のとおり、`sql::ddl::execute_create_table` が単一の
 /// 書き込みトランザクション内で TOCTOU なく判定する。
-pub(crate) fn validate_create_table_tokens(
+///
+/// `pub`（crate 外部へ公開。NOSQL-13・TASK-207、Issue #910）: NoSQL 表層
+/// （`wire-server` の `http/query/ddl.rs`）が JSON の DDL 要求をトークン列へ
+/// 写像し、本関数へ直接渡す入口として使う。`Self::parse_sql_prepared`／
+/// `bind_prepared` が `$n` を実値の `Token::StringLiteral` へ置換した
+/// トークン列を「SQL テキストへ戻さず」パーサーへ渡す前例と同じ設計
+/// （文字列連結ではなく構造化トークン列を渡す）。この入口はカタログ照会を
+/// 一切行わない契約を維持する——呼び出し元は本関数の戻り値を
+/// [`crate::core::ParsedSql::CreateTable`] へ包んで
+/// `EngineCore::execute_parsed_in_session` に渡し、DDL 実行権限ゲート
+/// （`sql::ddl::require_ddl_permission`）・カタログ照会を含む実行本体は
+/// 単一の実行器（`execute_parsed_in_session`）に委ねる（第 2 の DDL 実行器・
+/// 第 2 の権限判定を作らない）。
+pub fn validate_create_table_tokens(
     tokens: &[Token],
 ) -> Result<ValidatedCreateTable, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
@@ -5072,7 +5085,11 @@ pub fn validate_alter_table(sql: &str) -> Result<ValidatedAlterTableAddColumn, S
 /// （`core.rs::EngineCore::parse_tokens`）が既に先頭トークン判定のために
 /// `tokenize` 済みの場合、同一 SQL 文字列の再トークナイズを避けられる
 /// （`validate_truncate_tokens` と同じ設計）。
-pub(crate) fn validate_alter_table_tokens(
+/// `pub`（crate 外部へ公開。NOSQL-13・TASK-207、Issue #910）:
+/// [`validate_create_table_tokens`] と同じ契約で NoSQL 表層（`wire-server`
+/// `http/query/ddl.rs`）が JSON の `alter_table.add_column` をトークン列へ
+/// 写像して渡す入口とする。
+pub fn validate_alter_table_tokens(
     tokens: &[lexer::Token],
 ) -> Result<ValidatedAlterTableAddColumn, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
@@ -5101,7 +5118,11 @@ pub fn validate_drop_table(sql: &str) -> Result<ValidatedDropTable, SqlSurfaceEr
 /// [`validate_drop_table`] の本体。`core.rs::EngineCore::parse_tokens` が既に
 /// 字句解析済みの場合、同一 SQL 文字列の再トークナイズを避けるために使う
 /// （`validate_truncate_tokens` と同じ設計）。
-pub(crate) fn validate_drop_table_tokens(
+/// `pub`（crate 外部へ公開。NOSQL-13・TASK-207、Issue #910）:
+/// [`validate_create_table_tokens`] と同じ契約で NoSQL 表層（`wire-server`
+/// `http/query/ddl.rs`）が JSON の `drop_table` をトークン列へ写像して渡す
+/// 入口とする。
+pub fn validate_drop_table_tokens(
     tokens: &[lexer::Token],
 ) -> Result<ValidatedDropTable, SqlSurfaceError> {
     let mut p = Parser::new(tokens);

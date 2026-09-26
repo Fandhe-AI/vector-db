@@ -60,7 +60,7 @@ use engine::json::parse_json;
 
 use crate::http::query::op::{classify_op, Op};
 use crate::http::query::schema::Validated;
-use crate::http::query::{delete, insert, scan, update};
+use crate::http::query::{ddl, delete, insert, scan, update};
 use crate::http::session::middleware::{self, SessionPrincipal};
 use crate::http::{body, response};
 
@@ -150,6 +150,20 @@ pub fn handle(
         // 偽装しない）。
         (Op::Update, Some(engine)) => update::handle(engine, principal, &validated, now_wall),
         (Op::Delete, Some(engine)) => delete::handle(engine, principal, &validated, now_wall),
+        // `create_table`／`alter_table`／`drop_table`（Issue #910・NOSQL-13・
+        // TASK-207）は SQL 表層の DDL と同一の実行器（`super::ddl` モジュール
+        // doc 参照）へ委譲する。DDL 実行権限（`42501`）はテナント境界とは
+        // 別軸の判定で、`ddl::run_ddl` 内部の単一ゲート
+        // （`engine::sql::ddl::require_ddl_permission`）が担う。
+        (Op::CreateTable, Some(engine)) => {
+            ddl::handle_create_table(engine, principal, &validated, now_wall)
+        }
+        (Op::AlterTable, Some(engine)) => {
+            ddl::handle_alter_table(engine, principal, &validated, now_wall)
+        }
+        (Op::DropTable, Some(engine)) => {
+            ddl::handle_drop_table(engine, principal, &validated, now_wall)
+        }
         // `engine` 未接続時（`Router::new` 経由）は全 op がこの暫定応答へ
         // 落ちる（実行器なしで応答を偽装しない）。
         (_, _) => response::encode_error(
@@ -463,14 +477,17 @@ mod tests {
     }
 
     #[test]
-    fn tenant_id_in_json_is_rejected_for_all_six_ops() {
-        let cases: [&[u8]; 6] = [
+    fn tenant_id_in_json_is_rejected_for_all_nine_ops() {
+        let cases: [&[u8]; 9] = [
             br#"{"op":"search","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"scan","table":"docs","limit":1,"tenant_id":"evil"}"#,
             br#"{"op":"aggregate","table":"docs","aggregates":[],"tenant_id":"evil"}"#,
             br#"{"op":"insert","table":"docs","rows":[],"tenant_id":"evil"}"#,
             br#"{"op":"update","table":"docs","set":{"lang":"en"},"tenant_id":"evil"}"#,
             br#"{"op":"delete","table":"docs","where":{"id":1},"tenant_id":"evil"}"#,
+            br#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text"}],"tenant_id":"evil"}"#,
+            br#"{"op":"alter_table","table":"docs","add_column":{"name":"a","type":"text"},"tenant_id":"evil"}"#,
+            br#"{"op":"drop_table","table":"docs","tenant_id":"evil"}"#,
         ];
         for body in cases {
             let response = run(body, &[]);
@@ -492,16 +509,17 @@ mod tests {
 
     #[test]
     fn ddl_udf_transaction_ops_reject_with_0a000() {
-        // DDL・UDF 呼び出し・トランザクション制御・表記揺れは、いずれも
-        // 許可リスト（Op::parse の 6 値）に無いため 0A000 に落ちる
-        // （拒否リストを別途持たない設計の回帰確認。`update`／`delete` は
-        // Issue #875 で語彙へ加わったため本テストの対象から除外し、
-        // `valid_update_and_delete_reach_placeholder_even_when_engine_is_connected`
-        // 等へ移した）。
+        // UDF 呼び出し・トランザクション制御・NOSQL-13 対象外の DDL 相当
+        // （index／view 系）・表記揺れは、いずれも許可リスト（Op::parse の
+        // 9 値）に無いため 0A000 に落ちる（拒否リストを別途持たない設計の
+        // 回帰確認。`update`／`delete` は Issue #875、`create_table`／
+        // `alter_table`／`drop_table` は Issue #910 で語彙へ加わったため
+        // 本テストの対象から除外した）。
         let ops = [
-            "create_table",
-            "alter_table",
-            "drop_table",
+            "create_index",
+            "drop_index",
+            "create_view",
+            "drop_view",
             "call",
             "udf",
             "begin",
@@ -530,8 +548,9 @@ mod tests {
     fn op_allowlist_check_precedes_schema_validation() {
         // 語彙外 op に未知キー（本来ならスキーマ検証で 42601）が同時に
         // 付与されていても、op 許可リスト判定（0A000）が先に効く
-        // （手順の順序が契約であることの回帰確認）。
-        let body = br#"{"op":"drop_table","table":"docs","hint_order":["path"]}"#;
+        // （手順の順序が契約であることの回帰確認。`drop_table` は Issue #910
+        // で語彙に加わったため、引き続き語彙外の `drop_index` を使う）。
+        let body = br#"{"op":"drop_index","table":"docs","hint_order":["path"]}"#;
         let response = run(body, &[]);
         let text = String::from_utf8(response).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 501 "), "got: {text}");

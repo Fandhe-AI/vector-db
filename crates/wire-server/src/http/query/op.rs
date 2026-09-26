@@ -1,23 +1,34 @@
-//! `POST /v1/query` の受理語彙（閉じた 6 値）を許可リストとして表現する
-//! モジュール（Issue #759・TASK-179。`update`／`delete` 追加は Issue #875・
-//! NOSQL-12。対象ビヘイビア NOSQL-1・NOSQL-9・NOSQL-12。ポインタ:
-//! `docs/spec/05-tasks.md` TASK-179・`docs/spec/04-behavior/nosql-surface.md`
-//! NOSQL-1・NOSQL-9・NOSQL-12）。
+//! `POST /v1/query` の受理語彙を許可リストとして表現するモジュール
+//! （Issue #759・TASK-179。`update`／`delete` 追加は Issue #875・NOSQL-12。
+//! `create_table`／`alter_table`／`drop_table`（DDL 3 op）追加は Issue #910・
+//! NOSQL-13・TASK-207。対象ビヘイビア NOSQL-1・NOSQL-9・NOSQL-12・NOSQL-13。
+//! ポインタ: `docs/spec/05-tasks.md` TASK-179・TASK-207・
+//! `docs/spec/04-behavior/nosql-surface.md` NOSQL-1・NOSQL-9・NOSQL-12・
+//! NOSQL-13）。
 //!
 //! 責務境界: [`super::schema::extract_op`] が取り出した `op` 文字列を、
 //! [`Op::parse`] により **完全一致（大文字小文字・trim の読み替えなし）**
-//! でこの 6 値のいずれかへ分類する。これ以外の値（DDL・UDF 呼び出し・
-//! トランザクション制御・表記揺れをすべて含む）は [`UnsupportedOp`] として
-//! `ErrorClass::FeatureNotSupported`（`0A000`）へ fail-closed に写像する。
-//! この判定は SQL 表層の許可リスト検証（`engine::sql::allowlist`・SQL-8）
-//! と同じ設計原則（許可リスト方式。「既知の未対応名」を列挙する拒否リストに
-//! しない）に従う。
+//! でこの 9 値のいずれかへ分類する。これ以外の値（UDF 呼び出し・
+//! トランザクション制御・`create_index`／`drop_index`／`create_view`／
+//! `drop_view`（NOSQL-13 の対象外）・表記揺れをすべて含む）は
+//! [`UnsupportedOp`] として `ErrorClass::FeatureNotSupported`（`0A000`）へ
+//! fail-closed に写像する。この判定は SQL 表層の許可リスト検証
+//! （`engine::sql::allowlist`・SQL-8）と同じ設計原則（許可リスト方式。
+//! 「既知の未対応名」を列挙する拒否リストにしない）に従う。
 //!
 //! `update`／`delete` は語彙へ加わり許可リストを通過し、`where`（単一行・
 //! `id` 完全一致形）は Issue #876（TASK-186・NOSQL-6・NOSQL-12）で束縛・
 //! 実行結線済み。`filter`（述語形）は実行器未接続（Issue #871 の担当）の
 //! ため [`super::gate::handle`] の当該アーム内部で `0A000`／501 のまま
 //! 拒否する（実行器なしで成功を偽装しない）。
+//!
+//! `create_table`／`alter_table`／`drop_table`（Issue #910）は
+//! [`super::ddl`] が SQL 表層の DDL と**同一の実行器**
+//! （`engine::core::EngineCore::execute_parsed_in_session`）へ、JSON を
+//! トークン列へ写像したうえで到達させる（第 2 の DDL 実行器・第 2 の権限
+//! 判定を作らない設計）。`alter_table` は `add_column` のみ実行し、
+//! `drop_column`（SQL 表層が未結線）・`create_table` の `check` 制約は
+//! `0A000` のまま据え置く（`super::ddl` モジュール doc 参照）。
 //!
 //! [`super::schema::schema_for`] はこのモジュールの表引き（[`Op::schema`]）
 //! へ委譲し、`op` 名 → [`super::schema::ObjectSchema`] の対応表を単一情報源
@@ -29,7 +40,7 @@ use super::schema::ObjectSchema;
 
 /// `POST /v1/query` の `op` が取りうる閉じた語彙。
 ///
-/// この 6 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
+/// この 9 値以外を表す variant を追加しない（許可リストの意味が崩れる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Search,
@@ -38,18 +49,29 @@ pub enum Op {
     Insert,
     Update,
     Delete,
+    /// `CREATE TABLE`（NOSQL-13・TASK-207、Issue #910）。[`super::ddl`] が
+    /// 実行を担う。
+    CreateTable,
+    /// `ALTER TABLE ... ADD COLUMN`（`drop_column` は `0A000`。NOSQL-13・
+    /// TASK-207、Issue #910）。
+    AlterTable,
+    /// `DROP TABLE`（NOSQL-13・TASK-207、Issue #910）。
+    DropTable,
 }
 
 impl Op {
     /// 全 variant（宣言順）。[`super::schema::OP_SCHEMAS`] と名前列が
     /// 順序込みで一致することをテストで固定する。
-    pub const ALL: [Op; 6] = [
+    pub const ALL: [Op; 9] = [
         Op::Search,
         Op::Scan,
         Op::Aggregate,
         Op::Insert,
         Op::Update,
         Op::Delete,
+        Op::CreateTable,
+        Op::AlterTable,
+        Op::DropTable,
     ];
 
     /// `raw` を語彙へ分類する。完全一致のみ（大文字小文字の読み替え・
@@ -62,6 +84,9 @@ impl Op {
             "insert" => Some(Op::Insert),
             "update" => Some(Op::Update),
             "delete" => Some(Op::Delete),
+            "create_table" => Some(Op::CreateTable),
+            "alter_table" => Some(Op::AlterTable),
+            "drop_table" => Some(Op::DropTable),
             _ => None,
         }
     }
@@ -75,6 +100,9 @@ impl Op {
             Op::Insert => "insert",
             Op::Update => "update",
             Op::Delete => "delete",
+            Op::CreateTable => "create_table",
+            Op::AlterTable => "alter_table",
+            Op::DropTable => "drop_table",
         }
     }
 
@@ -88,6 +116,9 @@ impl Op {
             Op::Insert => &super::schema::INSERT_SCHEMA,
             Op::Update => &super::schema::UPDATE_SCHEMA,
             Op::Delete => &super::schema::DELETE_SCHEMA,
+            Op::CreateTable => &super::schema::CREATE_TABLE_SCHEMA,
+            Op::AlterTable => &super::schema::ALTER_TABLE_SCHEMA,
+            Op::DropTable => &super::schema::DROP_TABLE_SCHEMA,
         }
     }
 }
@@ -129,17 +160,20 @@ mod tests {
     use crate::http::query::schema::OP_SCHEMAS;
 
     #[test]
-    fn parse_accepts_exact_six_values() {
+    fn parse_accepts_exact_nine_values() {
         assert_eq!(Op::parse("search"), Some(Op::Search));
         assert_eq!(Op::parse("scan"), Some(Op::Scan));
         assert_eq!(Op::parse("aggregate"), Some(Op::Aggregate));
         assert_eq!(Op::parse("insert"), Some(Op::Insert));
         assert_eq!(Op::parse("update"), Some(Op::Update));
         assert_eq!(Op::parse("delete"), Some(Op::Delete));
+        assert_eq!(Op::parse("create_table"), Some(Op::CreateTable));
+        assert_eq!(Op::parse("alter_table"), Some(Op::AlterTable));
+        assert_eq!(Op::parse("drop_table"), Some(Op::DropTable));
     }
 
     #[test]
-    fn parse_rejects_vocabulary_outside_six_values() {
+    fn parse_rejects_vocabulary_outside_nine_values() {
         let negatives = [
             "",
             " search",
@@ -148,9 +182,15 @@ mod tests {
             "Search",
             "select",
             "explain",
-            "create_table",
-            "alter_table",
-            "drop_table",
+            "CREATE_TABLE",
+            " create_table",
+            "create_table ",
+            "ALTER_TABLE",
+            "DROP_TABLE",
+            "create_index",
+            "drop_index",
+            "create_view",
+            "drop_view",
             "call",
             "udf",
             "begin",
@@ -182,7 +222,7 @@ mod tests {
 
     #[test]
     fn unsupported_op_message_is_always_the_fixed_literal() {
-        for raw in ["begin", "create_table", "SEARCH", ""] {
+        for raw in ["begin", "create_index", "SEARCH", ""] {
             let err = classify_op(raw).unwrap_err();
             assert_eq!(err.client_message(), "unsupported op");
         }

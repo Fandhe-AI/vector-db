@@ -150,12 +150,20 @@ fn handle_inner(
     let ctx = auth::verify(users, user, password.as_bytes())
         .map_err(|_| HandleError::new(ErrorClass::AuthInvalid, auth::AuthFailure::MESSAGE))?;
 
+    // DDL 実行権限（NOSQL-13・TASK-207、Issue #910）: `auth::verify` 成功
+    // *後*にのみ `UserStore::is_ddl_allowed` を読み、セッションへ 1 回だけ
+    // 確定させる（未認証経路で権限表を参照しない。pg wire 側
+    // `handshake.rs` の `session.allow_ddl()` 呼び出しと同じ「認証成功後」の
+    // 順序）。値はセッション発行後に変化しない——DDL 実行権限ゲート自体は
+    // 引き続き `engine::sql::ddl::require_ddl_permission` 一箇所が担う。
+    let ddl_allowed = users.is_ddl_allowed(user);
+
     // セッション上限の判定は認証成功後にのみ行う（未認証クライアントへ
     // KDF を経ない高速経路・セッション数のオラクルを与えないための順序）。
     // `now_mono()` の呼び出し自体もここまで遅延させ、Argon2id 照合・セマフォ
     // 待機の時間が TTL 起点に含まれてしまわないようにする（本関数 doc 参照）。
     let token = sessions
-        .issue(ctx, now_mono())
+        .issue_with_ddl(ctx, ddl_allowed, now_mono())
         .map_err(|e| HandleError::new(e.error_class(), issue_error_message(&e)))?;
 
     Ok(token.encoded())
@@ -308,6 +316,60 @@ mod tests {
         let text = String::from_utf8(second).expect("utf-8 response");
         assert!(text.starts_with("HTTP/1.1 503 "), "got: {text}");
         assert!(text.contains("53300"), "got: {text}");
+    }
+
+    #[test]
+    fn ddl_allowed_user_session_carries_ddl_permission() {
+        // NOSQL-13・TASK-207、Issue #910: `is_ddl_allowed` なユーザーの
+        // セッションのみ `ddl_allowed` を持つ（handshake.rs の
+        // `session.allow_ddl()` と同じ「認証成功後に確定」順序）。
+        // `handle_inner` を直接使い、発行済みトークンを
+        // `SessionStore::lookup_grant` へ通して実際のフラグ値を検証する
+        // （`handle` の応答本文は `ddl_allowed` を含まない契約のため）。
+        use crate::http::session::token::SessionToken;
+
+        let store = store_with(&[
+            ("alice", "tenant-a", "pw-alice"),
+            ("bob", "tenant-a", "pw-bob"),
+        ]);
+        let store = store
+            .with_ddl_allowed_users(&["alice".to_string()])
+            .expect("alice is a known username");
+        let sessions = SessionStore::new();
+        let now = Instant::now();
+
+        let alice_token_encoded = handle_inner(
+            &store,
+            &sessions,
+            br#"{"user":"alice","password":"pw-alice"}"#,
+            move || now,
+        )
+        .map_err(|_| "alice login must succeed")
+        .expect("alice login succeeds");
+        let bob_token_encoded = handle_inner(
+            &store,
+            &sessions,
+            br#"{"user":"bob","password":"pw-bob"}"#,
+            move || now,
+        )
+        .map_err(|_| "bob login must succeed")
+        .expect("bob login succeeds");
+
+        let alice_token = SessionToken::parse(&alice_token_encoded).expect("parse alice token");
+        let bob_token = SessionToken::parse(&bob_token_encoded).expect("parse bob token");
+
+        assert!(
+            sessions
+                .lookup_grant(&alice_token, now)
+                .expect("alice session")
+                .ddl_allowed
+        );
+        assert!(
+            !sessions
+                .lookup_grant(&bob_token, now)
+                .expect("bob session")
+                .ddl_allowed
+        );
     }
 
     #[test]

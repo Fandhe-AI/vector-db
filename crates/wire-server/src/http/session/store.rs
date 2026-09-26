@@ -92,8 +92,25 @@ impl IssueError {
 /// ―― 枠解放を明示的な減算経路として複製しない設計）。
 struct Entry {
     ctx: engine::policy::PolicyContext,
+    /// DDL 実行権限（`--ddl-allowed-users`。NOSQL-13・TASK-207、Issue #910）。
+    /// `issue.rs` が `auth::verify` 成功直後に `UserStore::is_ddl_allowed` から
+    /// 1 回だけ確定させる値で、以後このセッションの寿命中は変化しない
+    /// （テナント境界（`ctx`）とは別軸の権限。DDL 実行権限ゲートの単一判定点
+    /// は `engine::sql::ddl::require_ddl_permission` のまま——本フィールドは
+    /// その判定へ渡す `SessionState::allow_ddl` の入力値をセッションへ
+    /// 搬送するだけで、第 2 の権限判定にはしない）。
+    ddl_allowed: bool,
     issued_at: Instant,
     _permit: SessionPermit,
+}
+
+/// [`SessionStore::lookup_grant`] が返す、テナント境界と DDL 実行権限の対
+/// （HTTP セッション認証ミドルウェアが両方を 1 回の照会で読む入口。
+/// NOSQL-13・TASK-207、Issue #910）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionGrant {
+    pub ctx: engine::policy::PolicyContext,
+    pub ddl_allowed: bool,
 }
 
 /// TTL 固定・同時有効数上限付きのメモリ内セッションストア（TASK-174・
@@ -168,6 +185,20 @@ impl SessionStore {
         ctx: engine::policy::PolicyContext,
         now: Instant,
     ) -> Result<SessionToken, IssueError> {
+        self.issue_with_ddl(ctx, false, now)
+    }
+
+    /// [`SessionStore::issue`] の DDL 実行権限つき版（NOSQL-13・TASK-207、
+    /// Issue #910）。`issue.rs` が `auth::verify` 成功後に一度だけ呼ぶ
+    /// 発行入口で、`ddl_allowed` は以後このセッションの寿命中固定される。
+    /// `issue` は `ddl_allowed = false` を渡す薄いラッパーとして残す
+    /// （既存呼び出し・テストの互換を保つ）。
+    pub fn issue_with_ddl(
+        &self,
+        ctx: engine::policy::PolicyContext,
+        ddl_allowed: bool,
+        now: Instant,
+    ) -> Result<SessionToken, IssueError> {
         let permit = match self.limiter.try_acquire() {
             Some(permit) => permit,
             None => {
@@ -194,6 +225,7 @@ impl SessionStore {
             token.clone(),
             Entry {
                 ctx,
+                ddl_allowed,
                 issued_at: now,
                 _permit: permit,
             },
@@ -215,6 +247,24 @@ impl SessionStore {
         let alive = self.is_alive(table.get(token)?.issued_at, now);
         if alive {
             table.get(token).map(|entry| entry.ctx.clone())
+        } else {
+            table.remove(token);
+            None
+        }
+    }
+
+    /// [`SessionStore::lookup`] と同じ照合契約で、`PolicyContext` に加えて
+    /// DDL 実行権限も一度に返す（NOSQL-13・TASK-207、Issue #910）。
+    /// `http/session/middleware.rs` の `authenticate` がこちらを使い、
+    /// `SessionPrincipal` へ `ddl_allowed` を運ぶ。
+    pub fn lookup_grant(&self, token: &SessionToken, now: Instant) -> Option<SessionGrant> {
+        let mut table = self.inner.lock().ok()?;
+        let alive = self.is_alive(table.get(token)?.issued_at, now);
+        if alive {
+            table.get(token).map(|entry| SessionGrant {
+                ctx: entry.ctx.clone(),
+                ddl_allowed: entry.ddl_allowed,
+            })
         } else {
             table.remove(token);
             None
@@ -414,6 +464,41 @@ mod tests {
             store.issue(ctx("tenant"), now),
             Err(IssueError::LimitExceeded)
         ));
+    }
+
+    #[test]
+    fn issue_defaults_ddl_allowed_to_false() {
+        // 既定の `issue`（`issue_with_ddl(ctx, false, now)` の薄いラッパー）は
+        // DDL 実行権限を一切付与しない（fail-closed。NOSQL-13・TASK-207、
+        // Issue #910）。
+        let store = SessionStore::new();
+        let now = Instant::now();
+        let token = store.issue(ctx("tenant"), now).expect("issue");
+        let grant = store.lookup_grant(&token, now).expect("lookup_grant");
+        assert!(!grant.ddl_allowed);
+        assert_eq!(grant.ctx, ctx("tenant"));
+    }
+
+    #[test]
+    fn issue_with_ddl_true_round_trips_via_lookup_grant() {
+        let store = SessionStore::new();
+        let now = Instant::now();
+        let token = store
+            .issue_with_ddl(ctx("tenant"), true, now)
+            .expect("issue_with_ddl");
+        let grant = store.lookup_grant(&token, now).expect("lookup_grant");
+        assert!(grant.ddl_allowed);
+    }
+
+    #[test]
+    fn lookup_grant_expires_at_ttl_like_lookup() {
+        let store = SessionStore::with_limits(4, Duration::from_secs(60));
+        let base = Instant::now();
+        let token = store
+            .issue_with_ddl(ctx("tenant"), true, base)
+            .expect("issue");
+        let after_ttl = base + Duration::from_secs(61);
+        assert!(store.lookup_grant(&token, after_ttl).is_none());
     }
 
     #[test]
