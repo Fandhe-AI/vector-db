@@ -5202,8 +5202,8 @@ pub(crate) fn validate_sql_tokens(
                 }
             };
 
-            // 参照されない CTE も含め、すべての定義本文の FROM を検証する
-            // （決定性・fail-closed のため。構造検証・存在確認を省略しない）。
+            // 参照されない CTE も含め、すべての定義本文を検証する（決定性・
+            // fail-closed のため。構造検証・存在確認を省略しない）。
             // 上限カウンタ（`ResolveBudget`）は「1 回のトップレベル呼び出し
             // （1 つの CTE 定義の事前検証、または主クエリの解決）」ごとに
             // 新規生成する（`cte::MAX_CTE_REFERENCES` のドキュメント参照。
@@ -5213,15 +5213,34 @@ pub(crate) fn validate_sql_tokens(
             // どちらも上限内の有効なクエリを誤って `54000` で拒否する。
             // 連鎖の深さは `MAX_CTE_NESTING_DEPTH` で呼び出しごとに独立して
             // 上限が掛かるため、リセットしても DoS 対策としての上限は失われない。
+            //
+            // `resolve_relation` は `def.body.table_name`（FROM）の名前解決
+            // 連鎖だけを検証し、`def` 自身の射影・`WHERE`（`compose` が本来
+            // 適用する `check_columns_within_view`）は「他の CTE・主クエリから
+            // 参照され `compose` を通る」場合にしか検証されない。参照されない
+            // leaf CTE はどこからも `compose` されないため、FROM 解決結果
+            // （`resolved` の公開列集合）に対して `def` 自身の射影・`WHERE` を
+            // ここで明示的に検証しないと、先行 CTE が非公開列を隠していても
+            // 参照されない後続 CTE がそれを射影・条件に使う文を通してしまう
+            // （Issue #928 レビュー指摘: Codex P1・Cursor Bugbot Low、同一欠陥）。
             for (idx, def) in ctes.iter().enumerate() {
                 let mut budget = super::cte::ResolveBudget::new();
-                super::cte::resolve_relation(
+                let resolved = super::cte::resolve_relation(
                     lookup,
                     &ctes,
                     idx,
                     &def.body.table_name,
                     0,
                     &mut budget,
+                )?;
+                let exposed = match &resolved {
+                    super::view::Resolved::Table => None,
+                    super::view::Resolved::View { view_columns, .. } => view_columns.as_deref(),
+                };
+                super::view::check_columns_within_view(
+                    exposed,
+                    &def.body.projection,
+                    &def.body.where_predicates,
                 )?;
             }
             let mut budget = super::cte::ResolveBudget::new();
@@ -10966,6 +10985,30 @@ mod tests {
             &lookup,
         )
         .expect_err("column outside CTE's exposed set must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_unreferenced_cte_projecting_column_outside_preceding_ctes_exposed_set() {
+        // Issue #928 レビュー指摘の回帰テスト（Codex P1・Cursor Bugbot Low、
+        // 同一欠陥）: 先行 CTE `x` が `id` のみを公開していても、後続 CTE
+        // `unused` がどこからも参照されない（`compose` を通らない）ことを
+        // 悪用して非公開列を射影・条件に使う文を通してはならない。事前検証
+        // ループは各定義の FROM 解決結果に対して定義自身の射影・`WHERE` も
+        // 検証すること（`check_columns_within_view` 相当）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents), unused AS (SELECT body FROM x) SELECT * FROM documents LIMIT 10",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE projecting a column outside its FROM's exposed set must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents), unused AS (SELECT id FROM x WHERE body = 'y') SELECT * FROM documents LIMIT 10",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE filtering on a column outside its FROM's exposed set must be rejected");
         assert_eq!(err.wire_code(), "22000");
     }
 
