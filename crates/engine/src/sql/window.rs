@@ -908,6 +908,26 @@ fn evaluate_partition(
             }
         }
 
+        // 集計関数（`Count`/`Sum`/`Avg`/`Min`/`Max`）の値は peer グループ内の
+        // 全行で同一（`acc` は peer グループ単位でしか変化しない累積器のため）。
+        // 以前は行ごとに `acc.clone().finish()` を呼んでいたが、peer グループに
+        // つき 1 回だけ計算し `Cell::clone()` で配るよう変更（挙動不変・
+        // レビュー指摘対応。PR #930 最終レビュー指摘 3）。順位関数
+        // （`RowNumber`/`Rank`/`DenseRank`）は行ごとに値が変わるため対象外。
+        let aggregate_cell: Option<Cell> = match item.func {
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => None,
+            WindowFunc::Count
+            | WindowFunc::Sum
+            | WindowFunc::Avg
+            | WindowFunc::Min
+            | WindowFunc::Max => {
+                let acc_ref = acc.clone().ok_or_else(|| {
+                    window_bug("aggregate window function is missing its accumulator")
+                })?;
+                Some(acc_ref.finish()?)
+            }
+        };
+
         let row_number_base = idx;
         for (offset, &row_idx) in indices[idx..peer_end].iter().enumerate() {
             let row_number = row_number_base + offset + 1;
@@ -919,12 +939,9 @@ fn evaluate_partition(
                 | WindowFunc::Sum
                 | WindowFunc::Avg
                 | WindowFunc::Min
-                | WindowFunc::Max => {
-                    let acc_ref = acc.clone().ok_or_else(|| {
-                        window_bug("aggregate window function is missing its accumulator")
-                    })?;
-                    acc_ref.finish()?
-                }
+                | WindowFunc::Max => aggregate_cell.clone().ok_or_else(|| {
+                    window_bug("aggregate window function is missing its finished cell")
+                })?,
             };
             out.insert(materialized[row_idx].id, cell);
         }
