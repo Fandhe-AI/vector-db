@@ -211,20 +211,38 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
 /// 次トークンが `Ident` として字句解析される `AS` の場合はさらに 2 つの読みが
 /// 衝突する（`catalog::validate_identifier` は列名 `as` も許可しているため）。
 /// PR #1098 レビュー対応（codex/review P1・Cursor Bugbot 指摘）:
-/// - `DISTINCT AS <alias>`（`tokens[pos+2]` が `Ident`）: `DISTINCT` 自体が
-///   列名で、`AS <alias>` はその別名（[`Parser::parse_aggregate_select_item`]
-///   が受理する「裸の識別子 ＋ 任意の `AS <alias>`」の形。GROUP BY 対象列と
-///   して使う `SELECT distinct AS d, COUNT(*) FROM t GROUP BY distinct` 等）。
+/// - `DISTINCT AS <alias>`（`tokens[pos+2]` が `Ident` で、かつそれ自身が
+///   `AS` 由来の連鎖ではない）: `DISTINCT` 自体が列名で、`AS <alias>` は
+///   その別名（[`Parser::parse_aggregate_select_item`] が受理する「裸の
+///   識別子 ＋ 任意の `AS <alias>`」の形。GROUP BY 対象列として使う
+///   `SELECT distinct AS d, COUNT(*) FROM t GROUP BY distinct` 等）。
 ///   この場合は列名側（`false`）へ振り分ける。
 /// - `DISTINCT AS`（`tokens[pos+2]` が `Ident` でない＝`FROM`・`,`・`)`・
 ///   文末等）: 列名 `as` の前に置かれた `DISTINCT` 修飾子（
 ///   `COUNT(DISTINCT as)`・`SELECT DISTINCT as FROM t`）。この場合は修飾子側
 ///   （`true`）へ振り分ける。
+/// - `DISTINCT as AS <alias>`（`tokens[pos+2]` も `AS` 由来の `Ident` で、
+///   その次（`tokens[pos+3]`）が `Ident`）: `tokens[pos+1]` の `as` は列名
+///   （`DISTINCT` は修飾子）、`tokens[pos+2]` の `AS` は列名 `as` に付く
+///   別名節の導入（`SELECT DISTINCT as AS alias FROM t`）。列名 `AS` を
+///   単なる別名（上記 1 つ目のケース）と誤読すると、2 段目の `AS <alias>`
+///   が余剰トークンとして構文エラーになり、この形状が拒否されてしまう
+///   （PR #1098 レビュー対応・codex/review P1 再指摘）。この場合は修飾子側
+///   （`true`）へ振り分ける。
 pub(crate) fn is_distinct_modifier(tokens: &[Token], pos: usize) -> bool {
     matches!(tokens.get(pos), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DISTINCT"))
         && match tokens.get(pos + 1) {
             Some(Token::Ident(next)) if next.eq_ignore_ascii_case("AS") => {
-                !matches!(tokens.get(pos + 2), Some(Token::Ident(_)))
+                match tokens.get(pos + 2) {
+                    Some(Token::Ident(next2))
+                        if next2.eq_ignore_ascii_case("AS")
+                            && matches!(tokens.get(pos + 3), Some(Token::Ident(_))) =>
+                    {
+                        true
+                    }
+                    Some(Token::Ident(_)) => false,
+                    _ => true,
+                }
             }
             Some(Token::Ident(_)) => true,
             Some(Token::Punct('*')) => true,
@@ -9300,6 +9318,35 @@ mod tests {
         let lookup = catalog_with(&["documents"]);
         validate_sql("SELECT COUNT(DISTINCT as) FROM documents", &lookup)
             .expect("COUNT(DISTINCT <column named 'as'>) must be accepted");
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_named_as_with_alias() {
+        // PR #1098 レビュー再指摘（codex/review P1）: `is_distinct_modifier` が
+        // `tokens[pos+1]` の `Ident("AS")` を見た時点で `tokens[pos+2]` が
+        // `Ident` なら無条件に「`DISTINCT` 自体が列名」と判定すると、列名 `as`
+        // （`AS` と字句上区別できない）自体に別名を付ける
+        // `SELECT DISTINCT as AS alias FROM t` まで、2 段目の `AS alias` を
+        // 余剰トークンとして `42601` で拒否していた。`tokens[pos+2]` 自体が
+        // さらに `AS` 由来で `tokens[pos+3]` が識別子（真の別名）の場合は
+        // 列名 `as` に対する `DISTINCT` 修飾子と判定することで、この形状が
+        // 受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql("SELECT DISTINCT as AS alias FROM documents", &lookup)
+            .expect("SELECT DISTINCT <column named 'as'> AS <alias> must be accepted");
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(agg.group_by.as_ref().map(|g| g.column.as_str()), Some("as"));
+                match agg.items.as_slice() {
+                    [AggregateSelectItem::GroupKey { column, alias }] => {
+                        assert_eq!(column, "as");
+                        assert_eq!(alias.as_deref(), Some("alias"));
+                    }
+                    other => panic!("expected single GroupKey item, got {other:?}"),
+                }
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
     }
 
     #[test]
