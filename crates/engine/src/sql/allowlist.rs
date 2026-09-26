@@ -203,15 +203,20 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
 /// `DISTINCT` が字句解析上 `Token::Ident` であること（[`catalog::validate_identifier`]
 /// は列名 `distinct` を許可している）に由来する文脈判定（SQL-25 (c)・TASK-209）。
 /// `tokens[pos]` が大文字小文字を無視して `DISTINCT` に一致し、かつ次のトークンが
-/// `Ident` または `'*'` の場合に限り修飾子とみなす。次が `FROM`・`,`・`)`・`(`・
-/// 文末のときは列名として扱う（`SELECT distinct FROM t`・`COUNT(distinct)`・
-/// `WHERE distinct = 'x'` 等の既存の列参照としての解釈を壊さない）。
+/// `Ident`（`AS` を除く）または `'*'` の場合に限り修飾子とみなす。次が `FROM`・
+/// `,`・`)`・`(`・文末・`AS` のときは列名として扱う（`SELECT distinct FROM t`・
+/// `COUNT(distinct)`・`WHERE distinct = 'x'`・`SELECT distinct AS d, COUNT(*)
+/// FROM t GROUP BY distinct`（[`Parser::parse_aggregate_select_item`] が受理
+/// する「裸の識別子 ＋ 任意の `AS <alias>`」という既存の集計 SELECT リスト項目
+/// 形状）等の既存の列参照としての解釈を壊さない。PR #1098 レビュー対応: 次が
+/// `AS` の場合を列名側へ振り分ける）。
 pub(crate) fn is_distinct_modifier(tokens: &[Token], pos: usize) -> bool {
     matches!(tokens.get(pos), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DISTINCT"))
-        && matches!(
-            tokens.get(pos + 1),
-            Some(Token::Ident(_)) | Some(Token::Punct('*'))
-        )
+        && match tokens.get(pos + 1) {
+            Some(Token::Ident(next)) => !next.eq_ignore_ascii_case("AS"),
+            Some(Token::Punct('*')) => true,
+            _ => false,
+        }
 }
 
 /// 1 文の集計項目リストが持てる要素数の上限（TASK-166・SQL-13）。無制限 `Vec` 確保を
@@ -9224,6 +9229,35 @@ mod tests {
         let lookup = catalog_with(&["documents"]);
         validate_sql("SELECT distinct FROM documents LIMIT 5", &lookup)
             .expect("bare column named 'distinct' must remain accepted as a projection");
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_with_alias_in_group_by_projection() {
+        // PR #1098 レビュー対応（codex/review P1）: `is_distinct_modifier` が
+        // 次トークンを任意の `Ident` とみなして `DISTINCT` 修飾子と誤判定すると、
+        // `distinct` という列名に `AS <alias>` を付けた既存の集計 SELECT リスト
+        // 項目（[`Parser::parse_aggregate_select_item`] が受理する「裸の識別子
+        // ＋ 任意の `AS <alias>`」の形。GROUP BY 対象列として使う場合に現れる）
+        // まで `parse_distinct_shape` へ誤って振り分けられ `42601` で拒否されて
+        // いた。次トークンが `AS` の場合は列名側へ振り分けることで、この形状が
+        // 引き続き受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql(
+            "SELECT distinct AS d, COUNT(*) FROM documents GROUP BY distinct",
+            &lookup,
+        )
+        .expect(
+            "column named 'distinct' with AS alias in GROUP BY projection must remain accepted",
+        );
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(
+                    agg.group_by.as_ref().map(|g| g.column.as_str()),
+                    Some("distinct")
+                );
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
     }
 
     #[test]
