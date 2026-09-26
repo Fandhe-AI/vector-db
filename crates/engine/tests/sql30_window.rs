@@ -983,6 +983,28 @@ fn rejects_using_plan_combined_with_window() {
 }
 
 #[test]
+fn rejects_explain_combined_with_window() {
+    // Issue #922（EXPLAIN の対象文拡大）取り込み時の再配線: `EXPLAIN` は
+    // ウィンドウ関数に未対応のまま維持する（`sql::explain` 側に対応する記述が
+    // ないため）。`validate_select_statement` が EXPLAIN・非 EXPLAIN 双方から
+    // 共有されるようになったことで、`Statement::Scan` の `window_items` が
+    // 非空なら EXPLAIN 側で明示的に拒否することを固定する。
+    let path = unique_db_path("window-reject-explain");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_basic(&storage, &ctx);
+    let core = new_core(storage);
+
+    expect_rejected(
+        &core,
+        &ctx,
+        "EXPLAIN SELECT id, ROW_NUMBER() OVER () FROM docs LIMIT 10",
+        "42601",
+    );
+}
+
+#[test]
 fn rejects_sum_of_text_column_type_mismatch() {
     let path = unique_db_path("window-reject-sum-text");
     let _guard = CleanupGuard(path.clone());
