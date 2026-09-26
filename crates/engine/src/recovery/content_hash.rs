@@ -2211,7 +2211,7 @@ mod tests {
             Box::new(Expr::Number("2".to_string())),
         ));
 
-        let h_null = for_delete_where("t", &[null_pred.clone()], &registry).unwrap();
+        let h_null = for_delete_where("t", std::slice::from_ref(&null_pred), &registry).unwrap();
         let h_coalesce = for_delete_where("t", &[coalesce_pred], &registry).unwrap();
         let h_coalesce_reordered =
             for_delete_where("t", &[coalesce_pred_reordered], &registry).unwrap();
