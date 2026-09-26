@@ -141,14 +141,29 @@ impl ExplainShape {
     /// 評価される契約に基づき、`scalar_prefilter: true` 固定で
     /// [`classify_scalar_plan`] を呼ぶ（[`crate::sql::using_plan::
     /// pre_check_bindable`] の既存契約をそのまま引き継ぐ）。
-    pub fn from_filters(metadata_filters: &[MetadataFilter], expr_filters: &[BoundExpr]) -> Self {
+    ///
+    /// `or_filters`（TASK-208・SQL-24、Issue #912）: `WHERE` の `OR` 群。
+    /// **BREAKING CHANGE**: 引数を追加した（OR を持たない既存呼び出しは
+    /// `&[]` を渡す）。`filters_empty` の判定に含めないと、OR だけの
+    /// `WHERE`（例: `WHERE a OR b`）が `USING PLAN` の ANN 適用条件判定
+    /// （`AnnShapeInput::filters_empty`）で「フィルタなし」と誤認され、
+    /// OR 条件が黙って無視される fail-open のバグになる（security.md
+    /// 「不安全な設計」対応）。
+    pub fn from_filters(
+        metadata_filters: &[MetadataFilter],
+        expr_filters: &[BoundExpr],
+        or_filters: &[crate::sql::where_tree::BoundOrGroup],
+    ) -> Self {
         let scalar_plan = classify_scalar_plan(&ScalarShapeInput {
             scalar_prefilter: true,
             metadata_filters,
             expr_filters,
+            or_filters,
         });
         Self {
-            filters_empty: metadata_filters.is_empty() && expr_filters.is_empty(),
+            filters_empty: metadata_filters.is_empty()
+                && expr_filters.is_empty()
+                && or_filters.is_empty(),
             scalar_plan,
         }
     }

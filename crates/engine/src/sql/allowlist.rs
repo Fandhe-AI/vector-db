@@ -114,9 +114,65 @@ fn is_where_predicate_boundary_token(token: Option<&Token>, extra_close_paren: b
                 || w.eq_ignore_ascii_case("RETURNING")
                 || w.eq_ignore_ascii_case("GROUP")
                 || w.eq_ignore_ascii_case("HAVING")
+                || w.eq_ignore_ascii_case("OR")
         }
         _ => false,
     }
+}
+
+/// `WHERE`（・`CHECK` 本体）述語ツリーが持てる葉（`Or` を含まない末端述語）の
+/// 総数上限（TASK-208・SQL-24、Issue #912）。`declarative_filter::
+/// MAX_METADATA_FILTERS` と同じ値を採用する（下流の索引・束縛段が同じ上限を
+/// 前提にできるよう単一の数値基準に揃える）。`push` の**前**に検査し、超過分の
+/// アロケーションを発生させない（security.md「不安全な設計｜無制限リソース確保
+/// （DoS）」対応）。
+const MAX_WHERE_LEAVES: usize = crate::declarative_filter::MAX_METADATA_FILTERS;
+
+/// `WHERE` 述語ツリーの括弧グルーピング（`Or` の入れ子）が持てる最大深さ
+/// （TASK-208・SQL-24、Issue #912）。`sql::udf_call::MAX_EXPR_DEPTH` と同じ実装
+/// 既定値を採用する（式の再帰深さ上限と同じ設計判断）。再帰呼び出しの**前**に
+/// 検査し、深いネスト入力によるスタック消費を定数に抑える。
+const MAX_WHERE_GROUP_DEPTH: usize = MAX_EXPR_DEPTH;
+
+/// `WHERE` の括弧グループ `(...)` の直後のトークンが、値式（`(id + 1) > 5` 等）の
+/// 一部であることを示す比較・算術演算子かどうかを判定する（TASK-208・SQL-24、
+/// Issue #912。[`Parser::parse_where_atom`] の決定的先読みが使う）。それ以外の
+/// トークンは BOOLEAN グループ（`(a OR b)`）として解析する。
+fn is_where_group_operator_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Punct('=')
+            | Token::Punct('<')
+            | Token::Punct('>')
+            | Token::Le
+            | Token::Ge
+            | Token::Punct('+')
+            | Token::Punct('-')
+            | Token::Punct('*')
+            | Token::Punct('/')
+    )
+}
+
+/// `predicates`（`AND` 列）が `visible()` 述語呼び出しを直接含むかどうかを判定する
+/// （RLS-7・Issue #912）。`Or` の腕へは再帰しない（`Or` 分岐内の `visible()` は
+/// 呼び出し元（[`Parser::parse_where_or`]）が分岐生成時点で個別に拒否するため、
+/// ここでは「1 つの AND 列の直下」だけを見れば十分）。
+fn where_predicates_contain_visible(predicates: &[WherePredicate]) -> bool {
+    predicates.iter().any(|predicate| {
+        matches!(
+            predicate,
+            WherePredicate::PredicateCall { name } if name.eq_ignore_ascii_case("VISIBLE")
+        )
+    })
+}
+
+/// `predicates` が [`WherePredicate::Or`] を（直接またはネストした分岐の内部に）
+/// 1 つでも含むかどうかを判定する（TASK-208・Issue #912）。`CHECK (...)` 本体
+/// （[`Parser::parse_check_clause`]）が `OR` を明示的に拒否するために使う。
+fn where_predicates_contain_or(predicates: &[WherePredicate]) -> bool {
+    predicates
+        .iter()
+        .any(|predicate| matches!(predicate, WherePredicate::Or(_)))
 }
 
 /// `token` が `WHERE` 述語の範囲比較演算子（`< > <= >=`）トークンであれば
@@ -875,6 +931,17 @@ pub enum WherePredicate {
         op: CompareOp,
         value: String,
     },
+    /// `OR` で結ぶ分岐の集合（TASK-208・SQL-24、Issue #912）。各分岐は
+    /// `Vec<WherePredicate>`（`AND` で結ぶ述語列。分岐の中にさらに `Or` を
+    /// 含めてよい＝ネスト可）で、`Or` は分岐が 2 個以上あるときのみ生成される
+    /// （分岐 1 個・`AND` だけの括弧グループは呼び出し元が親の列へ平坦化する。
+    /// [`Parser::parse_where_or`] 参照）。この構造により、`AND` だけの文は
+    /// 本 variant 追加前と完全に同じ AST になる（content hash 不変）。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （[`WherePredicate::Expression`]・[`WherePredicate::Prefix`] 追加時と同じ
+    /// 既存の破壊的変更運用）。
+    Or(Vec<Vec<WherePredicate>>),
 }
 
 /// [`WherePredicate::Compare`] の比較演算子（TABLE-13・TASK-199、Issue #891）。
@@ -2191,7 +2258,8 @@ impl<'a> Parser<'a> {
     /// `ILIKE`・`LIKE` の右辺が非リテラルの各形は、この確定判定に一致しないため
     /// 式述語フォールバックへ流れ、通常は `42601` で拒否される。
     fn parse_where(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-        self.parse_where_predicates(false)
+        let mut leaf_count = 0usize;
+        self.parse_where_or(false, 0, &mut leaf_count)
     }
 
     /// `CHECK (<body>)` の本体（TABLE-16・TASK-204、Issue #906）を [`Self::parse_where`]
@@ -2201,120 +2269,59 @@ impl<'a> Parser<'a> {
     /// 落ちずに受理される。呼び出し元（[`Self::parse_check_clause`]）が `(` を消費
     /// した直後に呼び、本体解析の完了後に `expect_punct(')')` で閉じ括弧を消費する。
     fn parse_check_body(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-        self.parse_where_predicates(true)
+        let mut leaf_count = 0usize;
+        self.parse_where_or(true, 0, &mut leaf_count)
     }
 
-    /// [`Self::parse_where`]・[`Self::parse_check_body`] が共有する述語列の解析本体。
-    fn parse_where_predicates(
+    /// [`Self::parse_where`]・[`Self::parse_check_body`] が共有する述語ツリーの
+    /// 文法入口（TASK-208・SQL-24、Issue #912）: `or_expr := and_expr { OR
+    /// and_expr }`。`OR` は [`Keyword`] へ追加せず `Token::Ident` を文脈的に照合する
+    /// （`LIKE` と同じ方式。`or` という列名の等価条件を壊さない）。
+    ///
+    /// 分岐が 1 個だけなら親の列へそのまま平坦化し（`AND` だけの文は本機能追加前と
+    /// 完全に同じ AST になる）、2 個以上なら 1 要素の [`WherePredicate::Or`] として
+    /// 返す。`visible()`（RLS 述語）が 2 分岐以上の `Or` の中に現れる場合は
+    /// `42601` で拒否する（RLS-7: `visible() OR ...` で RLS を解除したように見せる
+    /// 式を作らせない）。
+    fn parse_where_or(
         &mut self,
         extra_close_paren: bool,
+        depth: usize,
+        leaf_count: &mut usize,
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let mut branches = vec![self.parse_where_and(extra_close_paren, depth, leaf_count)?];
+        while matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("OR")) {
+            self.advance();
+            branches.push(self.parse_where_and(extra_close_paren, depth, leaf_count)?);
+        }
+        if branches.len() == 1 {
+            Ok(branches
+                .into_iter()
+                .next()
+                .expect("branches has exactly one element in this arm"))
+        } else {
+            if branches
+                .iter()
+                .any(|branch| where_predicates_contain_visible(branch))
+            {
+                return Err(SqlSurfaceError::unsupported(
+                    "visible() predicate is not allowed inside an OR branch",
+                ));
+            }
+            Ok(vec![WherePredicate::Or(branches)])
+        }
+    }
+
+    /// `and_expr := atom { AND atom }`。
+    fn parse_where_and(
+        &mut self,
+        extra_close_paren: bool,
+        depth: usize,
+        leaf_count: &mut usize,
     ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let mut predicates = Vec::new();
         loop {
-            let start = self.pos;
-            let mut matched_legacy = false;
-            if let Some(Token::Ident(name)) = self.peek().cloned() {
-                if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
-                    && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
-                {
-                    self.advance();
-                    self.advance();
-                    let value = self.expect_string_literal()?;
-                    predicates.push(WherePredicate::Equality {
-                        column: name.clone(),
-                        value,
-                    });
-                    matched_legacy = true;
-                } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
-                    && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
-                {
-                    self.advance();
-                    self.advance();
-                    let pattern = self.expect_string_literal()?;
-                    predicates.push(WherePredicate::Prefix {
-                        column: name.clone(),
-                        pattern,
-                    });
-                    matched_legacy = true;
-                } else if is_allowed_where_predicate_name(&name)
-                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
-                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Punct(')')))
-                {
-                    self.advance();
-                    self.advance();
-                    self.advance();
-                    predicates.push(WherePredicate::PredicateCall { name: name.clone() });
-                    matched_legacy = true;
-                } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
-                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false"))
-                {
-                    // BOOLEAN 列の明示等価条件（`<col> = true|false`。Issue #883・
-                    // D-c）。大小無視は expect_literal の bool リテラルと同じ方針。
-                    self.advance();
-                    self.advance();
-                    let value = match self.advance() {
-                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") => true,
-                        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("false") => false,
-                        // 上の peek 済み条件と同じ判定のため到達しない。
-                        other => {
-                            return Err(SqlSurfaceError::unsupported(format!(
-                                "expected true/false literal, got {other:?}"
-                            )))
-                        }
-                    };
-                    predicates.push(WherePredicate::BoolEquality {
-                        column: name.clone(),
-                        value,
-                    });
-                    matched_legacy = true;
-                } else if let Some(op) = self
-                    .tokens
-                    .get(self.pos + 1)
-                    .and_then(where_compare_op_token)
-                {
-                    if matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_))) {
-                        // `<col> (< | > | <= | >=) '<literal>'`（TABLE-13・
-                        // TASK-199、Issue #891・レーン B）。逆向き
-                        // （`'x' < col`）は本腕では扱わず式フォールバックへ回す
-                        // （既知の制約。詳細は `docs/design/scalar-types-predicates.md`）。
-                        self.advance();
-                        self.advance();
-                        let value = self.expect_string_literal()?;
-                        predicates.push(WherePredicate::Compare {
-                            column: name.clone(),
-                            op,
-                            value,
-                        });
-                        matched_legacy = true;
-                    }
-                }
-                if !matched_legacy
-                    && is_where_predicate_boundary_token(
-                        self.tokens.get(self.pos + 1),
-                        extra_close_paren,
-                    )
-                {
-                    // BOOLEAN 列の裸参照（`WHERE flag`）。直後のトークンが
-                    // WHERE 句の終端（`AND`・`ORDER`・`LIMIT`・`;`・EOF・後続構文
-                    // キーワード）である場合に限り受理する。受理範囲の拡大を
-                    // 最小限にとどめ、それ以外（`flag + 1` 等）は式フォールバックへ
-                    // 回す（Issue #883・D-c）。
-                    self.advance();
-                    predicates.push(WherePredicate::BoolColumn { column: name });
-                    matched_legacy = true;
-                }
-            }
-            if !matched_legacy {
-                self.pos = start;
-                let lhs = self.parse_value_expr(0)?;
-                let op = self.expect_cmp_op()?;
-                let rhs = self.parse_value_expr(0)?;
-                predicates.push(WherePredicate::Expression(Expr::Binary {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                }));
-            }
+            predicates.extend(self.parse_where_atom(extra_close_paren, depth, leaf_count)?);
             if matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
                 self.advance();
                 continue;
@@ -2322,6 +2329,191 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(predicates)
+    }
+
+    /// `atom := '(' or_expr ')' | leaf`。`(` の直後が値式グループ
+    /// （`(id + 1) > 5` 等。既存の式フォールバックへ委譲する）か BOOLEAN
+    /// グループ（`(a OR b)`）かを、後戻りせず決定的な先読みで判定する
+    /// （対応する `)` をトークン走査で探し、直後のトークンが比較・算術演算子
+    /// なら値式、それ以外なら BOOLEAN グループ。ネストした括弧で「グループとして
+    /// 解析し、失敗したら葉として解析し直す」後戻りをすると指数時間になるため
+    /// 禁止する。security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+    fn parse_where_atom(
+        &mut self,
+        extra_close_paren: bool,
+        depth: usize,
+        leaf_count: &mut usize,
+    ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('('))) {
+            let close_idx = self.find_matching_close_paren(self.pos).ok_or_else(|| {
+                SqlSurfaceError::unsupported("unmatched parenthesis in WHERE clause")
+            })?;
+            let is_value_group = matches!(
+                self.tokens.get(close_idx + 1),
+                Some(token) if is_where_group_operator_token(token)
+            );
+            if !is_value_group {
+                let next_depth = depth
+                    .checked_add(1)
+                    .filter(|d| *d <= MAX_WHERE_GROUP_DEPTH)
+                    .ok_or_else(|| {
+                        SqlSurfaceError::payload_too_large(format!(
+                            "WHERE grouping nesting exceeds limit {MAX_WHERE_GROUP_DEPTH}"
+                        ))
+                    })?;
+                self.advance(); // '(' を消費する
+                let inner = self.parse_where_or(true, next_depth, leaf_count)?;
+                self.expect_punct(')')?;
+                return Ok(inner);
+            }
+            // 値式グループ（`(id + 1) > 5` 等）。既存の式フォールバックへ委譲する
+            // （`parse_primary_expr` が '(' expr ')' を再帰的に処理する）。
+        }
+        Ok(vec![self.parse_where_leaf(extra_close_paren, leaf_count)?])
+    }
+
+    /// `(` の位置（`open_idx`）に対応する `)` のトークン位置を探す。`get()` のみを
+    /// 使い（添字アクセス・`unwrap`・`expect` 禁止。coding-rust.md）、対応する
+    /// 閉じ括弧が無い場合は `None`（呼び出し元が `42601` に変換する）。
+    fn find_matching_close_paren(&self, open_idx: usize) -> Option<usize> {
+        let mut depth: u32 = 0;
+        let mut idx = open_idx;
+        loop {
+            match self.tokens.get(idx)? {
+                Token::Punct('(') => depth = depth.checked_add(1)?,
+                Token::Punct(')') => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(idx);
+                    }
+                }
+                _ => {}
+            }
+            idx = idx.checked_add(1)?;
+        }
+    }
+
+    /// 述語ツリーの 1 葉（末端述語）を解析する。既存の等価条件・前方一致条件・
+    /// 述語呼び出し形・BOOLEAN 列条件・範囲比較条件・式フォールバックの判定は
+    /// TASK-208 以前の `parse_where_predicates` と同一のまま維持する（`OR`・括弧の
+    /// 導入で AND だけの文の受理形状・優先順位を変えないため）。葉を返す**前**に
+    /// 総数上限（[`MAX_WHERE_LEAVES`]）を検査し、超過時は `54000`（`push` 前に
+    /// 検査し、超過分のアロケーションを増やさない）。
+    fn parse_where_leaf(
+        &mut self,
+        extra_close_paren: bool,
+        leaf_count: &mut usize,
+    ) -> Result<WherePredicate, SqlSurfaceError> {
+        let start = self.pos;
+        let mut result: Option<WherePredicate> = None;
+        if let Some(Token::Ident(name)) = self.peek().cloned() {
+            if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
+                && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
+            {
+                self.advance();
+                self.advance();
+                let value = self.expect_string_literal()?;
+                result = Some(WherePredicate::Equality {
+                    column: name.clone(),
+                    value,
+                });
+            } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
+                && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
+            {
+                self.advance();
+                self.advance();
+                let pattern = self.expect_string_literal()?;
+                result = Some(WherePredicate::Prefix {
+                    column: name.clone(),
+                    pattern,
+                });
+            } else if is_allowed_where_predicate_name(&name)
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+                && matches!(self.tokens.get(self.pos + 2), Some(Token::Punct(')')))
+            {
+                self.advance();
+                self.advance();
+                self.advance();
+                result = Some(WherePredicate::PredicateCall { name: name.clone() });
+            } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
+                && matches!(self.tokens.get(self.pos + 2), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") || w.eq_ignore_ascii_case("false"))
+            {
+                // BOOLEAN 列の明示等価条件（`<col> = true|false`。Issue #883・
+                // D-c）。大小無視は expect_literal の bool リテラルと同じ方針。
+                self.advance();
+                self.advance();
+                let value = match self.advance() {
+                    Some(Token::Ident(w)) if w.eq_ignore_ascii_case("true") => true,
+                    Some(Token::Ident(w)) if w.eq_ignore_ascii_case("false") => false,
+                    // 上の peek 済み条件と同じ判定のため到達しない。
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "expected true/false literal, got {other:?}"
+                        )))
+                    }
+                };
+                result = Some(WherePredicate::BoolEquality {
+                    column: name.clone(),
+                    value,
+                });
+            } else if let Some(op) = self
+                .tokens
+                .get(self.pos + 1)
+                .and_then(where_compare_op_token)
+            {
+                if matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_))) {
+                    // `<col> (< | > | <= | >=) '<literal>'`（TABLE-13・
+                    // TASK-199、Issue #891・レーン B）。逆向き
+                    // （`'x' < col`）は本腕では扱わず式フォールバックへ回す
+                    // （既知の制約。詳細は `docs/design/scalar-types-predicates.md`）。
+                    self.advance();
+                    self.advance();
+                    let value = self.expect_string_literal()?;
+                    result = Some(WherePredicate::Compare {
+                        column: name.clone(),
+                        op,
+                        value,
+                    });
+                }
+            }
+            if result.is_none()
+                && is_where_predicate_boundary_token(
+                    self.tokens.get(self.pos + 1),
+                    extra_close_paren,
+                )
+            {
+                // BOOLEAN 列の裸参照（`WHERE flag`）。直後のトークンが WHERE 句の
+                // 終端（`AND`・`OR`・`ORDER`・`LIMIT`・`;`・EOF・後続構文キーワード・
+                // グループの `)`）である場合に限り受理する。受理範囲の拡大を最小限に
+                // とどめ、それ以外（`flag + 1` 等）は式フォールバックへ回す
+                // （Issue #883・D-c）。
+                self.advance();
+                result = Some(WherePredicate::BoolColumn { column: name });
+            }
+        }
+        let predicate = match result {
+            Some(predicate) => predicate,
+            None => {
+                self.pos = start;
+                let lhs = self.parse_value_expr(0)?;
+                let op = self.expect_cmp_op()?;
+                let rhs = self.parse_value_expr(0)?;
+                WherePredicate::Expression(Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                })
+            }
+        };
+        *leaf_count = leaf_count.checked_add(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("WHERE predicate leaf count overflow")
+        })?;
+        if *leaf_count > MAX_WHERE_LEAVES {
+            return Err(SqlSurfaceError::payload_too_large(format!(
+                "WHERE predicate leaf count exceeds limit {MAX_WHERE_LEAVES}"
+            )));
+        }
+        Ok(predicate)
     }
 
     /// 比較演算子トークン（`> < >= <= =`）を消費して [`BinOp`] へ写像する
@@ -3392,6 +3584,15 @@ impl<'a> Parser<'a> {
         self.expect_punct('(')?;
         let predicates = self.parse_check_body()?;
         self.expect_punct(')')?;
+        if where_predicates_contain_or(&predicates) {
+            // TASK-208・SQL-24（Issue #912）の対象は読み取り文・書き込み文の
+            // `WHERE` のみで、`CHECK (...)` 本体（TABLE-16）は含まない。
+            // 明示的に `42601` で拒否する（将来解禁する場合に備え、
+            // `render_predicate` 側は既に `Or` を網羅描画できる）。
+            return Err(SqlSurfaceError::unsupported(
+                "OR is not supported inside a CHECK clause",
+            ));
+        }
         Ok((name, predicates))
     }
 
@@ -3897,6 +4098,15 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
                     "view body WHERE predicate form is not supported",
                 ));
             }
+            WherePredicate::Or(_) => {
+                // TASK-208・SQL-24（Issue #912）の対象は SQL-19 の書き込み文と
+                // 読み取り SELECT で、TABLE-18 のビュー定義文本体は含まない
+                // （ビューに対する**外側クエリ**の OR は `sql::view::resolve_from`
+                // 経由で通常どおり受理される。ここで拒否するのは定義文本体のみ）。
+                return Err(SqlSurfaceError::unsupported(
+                    "view body WHERE predicate form is not supported",
+                ));
+            }
         }
     }
     p.expect_end_of_statement()?;
@@ -3973,6 +4183,19 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         // （`render_view_body` は常に [`parse_view_body`] の出力のみを描画する）。
         WherePredicate::PredicateCall { name } => format!("{name}()"),
         WherePredicate::Expression(_) => String::new(),
+        // `parse_view_body` が Or も拒否するため現時点では到達しない。将来の
+        // ビュー本体 OR 解禁（別 Issue）に備え、往復可能な形で網羅描画だけ
+        // 先に用意しておく（TASK-208・Issue #912）。
+        WherePredicate::Or(branches) => {
+            let rendered_branches: Vec<String> = branches
+                .iter()
+                .map(|branch| {
+                    let rendered: Vec<String> = branch.iter().map(render_where_predicate).collect();
+                    rendered.join(" AND ")
+                })
+                .collect();
+            format!("({})", rendered_branches.join(" OR "))
+        }
     }
 }
 
@@ -5924,6 +6147,235 @@ mod tests {
         );
     }
 
+    // --- TASK-208・SQL-24（Issue #912）: `WHERE` の `OR` 結合・括弧グルーピング --
+
+    fn where_predicates_for(sql: &str) -> Vec<WherePredicate> {
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(sql, &lookup)
+            .unwrap_or_else(|e| panic!("expected acceptance, got {e:?} for sql={sql:?}"))
+            .where_predicates()
+            .to_vec()
+    }
+
+    #[test]
+    fn accepts_simple_or() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE lang = 'ja' OR lang = 'en' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(
+            preds,
+            vec![WherePredicate::Or(vec![
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                }],
+                vec![WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "en".to_string(),
+                }],
+            ])]
+        );
+    }
+
+    #[test]
+    fn and_only_parenthesized_group_flattens_to_the_same_ast_as_without_parens() {
+        // `(a AND b)` は AND だけのグループなので、括弧なしと完全に同じ AST になる
+        // （TASK-208 導入前の content hash・既存受理形状との後方互換の核心）。
+        let with_parens = where_predicates_for(
+            "SELECT * FROM documents WHERE (lang = 'ja' AND flag) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        let without_parens = where_predicates_for(
+            "SELECT * FROM documents WHERE lang = 'ja' AND flag ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(with_parens, without_parens);
+    }
+
+    #[test]
+    fn accepts_and_of_two_or_groups() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE (lang = 'ja' OR lang = 'en') AND (flag OR active = true) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(preds.len(), 2, "two independent OR groups ANDed together");
+        assert!(matches!(preds[0], WherePredicate::Or(_)));
+        assert!(matches!(preds[1], WherePredicate::Or(_)));
+    }
+
+    #[test]
+    fn accepts_nested_or_inside_and_branch() {
+        // `a OR (b AND c)`: 分岐 2 の中に AND、`Or` 自体はネストしない。
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE lang = 'ja' OR (flag AND active = true) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        match &preds[..] {
+            [WherePredicate::Or(branches)] => {
+                assert_eq!(branches.len(), 2);
+                assert_eq!(branches[1].len(), 2);
+            }
+            other => panic!("expected a single Or predicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_value_expression_parenthesized_group_unaffected_by_or_support() {
+        // `(id + 1) > 5`: 既存の式フォールバック経路（値式グループ）が壊れて
+        // いないことを固定する（決定的先読みが値式グループと BOOLEAN グループを
+        // 取り違えない）。
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE (id + 1) > 5 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(preds.len(), 1);
+        assert!(matches!(preds[0], WherePredicate::Expression(_)));
+    }
+
+    #[test]
+    fn accepts_doubly_parenthesized_value_expression() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE ((id)) > 5 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(preds.len(), 1);
+        assert!(matches!(preds[0], WherePredicate::Expression(_)));
+    }
+
+    #[test]
+    fn accepts_bare_boolean_column_wrapped_in_parens() {
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE (flag) ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(
+            preds,
+            vec![WherePredicate::BoolColumn {
+                column: "flag".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn accepts_column_named_or_as_equality() {
+        // 列名 `or` はキーワード化しないため、通常の等価条件として通る。
+        let preds = where_predicates_for(
+            "SELECT * FROM documents WHERE or = 'x' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+        assert_eq!(
+            preds,
+            vec![WherePredicate::Equality {
+                column: "or".to_string(),
+                value: "x".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_or() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE lang = 'ja' OR ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_unmatched_open_paren_in_where() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE (lang = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_empty_paren_group_in_where() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE () ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn accepts_where_leaf_count_at_the_limit() {
+        let clause = (0..MAX_WHERE_LEAVES)
+            .map(|i| format!("lang = 'v{i}'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT * FROM documents WHERE {clause} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(&sql, &lookup)
+            .expect("exactly MAX_WHERE_LEAVES leaves must be accepted");
+    }
+
+    #[test]
+    fn rejects_where_leaf_count_over_the_limit() {
+        let clause = (0..=MAX_WHERE_LEAVES)
+            .map(|i| format!("lang = 'v{i}'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT * FROM documents WHERE {clause} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(&sql, &lookup).expect_err("must exceed MAX_WHERE_LEAVES");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn accepts_where_group_depth_at_the_limit() {
+        let mut clause = "flag".to_string();
+        for _ in 0..MAX_WHERE_GROUP_DEPTH {
+            clause = format!("({clause})");
+        }
+        let sql = format!(
+            "SELECT * FROM documents WHERE {clause} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(&sql, &lookup)
+            .expect("exactly MAX_WHERE_GROUP_DEPTH nesting must be accepted");
+    }
+
+    #[test]
+    fn rejects_where_group_depth_over_the_limit() {
+        let mut clause = "flag".to_string();
+        for _ in 0..=MAX_WHERE_GROUP_DEPTH {
+            clause = format!("({clause})");
+        }
+        let sql = format!(
+            "SELECT * FROM documents WHERE {clause} ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(&sql, &lookup).expect_err("must exceed MAX_WHERE_GROUP_DEPTH");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn rejects_visible_inside_or_branch() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE visible() OR lang = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn accepts_visible_inside_and_only_group() {
+        // `visible()` は「2 分岐以上の OR」の中にだけ現れなければ許可される
+        // （AND だけのグループはそもそも `Or` へ包まれない）。
+        where_predicates_for(
+            "SELECT * FROM documents WHERE (visible() AND lang = 'ja') ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_visible_inside_and_branch_of_an_or() {
+        // `(visible() AND x) OR y`: OR 分岐の 1 つが visible() を含むため拒否する。
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE (visible() AND flag) OR lang = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_or_inside_check_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "CREATE TABLE t (kind TEXT, CHECK (kind = 'a' OR kind = 'b'))",
+            &lookup,
+        )
+        .expect_err("OR must remain rejected inside CHECK bodies");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
     // 許可された ORDER BY 関数の引数形状回帰テスト。
     #[test]
     fn rejects_order_by_function_call_with_empty_args() {
@@ -7486,15 +7938,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delete_statement_with_or_combined_predicate() {
+    fn accepts_delete_statement_with_or_combined_predicate() {
+        // TASK-208・SQL-24（Issue #912）: `OR` 結合は述語つき DELETE の許可形状に
+        // 含まれるようになった（従来は `42601` で拒否していた）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_delete_statement(
+        let stmt = validate_delete_statement(
             "DELETE FROM documents WHERE lang = 'ja' OR lang = 'en' USING OPERATION_ID 'op-0001'",
             &lookup,
             LedgerMode::Ledgered,
         )
-        .expect_err("OR-combined predicate is out of the allowed shape");
-        assert_eq!(err.wire_code(), "42601");
+        .expect("OR-combined predicate is now accepted");
+        match stmt {
+            DeleteStatement::Predicate(predicate) => {
+                assert_eq!(
+                    predicate.where_predicates,
+                    vec![WherePredicate::Or(vec![
+                        vec![WherePredicate::Equality {
+                            column: "lang".to_string(),
+                            value: "ja".to_string(),
+                        }],
+                        vec![WherePredicate::Equality {
+                            column: "lang".to_string(),
+                            value: "en".to_string(),
+                        }],
+                    ])]
+                );
+            }
+            other => panic!("expected DeleteStatement::Predicate, got {other:?}"),
+        }
     }
 
     #[test]

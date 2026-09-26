@@ -247,6 +247,25 @@ fn decode_tier_for(schema: &TableSchema, bound: &BoundScan) -> (DecodeTier, Vec<
             needs_embedding = true;
         }
     }
+    // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群が参照する列・embedding も
+    // 同様に反映する。ここを取りこぼすと、OR 群が参照する列が
+    // `scalar_mask`（`scan_scalar_columns_masked`）から漏れて常に `None` に
+    // なり、あるいは embedding 未デコードのまま OR を評価することになり、
+    // OR 条件が誤って評価される（fail-open のバグになりうる。
+    // security.md「不安全な設計」対応）。
+    if !bound.or_filters.is_empty() {
+        has_scalar_reference = true;
+    }
+    for group in &bound.or_filters {
+        group.visit_column_indices(&mut |idx| {
+            if let Some(slot) = scalar_mask.get_mut(idx) {
+                *slot = true;
+            }
+        });
+        if group.references_embedding() {
+            needs_embedding = true;
+        }
+    }
 
     let tier = if needs_embedding {
         DecodeTier::Embedding
@@ -470,6 +489,23 @@ pub(crate) fn execute_scan_with_budget(
                             "WHERE expression did not evaluate to a boolean",
                         ))
                     }
+                }
+            }
+            // TASK-208・SQL-24（Issue #912）: `WHERE` の OR 群を、既存のメタデータ
+            // フィルタ・式述語と同じ SCALAR 段の一部として適用する。
+            for group in &bound.or_filters {
+                let group_embedding: &[f32] = match tier {
+                    DecodeTier::Embedding => embedding_scratch.as_slice(),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                };
+                if !group.matches(
+                    &scanned,
+                    id,
+                    group_embedding,
+                    dim as usize,
+                    &mut expr_scratch,
+                )? {
+                    continue 'rows;
                 }
             }
 
@@ -873,6 +909,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit,
             offset: 0,
         }
@@ -1035,6 +1072,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit,
             offset: 0,
         }
@@ -1100,6 +1138,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: vec![expr],
             expr_filter_programs: vec![program],
+            or_filters: Vec::new(),
             limit: 10,
             offset: 0,
         };
@@ -1147,6 +1186,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit: 10,
             offset: 0,
         };
@@ -1313,6 +1353,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit: 10,
             offset: 0,
         };
@@ -1330,6 +1371,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit: 10,
             offset: 0,
         };
@@ -1353,6 +1395,7 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             limit: 10,
             offset: 0,
         };

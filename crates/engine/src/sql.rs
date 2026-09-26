@@ -152,6 +152,13 @@ pub mod transaction;
 pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod visible_cache;
+pub(crate) mod where_tree;
+
+/// [`scalar_plan::ScalarShapeInput`]（`pub`）の `or_filters` フィールドの要素型を
+/// 外部から名前解決可能にするための再エクスポート（TASK-208・SQL-24、
+/// Issue #912）。`where_tree` モジュール自体は内部実装として `pub(crate)` の
+/// まま維持する（`ScalarIndexCacheStats`・`AnnPlan` 等と同方針）。
+pub use where_tree::BoundOrGroup;
 
 /// `EngineCore::sparse_index_cache_stats`（`pub`）の戻り値型を外部から
 /// 名前解決可能にするための再エクスポート。`sparse_cache` モジュール自体は
