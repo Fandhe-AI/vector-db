@@ -42,6 +42,13 @@ pub struct BoundOrGroup {
 pub struct BoundConjunction {
     pub(crate) metadata_filters: Vec<MetadataFilter>,
     pub(crate) expr_filters: Vec<BoundExpr>,
+    /// `expr_filters` の各要素を [`BoundConjunction::new`]（束縛時）に 1 回だけ
+    /// [`ExprProgram::compile`] した結果。`expr_filters` と同じ添字で対応し、
+    /// `matches` は行ごとに再コンパイルせずここを `zip` して評価する
+    /// （`sql::exec::execute_predicate_delete` 等が持つ `expr_filter_programs`
+    /// と同じ「束縛時コンパイル・行ループでは eval のみ」契約。Issue #912
+    /// codex-review 指摘対応）。
+    expr_programs: Vec<ExprProgram>,
     pub(crate) or_groups: Vec<BoundOrGroup>,
 }
 
@@ -57,10 +64,10 @@ impl BoundOrGroup {
     ///
     /// 索引経路（`sql::scalar_plan`・`sql::scalar_index`）は OR 群を含む述語を
     /// 一律 `ScalarPlan::PlainScan` へ縮退させるため（TASK-208 時点のスコープ、
-    /// Issue #912）、本メソッドは呼び出しのたびに [`ExprProgram::compile`] する
-    /// （行ごとの再コンパイルは行わない——呼び出し元が 1 クエリ実行につき 1 回
-    /// だけ [`BoundOrGroup::matches`] を経由するループを書く契約。性能最適化
-    /// （束縛時コンパイル・索引和集合）は将来の Issue で扱う）。
+    /// Issue #912）、行ループでは本メソッドが行ごとに呼ばれる。式述語の
+    /// [`ExprProgram`] は [`BoundConjunction::new`]（束縛時）に 1 回だけ
+    /// コンパイル済み（`expr_programs`）で、本メソッドはそれを `eval` するだけ
+    /// （索引和集合の実装は将来の Issue で扱う）。
     pub(crate) fn matches(
         &self,
         scanned: &[Option<ScalarRef<'_>>],
@@ -104,9 +111,11 @@ impl BoundConjunction {
         expr_filters: Vec<BoundExpr>,
         or_groups: Vec<BoundOrGroup>,
     ) -> Self {
+        let expr_programs = expr_filters.iter().map(ExprProgram::compile).collect();
         Self {
             metadata_filters,
             expr_filters,
+            expr_programs,
             or_groups,
         }
     }
@@ -122,13 +131,12 @@ impl BoundConjunction {
         if !declarative_filter::matches_all(&self.metadata_filters, scanned) {
             return Ok(false);
         }
-        for expr in &self.expr_filters {
+        for (expr, program) in self.expr_filters.iter().zip(&self.expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
             if references_embedding && dim == 0 {
                 return Ok(false);
             }
             let row_embedding: &[f32] = if references_embedding { embedding } else { &[] };
-            let program = ExprProgram::compile(expr);
             match program.eval(id, row_embedding, scratch)? {
                 ExprValue::Bool(true) => {}
                 ExprValue::Bool(false) => return Ok(false),
