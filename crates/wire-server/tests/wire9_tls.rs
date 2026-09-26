@@ -343,7 +343,19 @@ fn run_simple_query_collect_rows(channel: &mut impl ReadWrite, sql: &str) -> Vec
         match type_byte {
             b'T' => {} // RowDescription
             b'D' => rows.push(parse_data_row(&body)),
-            b'C' | b'I' | b'E' => {}
+            b'C' | b'I' => {}
+            // DataRow を返した後でもクエリが ErrorResponse で終わる経路
+            // （例: LIMIT 節評価中のエラー等）を「成功」として握りつぶさない。
+            // ReadyForQuery まで読み進めて接続を安定状態に戻したうえで
+            // sqlstate 付きで panic させ、握りつぶしを検出可能にする
+            // （codex #969 PR #1090 レビュー指摘）。
+            b'E' => {
+                let sqlstate = extract_sqlstate(&body);
+                drain_to_ready_for_query(channel);
+                panic!(
+                    "unexpected ErrorResponse (sqlstate={sqlstate}) while running simple query: {sql}"
+                );
+            }
             b'Z' => return rows,
             other => panic!("unexpected message type {other:?} while draining result set"),
         }
@@ -1164,17 +1176,45 @@ fn three_clients_run_c1_through_c4_over_tls() {
     }
 
     // 非 vacuous 性: sslmode=disable は --tls-mode require により拒否される。
+    // 実行するクエリは他ケースと同じ実在オラクル（C1 相当。結果 "1"）を
+    // 使う。裸の `SELECT 1` は本エンジンの SQL 表層が受理しないため、万一
+    // TLS 必須ポリシーが機能せず平文接続がそのまま認証・クエリ実行まで
+    // 進んでも「クエリ自体の失敗」で非 0 終了して見えてしまい
+    // （Vacuous rejection。codex/cursor #969 PR #1090 レビュー指摘）、TLS
+    // 拒否の証拠にならない。実在クエリへ差し替えたうえで、(i) 終了コード
+    // 非 0 に加え (ii) 認証前に平文 startup を拒否する `08P01` の実装
+    // エラー文言が stderr に現れること (iii) 行データが一切標準出力に
+    // 出ないことの 3 点を確認し、平文接続が起動応答すら受け取れずに拒否
+    // されたことを積極的に検証する。
     let psql = resolve_tool("PSQL_BIN", "psql");
     let conninfo =
         format!("host=127.0.0.1 port={port} user=alice dbname=irrelevant-db-name sslmode=disable");
     let output = Command::new(&psql)
         .env("PGPASSWORD", "pw-alice")
-        .args(["-d", &conninfo, "-X", "-w", "-At", "-c", "SELECT 1"])
+        .args([
+            "-d",
+            &conninfo,
+            "-X",
+            "-w",
+            "-At",
+            "-c",
+            "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1",
+        ])
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "sslmode=disable must be rejected under --tls-mode require"
+        "sslmode=disable must be rejected under --tls-mode require: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("TLS is required by this server"),
+        "rejection must be the plaintext-startup TLS policy error, not an unrelated query \
+         failure: stderr={stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "no row must be returned when sslmode=disable is rejected before authentication"
     );
 
     drop(server);
@@ -1267,6 +1307,15 @@ fn psql_with_tls12_max_protocol_is_rejected() {
         &key_path,
     );
 
+    // 非 vacuous 性: `SELECT 1` は本エンジンの SQL 表層が受理しない裸の
+    // SELECT のため、万一 `ssl_max_protocol_version=TLSv1.2` の制限が効かず
+    // ハンドシェイクがそのまま成立して認証・クエリ実行まで進んでも
+    // 「クエリ自体の失敗」で非 0 終了して見えてしまい、TLS 拒否の証拠に
+    // ならない（codex/cursor #969 PR #1090 レビュー指摘）。他ケースと同じ
+    // 実在オラクル（C1 相当。結果 "1"）に差し替え、終了コード非 0 に加え
+    // 標準出力に行データが一切出ないことも確認する。ハンドシェイク自体が
+    // 成立しなければクエリは送信すらされないため、この 2 点が揃って初めて
+    // 「TLS 1.2 上限が実際にネゴシエーションを拒否した」ことの証拠になる。
     let psql = resolve_tool("PSQL_BIN", "psql");
     let conninfo = format!(
         "host=127.0.0.1 port={port} user=alice dbname=irrelevant-db-name \
@@ -1274,12 +1323,26 @@ fn psql_with_tls12_max_protocol_is_rejected() {
     );
     let output = Command::new(&psql)
         .env("PGPASSWORD", "pw-alice")
-        .args(["-d", &conninfo, "-X", "-w", "-At", "-c", "SELECT 1"])
+        .args([
+            "-d",
+            &conninfo,
+            "-X",
+            "-w",
+            "-At",
+            "-c",
+            "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1",
+        ])
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"));
     assert!(
         !output.status.success(),
-        "psql with ssl_max_protocol_version=TLSv1.2 must fail against a TLS 1.3-only server"
+        "psql with ssl_max_protocol_version=TLSv1.2 must fail against a TLS 1.3-only server: \
+         stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "no row must be returned when the TLS 1.2 cap is rejected before the query runs"
     );
 
     // 直後に同じサーバーへ通常の sslmode=require で接続でき、プロセスが
