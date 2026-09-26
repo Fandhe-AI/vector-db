@@ -203,12 +203,13 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
             // 「公開 API・エラー契約の互換性（P1）」）。`allow` では
             // [`tls_transport::reject_or_close_over_limit`] が拒否ワーカー
             // （`RejectWorkerLimiter` で有界化済み）の中で先頭バイトを
-            // 期限付きで判定し、平文と判定した場合のみ拒否応答を返す
-            // （TLS レコードと判定した場合はハンドシェイクをせず無応答
-            // クローズする。遅いクライアントでワーカーが専有時間を超えて
-            // ふさがるのを避けるため `REJECT_TLS_PROBE_TIMEOUT` で読み取りを
-            // 打ち切る）。TLS 未構成時は既存の 503／`53300` 経路とバイト
-            // 単位で同一。
+            // 期限付きで判定し、平文なら既存の拒否応答をそのまま返す。
+            // TLS レコードと判定した場合も（codex-review 再指摘・同 Issue
+            // 是正）ハンドシェイクを完了したうえで同じ 503 応答を TLS 上で
+            // 返す（`RejectWorkerLimiter` の 1 枠＝1 スレッドの中で完結する
+            // ため、遅いクライアントでも `HANDSHAKE_READ_TIMEOUT` の絶対
+            // 期限がそのままこのワーカーの専有時間の上限になる）。TLS
+            // 未構成時は既存の 503／`53300` 経路とバイト単位で同一。
             // `TlsMode` は `#[non_exhaustive]`（下流クレート向け）だが、本
             // クレート内では通常どおり網羅性検査が効く。将来 variant を
             // 追加する場合はここが確実にコンパイルエラーになり、`allow`
@@ -222,7 +223,13 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
                 }
                 Some((_, TlsMode::Allow)) | None => {}
             }
-            let is_tls = tls.is_some();
+            // ここに到達する時点で `tls` は `None` か `Some((_, TlsMode::
+            // Allow))` のいずれかのみ（`Require` は直前の分岐で `continue`
+            // 済み）。TLS 構成があれば `TlsServerConfig` を拒否ワーカー
+            // スレッドへ複製する（`reject_or_close_over_limit` が TLS
+            // レコード判定時にハンドシェイクを完了して 503 を返すために
+            // 必要。Issue #968 codex-review 再指摘の是正）。
+            let tls_config_for_reject = tls.as_ref().map(|(config, _)| Arc::clone(config));
             match reject_limiter.try_acquire() {
                 Some(reject_permit) => {
                     // `std::thread::spawn` はスレッド生成失敗時に panic し、
@@ -230,8 +237,8 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
                     // `Builder::spawn` を使い、失敗時はログのみで継続する。
                     if let Err(e) = std::thread::Builder::new().spawn(move || {
                         let _reject_permit = reject_permit;
-                        if is_tls {
-                            tls_transport::reject_or_close_over_limit(stream);
+                        if let Some(config) = tls_config_for_reject {
+                            tls_transport::reject_or_close_over_limit(stream, config);
                         } else {
                             conn::reject_too_many_connections(stream);
                         }

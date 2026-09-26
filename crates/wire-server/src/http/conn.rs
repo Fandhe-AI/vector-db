@@ -105,8 +105,7 @@
 //! （`crate::simple_query::execute_and_respond` が SQL wire 側で使うのと
 //! 同じ機構。詳細は [`build_outcome`] 内のコメント参照）。
 
-use std::io::Write;
-use std::net::{Shutdown, TcpStream};
+use std::net::TcpStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -887,17 +886,44 @@ fn protocol_violation_bytes(reason: &str) -> Vec<u8> {
 /// 同時接続数の枠を確保できなかった接続へ HTTP 503 ＋ JSON 本文
 /// （`wire_code`＝`53300`）を書き込み、接続を閉じる。
 ///
-/// `crate::limits::reject_too_many_connections`（SQL 表層）の HTTP 版。書き込み
-/// タイムアウトは同じ [`REJECT_WRITE_TIMEOUT`] を使う（拒否応答自体が
+/// `crate::limits::reject_too_many_connections`（SQL 表層）の HTTP 版。
+/// [`reject_too_many_connections_on`] へ委譲する薄いラッパー（`TcpStream`
+/// 直呼び出しの既存呼び出し元向け）。
+pub(crate) fn reject_too_many_connections(mut stream: TcpStream) {
+    reject_too_many_connections_on(&mut stream);
+}
+
+/// [`reject_too_many_connections`] の本体（`S: WireStream` で一般化）。平文
+/// `TcpStream` に加え、`crate::http::tls_transport::reject_or_close_over_limit`
+/// が TLS ハンドシェイク成功後の `TlsStream` へも同じ 503／`53300` 応答を
+/// 送るために呼ぶ（Issue #968 codex-review P1 是正: `--tls-mode allow` の
+/// 上限超過時、先頭バイトが TLS レコードでもハンドシェイクを完了してから
+/// 拒否応答を返す経路が必要という指摘）。
+///
+/// 書き込みタイムアウトは [`REJECT_WRITE_TIMEOUT`] を使う（拒否応答自体が
 /// accept ループのブロッキング点にならないよう小さく設定する契約を共有）。
 /// 書き込み失敗は無視する（拒否経路で新たなブロッキング点・panic を作らない
-/// ため。クライアントが応答を受け取れなくても、最終的に `shutdown` で接続は
-/// 閉じる）。
-pub(crate) fn reject_too_many_connections(mut stream: TcpStream) {
+/// ため）。
+///
+/// 応答を `write_all` した直後に `shutdown(Both)` で即座に閉じるのではなく、
+/// [`respond_and_close`] と同じ「書き込み → 有界 lingering close（
+/// [`drain_and_close`]） → drop」の形にする（codex-review・Cursor Bugbot
+/// 指摘・Issue #968 是正）。呼び出し元（`tls_transport::serve_connection`／
+/// `reject_or_close_over_limit`）は応答判定のために先頭 1 バイトを `peek`
+/// 済みであり、そのバイト（および後続で既にパイプライン済みの要求バイト
+/// 列）が未読のまま `shutdown(Both)` すると、OS が未読データありの
+/// クローズを検知して TCP RST を送りうる（PoC-15 と同じ理屈）。RST を受けた
+/// クライアントは既に送出済みの 503 応答を読めないまま接続断と誤認する
+/// ため、`drain_and_close` で残データを有界に読み捨ててから戻る。
+pub(crate) fn reject_too_many_connections_on<S: WireStream>(stream: &mut S) {
     let _ = stream.set_write_timeout(Some(REJECT_WRITE_TIMEOUT));
     let response = encode_reject_response();
     let _ = stream.write_all(&response);
-    let _ = stream.shutdown(Shutdown::Both);
+    drain_and_close(
+        stream,
+        LINGER_DRAIN_TIMEOUT,
+        HTTP_LINGER_DRAIN_FALLBACK_BUDGET,
+    );
 }
 
 /// 同時接続数上限超過時の HTTP 応答バイト列を組み立てる純関数。
@@ -927,8 +953,8 @@ fn encode_reject_response() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
     use std::time::Duration;
 
     fn loopback_pair() -> (TcpStream, TcpStream) {
@@ -1512,6 +1538,47 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set read timeout");
         let received = read_all(&mut client);
+        let text = String::from_utf8_lossy(&received);
+        assert!(text.starts_with("HTTP/1.1 503 "), "got: {text:?}");
+        assert!(text.contains("53300"), "got: {text:?}");
+    }
+
+    /// `reject_too_many_connections`（`tls_transport::serve_connection`／
+    /// `reject_or_close_over_limit` の呼び出し元は先頭バイトを `peek` した
+    /// だけで、要求本体は未読のままこの関数へ渡す契約）は、クライアントが
+    /// 既に要求バイト列を送信済み（サーバー未読）の状態でも 503 応答を
+    /// 完全に読める形で返すこと（Issue #968 codex-review・Cursor Bugbot
+    /// 指摘の回帰防止: `write_all` 直後に未読データを残したまま
+    /// `shutdown(Both)` すると OS が TCP RST を送りうり、クライアントが
+    /// 送出済みの 503 応答を読めなくなる）。
+    #[test]
+    fn reject_too_many_connections_delivers_response_despite_unread_pipelined_request() {
+        let (server, mut client) = loopback_pair();
+
+        // 要求バイト列を送信するが、サーバー側は一切読まない
+        // （`reject_too_many_connections` は要求を解釈しない契約）。
+        client
+            .write_all(b"POST /v1/session HTTP/1.1\r\nContent-Length: 4\r\n\r\nabcd")
+            .expect("write pipelined request");
+
+        std::thread::spawn(move || {
+            reject_too_many_connections(server);
+        });
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e) => panic!(
+                    "client must read the full 503 response without a connection reset, got: {e:?}"
+                ),
+            }
+        }
         let text = String::from_utf8_lossy(&received);
         assert!(text.starts_with("HTTP/1.1 503 "), "got: {text:?}");
         assert!(text.contains("53300"), "got: {text:?}");

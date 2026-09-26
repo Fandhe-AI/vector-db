@@ -33,6 +33,12 @@
 //! - TLS-7: TLS レコード 1 個分の暗号文を 1 バイトずつ送り続けても、要求
 //!   読み取りの絶対期限が本番値の近傍で効くこと（`http::deadline_stream`
 //!   の H8 対応の回帰）
+//! - TLS-8: `--tls-mode allow` 下で同時接続数上限を超過した接続の先頭
+//!   バイトが TLS レコードでも、ハンドシェイクを完了したうえで既存の
+//!   503／`53300` 応答が TLS 上で返ること（codex-review 再指摘・Issue
+//!   #968 是正。旧実装はハンドシェイクをせず無応答クローズしており、
+//!   `allow` の下でも HTTPS クライアントだけがこのエラー契約から
+//!   取り残されていた）
 
 #[path = "http_common/mod.rs"]
 mod http_common;
@@ -612,6 +618,60 @@ fn require_mode_closes_over_capacity_connection_without_response() {
             panic!("expected no HTTP response over capacity when tls-mode=require, got {other:?}")
         }
     }
+
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// TLS-8: `--tls-mode allow` の下で同時接続数上限を超過した接続の先頭
+/// バイトが TLS レコードでも、ハンドシェイクを完了したうえで既存の
+/// 503／`wire_code` 53300 応答が TLS 上で返ること（codex-review 再指摘・
+/// Issue #968 是正。`reject_or_close_over_limit` が旧実装のまま TLS
+/// レコード判定時にハンドシェイクをせず無応答クローズしていると、
+/// `connect_tls`（クライアント側ハンドシェイク駆動）がハンドシェイク
+/// 完了を待てず失敗し、本テストは fail する）。
+#[test]
+fn allow_mode_returns_503_over_tls_for_tls_over_capacity() {
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "wire-server-http10-tls-r8-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let users_path = fixture_dir.join("users.txt");
+    write_user_store_with_alice(&users_path);
+
+    let limiter = ConnectionLimiter::new(1);
+    let addr = spawn_router_listener_tls_with_limiter(&users_path, TlsMode::Allow, limiter.clone());
+
+    // 1 本目: 枠を保持し続ける（TLS 接続を確立し、何も送らない）。
+    let _holder = connect_tls(addr);
+    wait_for_permit_active(&limiter);
+
+    // 2 本目（TLS）: 上限超過だが先頭バイトが TLS レコードのため、
+    // `reject_or_close_over_limit` がハンドシェイクを完了してから 503 を
+    // 返すはず（`connect_tls` 自体がクライアント側ハンドシェイクを完走
+    // させるため、ここまで到達した時点でサーバー側ハンドシェイクの完了は
+    // 既に確認済み）。
+    let mut channel = connect_tls(addr);
+    let request = build_request(
+        "/v1/session",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", "0"),
+        ],
+        b"",
+    );
+    channel.write_all(&request).expect("write request over tls");
+    let response = read_one_response(&mut channel);
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 503 "),
+        "allow mode must return 503 over TLS for TLS-record over capacity, got: {text:?}"
+    );
+    assert!(text.contains("53300"), "got: {text:?}");
 
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }

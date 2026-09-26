@@ -32,11 +32,15 @@
 //!   ハンドシェイクをしていないクライアントに平文 503 を送ると `require`
 //!   下での平文送出になり `--tls-mode require` の意図に反するため）。
 //!   `allow` は [`reject_or_close_over_limit`] が `RejectWorkerLimiter` の
-//!   枠の中で先頭バイトを期限付きで `peek` し、平文と判定した場合のみ
-//!   既存の 503／`53300` 応答（[`conn::reject_too_many_connections`]）を
-//!   維持する（TLS レコードと判定した場合はハンドシェイクをせず無応答
-//!   クローズする）。呼び出し元（`listener::accept_loop_with_handler`）が
-//!   `tls` の有無と `--tls-mode` で分岐する。
+//!   枠の中で先頭バイトを期限付きで `peek` し、平文なら既存の 503／
+//!   `53300` 応答（[`conn::reject_too_many_connections`]）を返す。TLS
+//!   レコードと判定した場合も（codex-review 再指摘・同 Issue 是正）
+//!   ハンドシェイクを完了したうえで同じ応答を TLS 上で返す（拒否応答が
+//!   `write_all` 直後の `shutdown(Both)` で未読データを残したまま閉じて
+//!   TCP RST になり応答を読めなくなる回帰は、[`conn::
+//!   reject_too_many_connections_on`] 側の有界 lingering close で対処
+//!   済み）。呼び出し元（`listener::accept_loop_with_handler`）が `tls`
+//!   の有無と `--tls-mode` で分岐する。
 //! - H5: `--tls-scram-channel-binding enable` × nosql は起動を拒否せず
 //!   no-op として受理する（`main.rs` 側の判断。NoSQL 表層は SASL 往復を
 //!   持たないため実際には提示されない）。本モジュールに直接の関与は無い。
@@ -150,17 +154,26 @@ pub(crate) fn serve_connection<H: RequestHandler>(
 /// 既存の 503／`wire_code` 53300 応答（[`conn::reject_too_many_connections`]）
 /// が返らなくなり、AGENTS.md の「公開 API・エラー契約の互換性（P1）」に反する
 /// 退行になる。`allow` は平文接続を受理するモードのため、上限超過時も
-/// 平文なら既存の拒否応答を維持し、TLS レコードと判定した場合のみ
-/// （ハンドシェイクをせずに）無応答クローズする（`require` は
-/// `listener::accept_loop_with_handler` 側で本関数を経由せず常に無応答
-/// クローズする。TLS のみ受理するモードで平文へ応答を返す理由が無いため）。
+/// 平文なら既存の拒否応答を維持する（`require` は `listener::
+/// accept_loop_with_handler` 側で本関数を経由せず常に無応答クローズする。
+/// TLS のみ受理するモードで平文へ応答を返す理由が無いため）。
+///
+/// 先頭バイトが TLS レコードの場合も、[`crate::tls::server_handshake::
+/// perform_server_handshake`] でハンドシェイクを完了したうえで同じ 503／
+/// `53300` 応答を TLS 上で返す（codex-review 再指摘・Issue #968 是正: 旧
+/// 実装はハンドシェイクをせず無応答クローズしており、`allow` の下でも
+/// HTTPS クライアントだけがこのエラー契約から取り残されていた）。
+/// `RejectWorkerLimiter` は本関数の呼び出し 1 回＝1 スレッドで既に有界化
+/// 済みのため、ハンドシェイク自体の絶対期限（`HANDSHAKE_READ_TIMEOUT`。
+/// `serve_tls_connection` と同じ）がそのままこの拒否ワーカーの専有時間の
+/// 上限になる。
 ///
 /// 先頭 1 バイトの `peek` には [`crate::limits::REJECT_TLS_PROBE_TIMEOUT`]
 /// を読み取りタイムアウトとして適用する（`RejectWorkerLimiter` の枠を
 /// 無期限に占有しない。`peek` が `Ok(0)`／`Err`（タイムアウト超過含む）の
 /// 場合は TLS ハンドシェイクをしていないクライアントへ応答を書く根拠が
 /// 無いため、`serve_connection` と同じく応答を書かずに閉じる）。
-pub(crate) fn reject_or_close_over_limit(stream: TcpStream) {
+pub(crate) fn reject_or_close_over_limit(stream: TcpStream, config: Arc<TlsServerConfig>) {
     if stream
         .set_read_timeout(Some(crate::limits::REJECT_TLS_PROBE_TIMEOUT))
         .is_err()
@@ -184,14 +197,25 @@ pub(crate) fn reject_or_close_over_limit(stream: TcpStream) {
             }
             Some(byte) => match classify_first_byte(*byte) {
                 FirstByte::Plain => conn::reject_too_many_connections(stream),
-                FirstByte::Tls => {
-                    // TLS ハンドシェイクはしない（`RejectWorkerLimiter` の
-                    // 有界性を維持するため。H4 と同じ判断）。
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                }
+                FirstByte::Tls => reject_over_limit_after_tls_handshake(stream, config),
             },
         },
     }
+}
+
+/// [`reject_or_close_over_limit`] の TLS レコード判定後の分岐。ハンドシェイク
+/// を完了できた場合のみ [`TlsStream`] 上へ既存の 503／`53300` 応答
+/// （[`conn::reject_too_many_connections_on`]）を書く。ハンドシェイク失敗時は
+/// 応答を書かない（alert の送出・切断は driver 側が既に行っている契約。
+/// `serve_tls_connection` と同じ）。
+fn reject_over_limit_after_tls_handshake(mut stream: TcpStream, config: Arc<TlsServerConfig>) {
+    let session = match crate::tls::server_handshake::perform_server_handshake(&mut stream, config)
+    {
+        Ok(session) => session,
+        Err(_e) => return,
+    };
+    let mut tls_stream = TlsStream::new(stream, session);
+    conn::reject_too_many_connections_on(&mut tls_stream);
 }
 
 /// TLS ハンドシェイクを実行し、成功したら [`TlsStream`] 上で
