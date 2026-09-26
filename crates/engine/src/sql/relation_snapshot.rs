@@ -172,9 +172,14 @@ pub type RelationSnapshotCache = GenerationKeyedCache<RelationSnapshot>;
 /// 2. 行を走査する前に、`read_txn` から全テーブルの世代を
 ///    [`TableGenerationKey::capture`] で確定させる（キャッシュヒット判定・
 ///    整合性判定の唯一の世代源泉）
-/// 3. テーブルごとにキャッシュ（[`RelationSnapshotCache`]）を単一テーブル鍵で
+/// 3. 各 `relations` 要素について `table_ref.table()`（世代キーの元）と
+///    `schema.name`（実走査対象。`catalog::user_rows_table_name` の解決元）の
+///    一致を検証する（不一致は `Internal` で fail-closed。誤った組が渡されると
+///    別テーブルの内容が誤ったテーブルの世代キーでキャッシュされ RLS 可視集合が
+///    汚染されるため）
+/// 4. テーブルごとにキャッシュ（[`RelationSnapshotCache`]）を単一テーブル鍵で
 ///    引く。ミスしたらそのテーブルだけ走査して構築し `insert` する
-/// 4. 自己結合（同じテーブル名を複数回参照）は同じ `Arc` を共有する
+/// 5. 自己結合（同じテーブル名を複数回参照）は同じ `Arc` を共有する
 ///
 /// `ctx` はサーバー側で導出済みのものだけを受け取り、クライアント指定の値を
 /// 受け取る引数は設けない（呼び出し元の責務）。
@@ -209,6 +214,18 @@ pub fn resolve_relation_snapshots(
         if let Some((_, existing)) = resolved.iter().find(|(name, _)| name == table_ref.table()) {
             snapshots.push(Arc::clone(existing));
             continue;
+        }
+
+        // 呼び出し元が `(TableRef, &TableSchema)` を取り違えて渡すと、世代キー
+        // （`table_ref.table()` 由来）と実走査対象（`schema.name` 由来の行テーブル）
+        // が食い違ったまま構築・キャッシュ登録されてしまう（誤ったテーブルの
+        // `RelationSnapshot` が別テーブルの世代キーでキャッシュされ、以降の書き込みが
+        // 無効化しない stale キャッシュとなり RLS 可視集合を汚染する）。fail-closed に
+        // プログラム的検証を行う（`.claude/rules/security.md` テナント境界・fail-closed）。
+        if table_ref.table() != schema.name {
+            return Err(SqlSurfaceError::Internal {
+                detail: "relation snapshot table reference mismatch".to_string(),
+            });
         }
 
         let single_key = TableGenerationKey::capture(read_txn, ctx.clone(), &[table_ref.table()])

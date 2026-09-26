@@ -179,6 +179,41 @@ fn table_without_any_row_yields_empty_snapshot() {
     assert!(result.snapshots()[0].visible_rows().is_empty());
 }
 
+/// `TableRef` と `TableSchema` の取り違え（`table_ref.table()` と `schema.name`
+/// の不一致）は fail-closed に拒否する。誤った組を素通しすると、誤ったテーブルの
+/// 内容が別テーブルの世代キーでキャッシュされ RLS 可視集合が汚染されうる
+/// （security.md P0 テナント境界・fail-closed）。
+#[test]
+fn table_ref_schema_mismatch_is_rejected() {
+    let path = unique_db_path("multi-relation-rls-mismatch");
+    let _cleanup = CleanupGuard(path.clone());
+    let (docs, notes) = {
+        let storage = Storage::open(&path).expect("open storage");
+        let docs = schema("docs");
+        let notes = schema("notes");
+        storage.create_table(&docs).expect("create docs");
+        storage.create_table(&notes).expect("create notes");
+        (docs, notes)
+    };
+
+    let db = redb::Database::open(&path).expect("reopen raw database");
+    let read_txn = db.begin_read().expect("begin_read");
+    let ctx = PolicyContext::new("tenant-a").expect("valid ctx");
+    // "docs" を参照しているのに、渡すスキーマは "notes" のもの（取り違え）。
+    let relations = vec![(TableRef::new("docs"), &notes)];
+    match resolve_relation_snapshots(&read_txn, &ctx, &relations, None) {
+        Err(engine::sql::allowlist::SqlSurfaceError::Internal { .. }) => {}
+        Err(other) => {
+            panic!("expected Internal error, got a different SqlSurfaceError variant: {other:?}")
+        }
+        Ok(_) => panic!("mismatched table_ref/schema must be rejected"),
+    }
+
+    // 逆方向（"notes" を参照しているのに "docs" のスキーマ）も拒否されること。
+    let relations = vec![(TableRef::new("notes"), &docs)];
+    assert!(resolve_relation_snapshots(&read_txn, &ctx, &relations, None).is_err());
+}
+
 /// 参照数の上限（`MAX_TABLE_REFS`）超過はアロケーション前に拒否する。
 #[test]
 fn too_many_relations_is_rejected() {
