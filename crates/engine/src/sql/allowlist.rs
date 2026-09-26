@@ -37,6 +37,12 @@ const MAX_INSERT_COLUMNS: usize = 256;
 /// `.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」対応）。
 pub(crate) const MAX_INDEX_DDL_COLUMNS: usize = 256;
 
+/// サブクエリ（`IN (SELECT ...)`・`EXISTS (SELECT ...)`）のネスト深さ上限
+/// （Issue #927・SQL-29 (a)・TASK-213。実装既定値）。`Parser::subquery_ctx` の
+/// 深さがこれを超える箇所を構文解析段で `54000` へ落とし、`sql::subquery` の
+/// 解決（再帰的な内側実行）がスタック・実行コストとも定数段に収まるようにする。
+pub(crate) const MAX_SUBQUERY_DEPTH: usize = 4;
+
 /// `CREATE TABLE`（SQL-23・TASK-85、Issue #899）の列リストが持てる列数の上限。
 /// `catalog::MAX_COLUMN_COUNT` と同値を採用する（`MAX_INSERT_COLUMNS` と同じ
 /// 「無制限 `Vec` 確保を避ける」設計方針。列を `Vec` へ push する**前**に判定し、
@@ -942,6 +948,42 @@ pub enum WherePredicate {
     /// （[`WherePredicate::Expression`]・[`WherePredicate::Prefix`] 追加時と同じ
     /// 既存の破壊的変更運用）。
     Or(Vec<Vec<WherePredicate>>),
+    /// `<列> IN (SELECT ...)`（Issue #927・SQL-29 (a)・TASK-213）。内側の生
+    /// トークン列（開き括弧の次〜対応する閉じ括弧の前）のみを保持し、構文解析
+    /// 段では一切評価・再帰解析しない。`sql::subquery::resolve_where_predicates`
+    /// が束縛（`sql::parser::bind_where_predicates`）の**前**に、外側と同じ
+    /// `PolicyContext`（RLS 暗黙適用）で内側を実行し、具体的な
+    /// [`WherePredicate::Or`]／[`WherePredicate::Equality`] 等へ書き換える
+    /// （第 2 の評価器を作らない設計。CLAUDE.md「委譲方針」）。`depth` は
+    /// このサブクエリ自身のネスト深さ（最外側 SELECT が 1）で、
+    /// [`MAX_SUBQUERY_DEPTH`] を超える構文は構文解析段で `54000` になるため、
+    /// ここへ到達する時点で既に上限内であることが不変条件。
+    ///
+    /// 構文的に受理するのは [`Parser::subquery_ctx`] が `Some` の文脈（読み取り
+    /// SELECT の WHERE。`sql::allowlist::validate_sql_tokens` のトップレベル
+    /// 呼び出しのみが設定する）のみで、CHECK 本体・`CREATE VIEW` 本体・述語形
+    /// `UPDATE`/`DELETE`・カーソル・`COPY`・`EXPLAIN` からは構文解析段で `42601`
+    /// になる。`NOT IN` は対象外（`42601`。#913 の `NOT` 対応後の課題）。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （既存の破壊的変更運用を踏襲）。
+    InSubquery {
+        column: String,
+        inner_tokens: Vec<Token>,
+        depth: usize,
+    },
+    /// `EXISTS (SELECT ...)`（Issue #927・SQL-29 (a)・TASK-213）。意味論・解決
+    /// 契約は [`WherePredicate::InSubquery`] と同じ（`sql::subquery` が束縛前に
+    /// 解決する）。`EXISTS` は [`Keyword`] へ追加せず、`LIKE`・`OR` と同じ
+    /// 「`Token::Ident` をパーサー位置でのみ文脈照合」方式にする（`exists` という
+    /// 列名を壊さない）。`NOT EXISTS` は対象外（`42601`。同上）。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （既存の破壊的変更運用を踏襲）。
+    Exists {
+        inner_tokens: Vec<Token>,
+        depth: usize,
+    },
 }
 
 /// [`WherePredicate::Compare`] の比較演算子（TABLE-13・TASK-199、Issue #891）。
@@ -1898,6 +1940,17 @@ struct Parser<'a> {
     /// スタック消費も定数に抑える（security.md「不安全な設計｜無制限リソース確保
     /// （DoS）」対応。1 文（`Parser` 1 インスタンス）につき共有）。
     expr_node_budget: usize,
+    /// サブクエリ（`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を構文的に受理して
+    /// よい文脈かどうかのゲート（Issue #927・SQL-29 (a)・TASK-213）。`None`
+    /// （既定）は不許可＝`parse_where_leaf` が検出時点で `42601` を返す
+    /// （CHECK 本体・`CREATE VIEW` 本体・カーソル・`COPY`・述語形
+    /// `UPDATE`/`DELETE` はいずれも `Parser::new` の既定のまま呼ぶため、
+    /// 個別に拒否腕を書かなくても fail-closed になる）。`Some(depth)` は
+    /// 現在の入れ子深さ（最外側は 0）で、[`MAX_SUBQUERY_DEPTH`] 超過を
+    /// 検出したら `54000` にする。`sql::allowlist::validate_sql_tokens` の
+    /// トップレベル呼び出し（`parse_select_shape`/`parse_aggregate_shape` の
+    /// 呼び出し元）だけが `Some(0)` を設定する。
+    subquery_ctx: Option<usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -1906,7 +1959,35 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
+            subquery_ctx: None,
         }
+    }
+
+    /// サブクエリを許可する文脈で構築する（Issue #927・TASK-213）。`depth` は
+    /// 現在位置の入れ子深さ（`sql::subquery` が内側 SELECT を再検証する際に
+    /// 1 つ進めて渡す）。
+    fn with_subquery_ctx(mut self, depth: usize) -> Self {
+        self.subquery_ctx = Some(depth);
+        self
+    }
+
+    /// `IN (SELECT ...)`／`EXISTS (SELECT ...)` を検出した位置で呼ぶ。現在の
+    /// 文脈が許可されていなければ `42601`、許可されていても深さ上限
+    /// （[`MAX_SUBQUERY_DEPTH`]）を超えるなら `54000`。返り値は新設する
+    /// [`WherePredicate::InSubquery`]/[`WherePredicate::Exists`] へ格納する
+    /// `depth`（このサブクエリ自身の深さ＝現在の文脈深さ＋1）。
+    fn require_subquery_depth(&self) -> Result<usize, SqlSurfaceError> {
+        let ctx_depth = self.subquery_ctx.ok_or_else(|| {
+            SqlSurfaceError::unsupported("subquery is not allowed in this context")
+        })?;
+        let next_depth = ctx_depth
+            .checked_add(1)
+            .filter(|d| *d <= MAX_SUBQUERY_DEPTH);
+        next_depth.ok_or_else(|| {
+            SqlSurfaceError::payload_too_large(format!(
+                "subquery nesting exceeds limit {MAX_SUBQUERY_DEPTH}"
+            ))
+        })
     }
 
     /// 式ノードを 1 つ生成する直前に呼び、予算を消費する。予算枯渇時は
@@ -2407,7 +2488,62 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         let mut result: Option<WherePredicate> = None;
         if let Some(Token::Ident(name)) = self.peek().cloned() {
-            if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
+            if name.eq_ignore_ascii_case("EXISTS")
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+                && matches!(
+                    self.tokens.get(self.pos + 2),
+                    Some(Token::Keyword(Keyword::Select))
+                )
+            {
+                // `EXISTS (SELECT ...)`（Issue #927・SQL-29 (a)・TASK-213）。`EXISTS`
+                // は `LIKE`・`OR` と同じ文脈照合方式（`Keyword` へ追加しない）で、
+                // `exists` という列名の裸参照（`WHERE exists`）は直後が `(` かつ
+                // `SELECT` のときのみサブクエリ側へ振り分けられる（それ以外は
+                // 既存どおり `BoolColumn` 等の通常の識別子解析へ流れる）。
+                let depth = self.require_subquery_depth()?;
+                let open_idx = self.pos + 1;
+                let close_idx = self.find_matching_close_paren(open_idx).ok_or_else(|| {
+                    SqlSurfaceError::unsupported("unmatched parenthesis in EXISTS subquery")
+                })?;
+                let inner_tokens = self
+                    .tokens
+                    .get((open_idx + 1)..close_idx)
+                    .ok_or_else(|| {
+                        SqlSurfaceError::unsupported("malformed EXISTS subquery boundary")
+                    })?
+                    .to_vec();
+                self.pos = close_idx + 1;
+                result = Some(WherePredicate::Exists {
+                    inner_tokens,
+                    depth,
+                });
+            } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN"))
+                && matches!(self.tokens.get(self.pos + 2), Some(Token::Punct('(')))
+                && matches!(
+                    self.tokens.get(self.pos + 3),
+                    Some(Token::Keyword(Keyword::Select))
+                )
+            {
+                // `<col> IN (SELECT ...)`（Issue #927・SQL-29 (a)・TASK-213）。
+                // `IN` の直後が `SELECT` の場合のみサブクエリとして扱い、
+                // リテラル列 `IN (...)`（#913・未マージ）とは構造的に衝突しない。
+                let depth = self.require_subquery_depth()?;
+                let open_idx = self.pos + 2;
+                let close_idx = self.find_matching_close_paren(open_idx).ok_or_else(|| {
+                    SqlSurfaceError::unsupported("unmatched parenthesis in IN subquery")
+                })?;
+                let inner_tokens = self
+                    .tokens
+                    .get((open_idx + 1)..close_idx)
+                    .ok_or_else(|| SqlSurfaceError::unsupported("malformed IN subquery boundary"))?
+                    .to_vec();
+                self.pos = close_idx + 1;
+                result = Some(WherePredicate::InSubquery {
+                    column: name.clone(),
+                    inner_tokens,
+                    depth,
+                });
+            } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
                 && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
             {
                 self.advance();
@@ -4107,6 +4243,15 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
                     "view body WHERE predicate form is not supported",
                 ));
             }
+            // Issue #927・SQL-29 (a)・TASK-213: `CREATE VIEW` 本体は `Parser::new`
+            // の既定（`subquery_ctx == None`）で解析するため、`parse_where` 自体が
+            // サブクエリ構文を `42601` で拒否し、ここへ到達しない
+            // （fail-closed の防御的経路）。
+            WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => {
+                return Err(SqlSurfaceError::unsupported(
+                    "view body WHERE predicate form is not supported",
+                ));
+            }
         }
     }
     p.expect_end_of_statement()?;
@@ -4196,6 +4341,9 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
                 .collect();
             format!("({})", rendered_branches.join(" OR "))
         }
+        // `parse_view_body` がサブクエリを構造的に拒否するため到達しない
+        // （Issue #927・SQL-29 (a)・TASK-213。上記 `Or` と同じ理由）。
+        WherePredicate::InSubquery { .. } | WherePredicate::Exists { .. } => String::new(),
     }
 }
 
@@ -4483,8 +4631,14 @@ enum ParsedSelect {
 /// `WHERE`（省略可）直後の `USING PLAN(...)` 分岐を追加した。Issue #454 で
 /// `WHERE`（省略可）の直後に `LIMIT` が直接現れる、ランキング段を持たない広域
 /// 取得の分岐を追加した）。
-fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError> {
+fn parse_select_shape(
+    tokens: &[Token],
+    subquery_ctx: Option<usize>,
+) -> Result<ParsedSelect, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
+    if let Some(depth) = subquery_ctx {
+        p = p.with_subquery_ctx(depth);
+    }
 
     p.expect_keyword(Keyword::Select)?;
     let projection = p.parse_select_list()?;
@@ -4601,8 +4755,14 @@ struct ParsedAggregateShape {
 /// 余地を持たない）。呼び出し元（[`validate_sql`]）は先頭 2 トークンが集計関数名
 /// `'('` であるか、`SELECT ... GROUP BY` の並びを含むかのいずれかを確認済みの
 /// 前提で呼ぶ。
-fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
+fn parse_aggregate_shape(
+    tokens: &[Token],
+    subquery_ctx: Option<usize>,
+) -> Result<ParsedAggregateShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
+    if let Some(depth) = subquery_ctx {
+        p = p.with_subquery_ctx(depth);
+    }
 
     p.expect_keyword(Keyword::Select)?;
     let mut items = vec![p.parse_aggregate_select_item()?];
@@ -4775,6 +4935,20 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
     validate_sql_tokens(&tokens, lookup)
 }
 
+/// [`validate_sql`] のトップレベル読み取り SELECT／集計 SELECT 経路でのみ
+/// サブクエリ（`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を許可するエントリ
+/// ポイント（Issue #927・SQL-29 (a)・TASK-213）。`sql::subquery` が内側の
+/// `Statement::Scan` を再検証する際にも、深さを 1 つ進めて
+/// [`validate_sql_tokens_with_subquery_ctx`] を直接呼ぶ（本関数は深さ 0 固定の
+/// トップレベル用薄いラッパー）。
+pub(crate) fn validate_sql_with_subquery_ctx(
+    sql: &str,
+    lookup: &impl TableLookup,
+) -> Result<Statement, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    validate_sql_tokens_with_subquery_ctx(&tokens, lookup, 0)
+}
+
 /// [`validate_sql`] の本体（Issue #939・WIRE-17。COPY プロトコル対応の一環）。
 /// トークン列を受け取ることで、`COPY (<SELECT>) TO STDOUT`
 /// （[`validate_copy_to_tokens`]）の内側 SELECT のように、外側の許可リストが
@@ -4789,6 +4963,31 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
 pub(crate) fn validate_sql_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
+) -> Result<Statement, SqlSurfaceError> {
+    validate_sql_tokens_impl(tokens, lookup, None)
+}
+
+/// [`validate_sql_tokens`] のサブクエリ許可版（Issue #927・TASK-213）。
+/// `depth` は現在位置の入れ子深さ（`sql::subquery::resolve_where_predicates`
+/// が内側 `Statement::Scan` を再検証する際に 1 つ進めて渡す。トップレベルは
+/// [`validate_sql_with_subquery_ctx`] が 0 を渡す）。
+pub(crate) fn validate_sql_tokens_with_subquery_ctx(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    depth: usize,
+) -> Result<Statement, SqlSurfaceError> {
+    validate_sql_tokens_impl(tokens, lookup, Some(depth))
+}
+
+/// [`validate_sql_tokens`]／[`validate_sql_tokens_with_subquery_ctx`] が共有する
+/// 本体。`subquery_ctx` が `None` の呼び出し（cursor・view・copy・params・
+/// aggregate 等の既存の内部呼び出しがすべてここへ委譲する）は本 Issue 追加前と
+/// 完全に同じ挙動（サブクエリ構文は `Parser::require_subquery_depth` が
+/// `42601` で拒否する）を維持する。
+fn validate_sql_tokens_impl(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    subquery_ctx: Option<usize>,
 ) -> Result<Statement, SqlSurfaceError> {
     // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
     // （TASK-161・SQL-12 修正と同方針）、statement 先頭という文脈でのみ大文字小文字を
@@ -4821,7 +5020,7 @@ pub(crate) fn validate_sql_tokens(
             || contains_group_by);
     match tokens.first() {
         Some(Token::Keyword(Keyword::Select)) if is_aggregate_select => {
-            let shape = parse_aggregate_shape(tokens)?;
+            let shape = parse_aggregate_shape(tokens, subquery_ctx)?;
             let exists = lookup.table_exists(&shape.table_name)?;
             if !exists {
                 return Err(SqlSurfaceError::undefined_table(shape.table_name));
@@ -4833,7 +5032,7 @@ pub(crate) fn validate_sql_tokens(
                 group_by: shape.group_by,
             }))
         }
-        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(tokens)? {
+        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(tokens, subquery_ctx)? {
             ParsedSelect::Search(shape) => {
                 let exists = lookup.table_exists(&shape.table_name)?;
                 if !exists {
@@ -4944,7 +5143,7 @@ pub(crate) fn validate_sql_tokens(
             // 落とす（`EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置のみを
             // 受理する契約。本モジュールドキュメントの `Statement::Explain`
             // 参照）。
-            let shape = match parse_select_shape(rest)? {
+            let shape = match parse_select_shape(rest, None)? {
                 ParsedSelect::Search(shape) => shape,
                 ParsedSelect::Scan(_) => {
                     return Err(SqlSurfaceError::unsupported(
