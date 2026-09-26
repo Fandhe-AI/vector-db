@@ -1318,6 +1318,19 @@ pub(crate) fn execute_scan_with_budget(
             }
         }
 
+        // codex-review PR #1096 P1 是正: パス 1 のヒープ候補（`heap_budget`）と
+        // パス 2 の投影結果（`byte_budget`）を別々の予算カウンタで `max_result_bytes`
+        // 上限判定していたため、両者を同時に保持する実メモリ量が単独の上限判定を
+        // すり抜けて `max_result_bytes` の 2 倍近くまで達し得た（`DECLARE CURSOR` の
+        // 小さい予算指定でメモリ予算を実質迂回できる経路）。`heap.into_sorted_vec()`
+        // が返す全候補はパス 2 の投影完了までヒープ内で保持され続けるため
+        // （各要素は消費時に初めて破棄される）、パス 2 開始時点で候補が占める
+        // 実メモリは `heap_budget` 分そのまま残っている。ここで `byte_budget` を
+        // `heap_budget` から引き継ぐことで、候補・結果を跨いだ単一の共通予算
+        // カウンタとして扱い、以降の `try_accumulate_budget` 呼び出しが両者の
+        // 合計を `max_result_bytes` 以下に fail-closed で制限する。
+        byte_budget = heap_budget;
+
         // パス 2: 全順序で確定してから（`BinaryHeap::into_sorted_vec` は
         // `Ord` の昇順。`(tenant_id, id)` が一意な全順序のため安定性は
         // 問題にならない）、同じ read txn 内で勝者のみを再取得し投影する
@@ -1559,6 +1572,122 @@ mod tests {
         // 行生成中に打ち切られる（`execute_scan` の既定予算まで到達しない）。
         let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 1)
             .expect_err("tiny caller-supplied budget must reject before default cap");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review PR #1096 P1 是正の回帰: 経路 (B)（上位 N 件 2 パス。
+    /// `crates/engine/src/sql/scan.rs:1303` 付近）は、パス 1 のヒープ候補保持量
+    /// （`heap_budget`）とパス 2 の投影結果保持量（`byte_budget`）を別々に
+    /// `max_result_bytes` へ照合していたため、候補側・結果側それぞれ単独では
+    /// 予算内でも同時に保持する合計サイズが上限を超えうる（`DECLARE CURSOR` の
+    /// 小さい予算指定でメモリ予算を実質迂回できる経路）。ここでは、候補
+    /// （`ORDER BY` 対象の TEXT 値）と結果（同じ列の投影セル）の双方が同じ長さの
+    /// テキストを保持する行を用意し、単独では収まるが合計では超過する予算値を
+    /// 計算して渡す。修正後は `byte_budget` がパス 2 開始時に `heap_budget` を
+    /// 引き継ぐ単一の共通予算カウンタになるため、合計超過を行生成中に検出して
+    /// `54000` で打ち切る。
+    #[test]
+    fn execute_scan_with_budget_bounds_combined_candidate_and_result_bytes_on_path_b() {
+        let path = unique_db_path("scan-path-b-combined-budget");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true),
+                ColumnDef::new("tag", ColumnType::Text, true),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let tag_value = "x".repeat(2000);
+        let tenant_id = "tenant-a";
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            let metadata = crate::row_codec::encode_scalar_columns(
+                &schema,
+                &[
+                    crate::row_codec::Value::Null,
+                    crate::row_codec::Value::Text(tag_value.clone()),
+                ],
+            )
+            .expect("encode scalar columns");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id,
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &metadata,
+            })
+            .expect("encode row");
+            table
+                .insert((tenant_id, 1u64), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+
+        let ctx = PolicyContext::new(tenant_id).expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Column {
+                    index: 1,
+                    name: "tag".to_string(),
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+            limit: 1,
+            order_by: vec![crate::sql::parser::BoundOrderKey {
+                target: crate::sql::parser::BoundOrderTarget::Column(1),
+                kind: crate::sql::parser::OrderKind::Bytes,
+                descending: false,
+            }],
+            offset: 0,
+        };
+
+        // パス 1 のヒープ候補 1 件分（`heap_entry_bytes` と同じ計算式）と、
+        // パス 2 の投影結果 1 行分（`per_row_struct_bytes` + テキスト実体）を
+        // それぞれ単独で見積もる。
+        let heap_entry_bytes_estimate = std::mem::size_of::<HeapEntry>()
+            .saturating_add(tag_value.len())
+            .saturating_add(tenant_id.len());
+        let cell_struct_bytes = bound
+            .projection
+            .len()
+            .saturating_mul(std::mem::size_of::<Cell>());
+        let result_row_struct_bytes = std::mem::size_of::<ResultRow>();
+        let per_row_bytes_estimate = cell_struct_bytes
+            .saturating_add(result_row_struct_bytes)
+            .saturating_add(tag_value.len());
+
+        // 単独ではどちらも収まるが合計では超過する予算（各見積りの大きい方に
+        // 小さな余白を足しただけの値）を用意する。
+        let cap = heap_entry_bytes_estimate.max(per_row_bytes_estimate) + 8;
+        assert!(
+            cap < heap_entry_bytes_estimate.saturating_add(per_row_bytes_estimate),
+            "test cap must fall strictly between the per-side estimate and their combined total \
+             to exercise the shared-budget fix"
+        );
+
+        // 十分大きい既定予算では成功する。
+        execute_scan(&read_txn, &ctx, &schema, &bound).expect("default budget should succeed");
+
+        // 候補側・結果側それぞれ単独では収まるが合計では超過する予算では、
+        // 行生成中に打ち切られる（旧実装は `heap_budget` と `byte_budget` を
+        // 独立に判定していたためここを通過してしまっていた）。
+        let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, cap).expect_err(
+            "combined candidate+result bytes must exceed the caller-supplied cap on path (B)",
+        );
         assert_eq!(err.wire_code(), "54000");
     }
 
