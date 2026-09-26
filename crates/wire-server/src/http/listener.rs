@@ -25,8 +25,11 @@
 //! RequestHandler`] 実装を注入できる。
 //!
 //! 同時接続数上限超過時の 503 応答は
-//! [`crate::http::conn::reject_too_many_connections`] が担う（TLS 構成時は
-//! 応答を書かずに閉じる。Issue #968・H4）。
+//! [`crate::http::conn::reject_too_many_connections`] が担う。TLS 構成時は
+//! `--tls-mode` で分岐し、`require` は応答を書かずに閉じるが、`allow` は
+//! 先頭バイトを期限付きで判定して平文なら既存の 503 応答を維持する
+//! （[`crate::http::tls_transport::reject_or_close_over_limit`]。Issue
+//! #968・H4・codex-review 是正）。
 //!
 //! [`accept_loop_with_router_tls`]（Issue #968）は `main.rs::run_server` が
 //! nosql 選択時に `--tls-cert`／`--tls-key` を構成した場合の入口。接続 1 本
@@ -188,18 +191,38 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
                 limiter.max()
             );
             // H4（Issue #968・`docs/design/tls-wire-connection.md`
-            // 「HTTPS 表層」節）: TLS を構成している場合、平文の 503 応答を
-            // 書かずに閉じる。TLS ハンドシェイクをしていない接続へ平文
-            // バイト列を送ると `--tls-mode require` の意図（平文を一切
-            // 送出しない）に反するうえ、TLS クライアントにとっては意味の
-            // 無い応答になる。拒否ワーカーの中でハンドシェイクもしない
-            // （`RejectWorkerLimiter` の有界性を維持するため。遅いクライアント
-            // でワーカーが `HANDSHAKE_READ_TIMEOUT` 分ふさがるのを避ける）。
-            // TLS 未構成時は既存の 503／`53300` 経路とバイト単位で同一。
-            if tls.is_some() {
-                let _ = stream.shutdown(Shutdown::Both);
-                continue;
+            // 「HTTPS 表層」節。codex-review 指摘・同 Issue で是正）:
+            // `--tls-mode require` は平文と TLS レコードのどちらでも要求を
+            // 解釈せず即座に閉じる（TLS ハンドシェイクをしていない接続へ
+            // 平文 503 を送ると `require` の意図（平文を一切送出しない）に
+            // 反するため）。`--tls-mode allow` は平文接続を受理するモード
+            // のため、上限超過時も平文なら既存の 503／`53300` 応答
+            // （[`conn::reject_too_many_connections`]）を維持する必要があり、
+            // これを `tls.is_some()` だけで無応答クローズすると `allow` 下の
+            // 平文クライアントに対するエラー契約の退行になる（AGENTS.md
+            // 「公開 API・エラー契約の互換性（P1）」）。`allow` では
+            // [`tls_transport::reject_or_close_over_limit`] が拒否ワーカー
+            // （`RejectWorkerLimiter` で有界化済み）の中で先頭バイトを
+            // 期限付きで判定し、平文と判定した場合のみ拒否応答を返す
+            // （TLS レコードと判定した場合はハンドシェイクをせず無応答
+            // クローズする。遅いクライアントでワーカーが専有時間を超えて
+            // ふさがるのを避けるため `REJECT_TLS_PROBE_TIMEOUT` で読み取りを
+            // 打ち切る）。TLS 未構成時は既存の 503／`53300` 経路とバイト
+            // 単位で同一。
+            // `TlsMode` は `#[non_exhaustive]`（下流クレート向け）だが、本
+            // クレート内では通常どおり網羅性検査が効く。将来 variant を
+            // 追加する場合はここが確実にコンパイルエラーになり、`allow`
+            // 相当の受理側（平文へ応答を返す側）へ黙ってフォールバック
+            // しない（`tls_transport::serve_connection` の `FirstByte`
+            // 網羅と同じ fail-closed 方針）。
+            match &tls {
+                Some((_, TlsMode::Require)) => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                Some((_, TlsMode::Allow)) | None => {}
             }
+            let is_tls = tls.is_some();
             match reject_limiter.try_acquire() {
                 Some(reject_permit) => {
                     // `std::thread::spawn` はスレッド生成失敗時に panic し、
@@ -207,7 +230,11 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
                     // `Builder::spawn` を使い、失敗時はログのみで継続する。
                     if let Err(e) = std::thread::Builder::new().spawn(move || {
                         let _reject_permit = reject_permit;
-                        conn::reject_too_many_connections(stream);
+                        if is_tls {
+                            tls_transport::reject_or_close_over_limit(stream);
+                        } else {
+                            conn::reject_too_many_connections(stream);
+                        }
                     }) {
                         eprintln!("wire-server: failed to spawn reject worker thread: {e}");
                     }

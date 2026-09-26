@@ -24,6 +24,12 @@
 //! - TLS-4: 不正な ClientHello（`0x16` の後にゴミバイト列）を送っても
 //!   サーバーが panic せず、応答なしで閉じたうえで後続の正常な TLS 接続には
 //!   波及しないこと
+//! - TLS-5: `--tls-mode allow` 下で同時接続数上限を超過した平文 HTTP
+//!   クライアントに、TLS 未構成時と同じ既存の 503／`53300` 応答が返る
+//!   こと（codex-review 指摘・Issue #968 是正。`tls.is_some()` のみで
+//!   無応答クローズしていた回帰の再発防止）
+//! - TLS-6: `--tls-mode require` 下で同時接続数上限を超過した接続は
+//!   （平文であっても）要求を解釈されずに応答なしで閉じられること（H4）
 
 #[path = "http_common/mod.rs"]
 mod http_common;
@@ -52,10 +58,25 @@ mod tls_client;
 /// 流儀）。`engine` はテーブルを一切持たないスローアウェイ `EngineCore`
 /// （TLS-1 の `scan` が `42P01`／404 へ到達することの非 vacuous な証跡用）。
 fn spawn_router_listener_tls(users_path: &std::path::Path, mode: TlsMode) -> std::net::SocketAddr {
+    spawn_router_listener_tls_with_limiter(
+        users_path,
+        mode,
+        ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS),
+    )
+}
+
+/// [`spawn_router_listener_tls`] の、呼び出し元が [`ConnectionLimiter`] を
+/// 構築して渡せる版。同時接続数上限超過（`limiter.try_acquire()` が
+/// `None` を返す経路。TLS-5・TLS-6）を決定的に再現するため、テスト側で
+/// 容量 1 の `ConnectionLimiter` を渡し、枠を保持したまま 2 本目を接続する。
+fn spawn_router_listener_tls_with_limiter(
+    users_path: &std::path::Path,
+    mode: TlsMode,
+    limiter: ConnectionLimiter,
+) -> std::net::SocketAddr {
     let store = wire_server::auth::UserStore::load_from_file(users_path).expect("valid store");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
-    let limiter = ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS);
     let core_path = http_common::temp_db::unique_db_path("http10-tls-surface-throwaway");
     let core = EngineCore::open(&core_path).expect("open throwaway engine core");
     let sessions = SessionStore::new();
@@ -447,6 +468,129 @@ fn malformed_client_hello_does_not_crash_or_affect_later_connections() {
         200,
         "a later well-formed TLS connection must still succeed"
     );
+
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+// --- TLS-5/6: 同時接続数上限超過時のエラー契約（Issue #968 codex-review
+//     P1 是正）---------------------------------------------------------------
+
+/// 容量 1 の `ConnectionLimiter` を渡し、1 本目の接続で枠を保持したまま
+/// 2 本目を接続することで `limiter.try_acquire()` が `None` を返す経路を
+/// 決定的に再現する。`listener.rs::accept_loop_with_handler` の
+/// `active() >= 1` を待ってから 2 本目を送るため、フレーク要因（受理前に
+/// 2 本目が先着する）を排除する。
+fn wait_for_permit_active(limiter: &ConnectionLimiter) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while limiter.active() < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for permit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// TLS-5: `--tls-mode allow` の下で同時接続数上限を超過した平文 HTTP
+/// クライアントには、TLS 未構成時と同じ既存の 503／`wire_code` 53300
+/// 応答が返ること（`tls.is_some()` のみで無応答クローズしていた回帰の
+/// 再発防止）。
+#[test]
+fn allow_mode_still_returns_503_for_plaintext_over_capacity() {
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "wire-server-http10-tls-r5-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let users_path = fixture_dir.join("users.txt");
+    write_user_store_with_alice(&users_path);
+
+    let limiter = ConnectionLimiter::new(1);
+    let addr = spawn_router_listener_tls_with_limiter(&users_path, TlsMode::Allow, limiter.clone());
+
+    // 1 本目: 枠を保持し続ける（TLS 接続を確立し、何も送らない）。
+    let _holder = connect_tls(addr);
+    wait_for_permit_active(&limiter);
+
+    // 2 本目（平文）: 上限超過で拒否されるはず。`allow` 下の判定は先頭
+    // バイトの `peek` に依存するため、request-line を送ってから読む
+    // （`accept_loop_with_limiter_rejects_connection_over_capacity_with_503`
+    // の TLS 未構成版と異なり、何も送らない接続は判定に必要なバイトが
+    // 届かず `peek` がタイムアウトして無応答クローズ側に倒れる）。
+    let mut rejected = TcpStream::connect(addr).expect("connect rejected");
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let login_body = br#"{"user":"alice","password":"pw-alice"}"#;
+    let request = build_request(
+        "/v1/session",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", &login_body.len().to_string()),
+        ],
+        login_body,
+    );
+    let _ = rejected.write_all(&request);
+    let mut received = Vec::new();
+    let mut buf = [0u8; 512];
+    loop {
+        match rejected.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&received);
+    assert!(
+        text.starts_with("HTTP/1.1 503 "),
+        "allow mode must still return 503 for plaintext over capacity, got: {text:?}"
+    );
+    assert!(text.contains("53300"), "got: {text:?}");
+
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// TLS-6: `--tls-mode require` の下で同時接続数上限を超過した接続は
+/// （平文であっても）要求を解釈されずに応答なしで閉じられること（H4）。
+#[test]
+fn require_mode_closes_over_capacity_connection_without_response() {
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "wire-server-http10-tls-r6-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let users_path = fixture_dir.join("users.txt");
+    write_user_store_with_alice(&users_path);
+
+    let limiter = ConnectionLimiter::new(1);
+    let addr =
+        spawn_router_listener_tls_with_limiter(&users_path, TlsMode::Require, limiter.clone());
+
+    // 1 本目: 枠を保持し続ける（TLS 接続を確立し、何も送らない）。
+    let _holder = connect_tls(addr);
+    wait_for_permit_active(&limiter);
+
+    // 2 本目（平文）: `require` 下では上限超過時も応答なしで閉じられる。
+    let mut rejected = TcpStream::connect(addr).expect("connect rejected");
+    rejected
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    let mut buf = [0u8; 8];
+    match rejected.read(&mut buf) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => {
+            panic!("expected no HTTP response over capacity when tls-mode=require, got {other:?}")
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }

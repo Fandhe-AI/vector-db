@@ -24,11 +24,19 @@
 //!   `HANDSHAKE_READ_TIMEOUT`（SQL wire の TLS 経路と同じ定数。Issue #966）
 //!   に委ねる。前後で接続のタイムアウト設定を退避・復元する
 //!   （`crate::handshake::handle_tls_upgrade` と同型）。
-//! - H4: TLS 構成時の同時接続数上限超過は、平文の 503 応答を書かずに
-//!   クローズする（TLS ハンドシェイクをしていないクライアントに平文 503 を
-//!   送ると `require` 下での平文送出になり、`--tls-mode require` の意図に
-//!   反するため）。呼び出し元（`listener::accept_loop_with_handler`）が
-//!   `tls.is_some()` で分岐する。
+//! - H4: TLS 構成時の同時接続数上限超過は `--tls-mode` で分岐する
+//!   （codex-review 指摘・Issue #968 是正。旧実装は `tls.is_some()` のみで
+//!   無応答クローズしており、`allow` 下の平文クライアントへも既存の
+//!   503／`53300` 応答が返らなくなる回帰があった）。`require` は平文と
+//!   TLS レコードのどちらであっても要求を解釈せず即座に閉じる（TLS
+//!   ハンドシェイクをしていないクライアントに平文 503 を送ると `require`
+//!   下での平文送出になり `--tls-mode require` の意図に反するため）。
+//!   `allow` は [`reject_or_close_over_limit`] が `RejectWorkerLimiter` の
+//!   枠の中で先頭バイトを期限付きで `peek` し、平文と判定した場合のみ
+//!   既存の 503／`53300` 応答（[`conn::reject_too_many_connections`]）を
+//!   維持する（TLS レコードと判定した場合はハンドシェイクをせず無応答
+//!   クローズする）。呼び出し元（`listener::accept_loop_with_handler`）が
+//!   `tls` の有無と `--tls-mode` で分岐する。
 //! - H5: `--tls-scram-channel-binding enable` × nosql は起動を拒否せず
 //!   no-op として受理する（`main.rs` 側の判断。NoSQL 表層は SASL 往復を
 //!   持たないため実際には提示されない）。本モジュールに直接の関与は無い。
@@ -128,6 +136,59 @@ pub(crate) fn serve_connection<H: RequestHandler>(
             TlsMode::Allow => {
                 conn::handle_connection_with(stream, handler, read_timeout);
             }
+        },
+    }
+}
+
+/// [`crate::http::listener::accept_loop_with_handler`] の同時接続数上限超過
+/// 経路（`--tls-mode allow` の場合）から呼ばれる、拒否応答ワーカースレッド内
+/// 専用の分岐（Issue #968 codex-review P1 是正）。
+///
+/// `tls.is_some()` だけで無応答クローズすると、`--tls-mode allow` で本来
+/// 受理されるはずの平文 HTTP クライアントに対しても、TLS 未構成時と同じ
+/// 既存の 503／`wire_code` 53300 応答（[`conn::reject_too_many_connections`]）
+/// が返らなくなり、AGENTS.md の「公開 API・エラー契約の互換性（P1）」に反する
+/// 退行になる。`allow` は平文接続を受理するモードのため、上限超過時も
+/// 平文なら既存の拒否応答を維持し、TLS レコードと判定した場合のみ
+/// （ハンドシェイクをせずに）無応答クローズする（`require` は
+/// `listener::accept_loop_with_handler` 側で本関数を経由せず常に無応答
+/// クローズする。TLS のみ受理するモードで平文へ応答を返す理由が無いため）。
+///
+/// 先頭 1 バイトの `peek` には [`crate::limits::REJECT_TLS_PROBE_TIMEOUT`]
+/// を読み取りタイムアウトとして適用する（`RejectWorkerLimiter` の枠を
+/// 無期限に占有しない。`peek` が `Ok(0)`／`Err`（タイムアウト超過含む）の
+/// 場合は TLS ハンドシェイクをしていないクライアントへ応答を書く根拠が
+/// 無いため、`serve_connection` と同じく応答を書かずに閉じる）。
+pub(crate) fn reject_or_close_over_limit(stream: TcpStream) {
+    if stream
+        .set_read_timeout(Some(crate::limits::REJECT_TLS_PROBE_TIMEOUT))
+        .is_err()
+    {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return;
+    }
+
+    let mut probe = [0u8; 1];
+    match stream.peek(&mut probe) {
+        Ok(0) | Err(_) => {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        Ok(_) => match probe.first() {
+            // `peek` が `Ok(1)` 以上を返した以上 `probe` は必ず 1 要素
+            // 埋まっているため構造的に到達しないが、untrusted なソケット
+            // 入力経路では添字アクセスを使わない（`serve_connection` と
+            // 同じ方針。coding-rust.md）。
+            None => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            Some(byte) => match classify_first_byte(*byte) {
+                FirstByte::Plain => conn::reject_too_many_connections(stream),
+                FirstByte::Tls => {
+                    // TLS ハンドシェイクはしない（`RejectWorkerLimiter` の
+                    // 有界性を維持するため。H4 と同じ判断）。
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            },
         },
     }
 }
