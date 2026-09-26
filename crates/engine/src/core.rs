@@ -3596,6 +3596,7 @@ impl EngineCore {
                     &validated.tree,
                     session.udfs(),
                     dummy_equality_flags,
+                    validated.limit,
                 )?;
                 Ok(Some(columns))
             }

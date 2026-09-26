@@ -825,6 +825,33 @@ fn describe_matches_execute_columns() {
     );
 }
 
+/// PR #1105 レビュー指摘の回帰: 全体 `LIMIT` の範囲外検証（`22000`）は Execute
+/// （`execute_sql_in_session`）と Describe（`describe_parsed_in_session`）の
+/// いずれでも同じ SQLSTATE で拒否する。従来は Describe が全体 `LIMIT` を
+/// 検証しておらず、Execute では拒否される範囲外の値が Describe だけ受理されて
+/// いた。
+#[test]
+fn top_level_limit_out_of_range_is_rejected_by_execute_and_describe_alike() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+
+    for sql in [
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs LIMIT 0",
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs LIMIT 10001",
+    ] {
+        let exec_err = run_err(&core, "tenant-a", sql);
+        assert_eq!(exec_err.wire_code(), "22000", "execute sql={sql}");
+
+        let parsed = core.parse_sql(sql).expect("parse_sql should succeed");
+        let describe_session = SessionState::default();
+        let describe_err = core
+            .describe_parsed_in_session(&describe_session, &parsed)
+            .expect_err("describe must reject out-of-range LIMIT the same way execute does");
+        assert_eq!(describe_err.wire_code(), "22000", "describe sql={sql}");
+    }
+}
+
 // ---------- セッションレス経路（`EngineCore::execute_sql`） ----------
 
 #[test]

@@ -18,11 +18,15 @@
 //! 中間結果・重複除去・`INTERSECT`／`EXCEPT` の判定・件数のいずれにも現れない。
 //! RLS-10 (b)）。
 //!
+//! 文全体（全枝の走査・合成・行キー生成）で 1 つの累計バイト予算
+//! （[`SetOpBudget`]。単一クエリの結果予算と同じ上限
+//! [`crate::arena::MAX_ARENA_TOTAL_BYTES`]）を共有する（PR #1105 レビュー指摘
+//! 対応: 各枝が独立に同予算を使い、最大枝数上限（実装既定値 16）分の結果を
+//! `eval_tree` が同時に保持し得ると、単一クエリの結果予算をはるかに超える
+//! 合計メモリを SQL 入力だけで確保できてしまう〔DoS〕ため）。
+//!
 //! スコープ外（Issue #929 の対象外事項。詳細は PR 本文参照）:
-//! - 枝ごとの累計バイト予算の共有（各枝は独立に
-//!   [`crate::arena::MAX_ARENA_TOTAL_BYTES`] 相当の予算を持つ。全枝で共有する
-//!   単一の累計予算は今回は実装しない）
-//! - Describe（拡張クエリプロトコル）・明示トランザクション内での実行
+//! - 明示トランザクション内での実行
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,6 +40,89 @@ use crate::sql::udf_call::UdfRegistry;
 /// （実装既定値。`core::MAX_SEARCH_K` と同値）。超過は `54000`。合成結果の行数
 /// 上限も同じ定数を共有する（重複除去後の行数は必ずこの値以下になる）。
 const MAX_SET_OP_ROWS: usize = crate::core::MAX_SEARCH_K;
+
+/// 集合演算文全体（全枝の走査・合成・行キー生成）で共有する累計バイト予算
+/// （PR #1105 レビュー指摘対応）。各枝を独立に
+/// [`crate::sql::scan::execute_scan`] の既定予算（[`crate::arena::MAX_ARENA_TOTAL_BYTES`]）
+/// で評価すると、最大 16 枝分の結果を `eval_tree` が同時に保持できてしまい、
+/// 単一クエリの結果予算をはるかに超える合計メモリを SQL 入力だけで確保できる
+/// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。本予算は
+/// 単一クエリの結果予算と同じ上限を文全体で 1 つだけ持ち、枝の評価
+/// （[`eval_branch`]）・ノード合成・行キー生成（[`eval_tree`]）のいずれでも
+/// 消費し、超過は `54000` で打ち切る。
+struct SetOpBudget {
+    used: usize,
+    cap: usize,
+}
+
+impl SetOpBudget {
+    fn new(cap: usize) -> Self {
+        Self { used: 0, cap }
+    }
+
+    /// まだ消費していない残り予算（次に評価する枝の [`crate::sql::scan::
+    /// execute_scan_with_budget`] へそのまま渡す上限として使う。枝単体でも
+    /// 残り予算を超えられないようにする）。
+    fn remaining(&self) -> usize {
+        self.cap.saturating_sub(self.used)
+    }
+
+    /// `bytes` を消費として計上する。累計が上限を超えたら `54000` で拒否する
+    /// （fail-closed。超過分をアロケーションした後の判定ではなく、既に確保済み
+    /// の行データのバイト量を根拠にするため、確保自体は上限内に収まった分のみ）。
+    fn charge(&mut self, bytes: usize) -> Result<(), SqlSurfaceError> {
+        self.used = self.used.saturating_add(bytes);
+        if self.used > self.cap {
+            return Err(SqlSurfaceError::payload_too_large(
+                "set operation exceeds the shared result byte budget",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 行集合（1 枝分の実行結果、または合成後の中間結果）の推定バイト量。
+/// [`crate::sql::scan::execute_scan_with_budget`] が単一枝内で行う予算計上と
+/// 同じ考え方（セル構造体オーバーヘッド＋可変長ペイロード実体）を、複数枝を
+/// 横断する累計予算（[`SetOpBudget`]）へ計上するために使う。
+fn result_bytes(columns: &[ColumnMeta], rows: &[ResultRow]) -> usize {
+    let cell_struct_bytes = columns.len().saturating_mul(std::mem::size_of::<Cell>());
+    let result_row_struct_bytes = std::mem::size_of::<ResultRow>();
+    let per_row_struct_bytes = cell_struct_bytes.saturating_add(result_row_struct_bytes);
+    let mut total = per_row_struct_bytes.saturating_mul(rows.len());
+    for row in rows {
+        for cell in &row.cells {
+            total = total.saturating_add(cell_payload_bytes(cell));
+        }
+    }
+    total
+}
+
+/// セル 1 個が持つ可変長ペイロードの推定バイト量（固定長セルは
+/// [`result_bytes`] 側の構造体オーバーヘッドで既に計上済みのため `0`）。
+fn cell_payload_bytes(cell: &Cell) -> usize {
+    match cell {
+        Cell::Text(s) => s.len(),
+        Cell::Bytes(b) => b.len(),
+        Cell::Json(s) => s.len(),
+        // 正確な内部表現サイズではなく十進文字列表現による近似（予算計上の
+        // 目的では十分。実際の確保量を下回らない側に倒す）。
+        Cell::Numeric(d) => d.to_string().len(),
+        Cell::Vector(v) => v.len().saturating_mul(std::mem::size_of::<f32>()),
+        Cell::Array(arr) => match arr {
+            crate::row_codec::ArrayValue::Text(items) => items.iter().map(|s| s.len()).sum(),
+            crate::row_codec::ArrayValue::Bool(items) => items.len(),
+        },
+        Cell::Null
+        | Cell::Integer(_)
+        | Cell::Float(_)
+        | Cell::Bool(_)
+        | Cell::SignedInteger(_)
+        | Cell::Date(_)
+        | Cell::Timestamp(_)
+        | Cell::Uuid(_) => 0,
+    }
+}
 
 /// 枝が参照するテーブル名を構文木から集める（重複は 1 回だけ収集する）。
 /// `core.rs::EngineCore` が単一の `read_txn` 上で全テーブルのスキーマを解決する
@@ -203,25 +290,35 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
 
 /// 単一の枝（`SELECT ... FROM <table> [WHERE ...]`）を束縛・実行する。可視かつ
 /// `WHERE` 一致行が `core::MAX_SEARCH_K` を超える場合は `54000`（超過検出のため
-/// `MAX_SEARCH_K + 1` を上限として走査する）。
+/// `MAX_SEARCH_K + 1` を上限として走査する）。文全体で共有する `budget`
+/// （[`SetOpBudget`]）の残り予算を枝の実行に渡し（枝単体でも残り予算を超えられ
+/// ない）、実行結果のバイト量を消費として計上する。
 fn eval_branch(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     schema: &TableSchema,
     validated: &ValidatedScan,
     udfs: &UdfRegistry,
+    budget: &mut SetOpBudget,
 ) -> Result<EvalOutcome, SqlSurfaceError> {
     let mut bound = crate::sql::parser::bind_scan(validated, schema, udfs)?;
     // §2.3: 可視行数の上限判定は「可視行数だけに依存」させる（全体 `LIMIT` の
     // 有無で成否が変わらない単純な規則）。`bound.limit`（`pub(crate)`）を
     // `MAX_SEARCH_K + 1` へ差し替えて超過を検出できるようにする。
     bound.limit = MAX_SET_OP_ROWS + 1;
-    let result = crate::sql::scan::execute_scan(read_txn, ctx, schema, &bound)?;
+    let result = crate::sql::scan::execute_scan_with_budget(
+        read_txn,
+        ctx,
+        schema,
+        &bound,
+        budget.remaining(),
+    )?;
     if result.rows.len() > MAX_SET_OP_ROWS {
         return Err(SqlSurfaceError::payload_too_large(
             "set operation branch exceeds the visible row limit",
         ));
     }
+    budget.charge(result_bytes(&result.columns, &result.rows))?;
     let has_vector = columns_have_vector(&result.columns);
     Ok(EvalOutcome {
         columns: result.columns,
@@ -232,13 +329,15 @@ fn eval_branch(
 
 /// 構文木を後行順（postorder）で評価する。各 `Op` ノードで型整合
 /// （列数・列型。§2.2）を検証してから合成する。結果列名・メタデータは常に左の
-/// 子（左端の枝）に揃える。
+/// 子（左端の枝）に揃える。`budget` は文全体で共有する累計バイト予算
+/// （[`SetOpBudget`]）で、枝の評価・行キー生成のいずれでも消費する。
 fn eval_tree(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,
     udfs: &UdfRegistry,
+    budget: &mut SetOpBudget,
 ) -> Result<EvalOutcome, SqlSurfaceError> {
     match tree {
         SetTree::Branch(validated) => {
@@ -248,11 +347,11 @@ fn eval_tree(
                     .ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "schema missing for set operation branch table".to_string(),
                     })?;
-            eval_branch(read_txn, ctx, schema, validated, udfs)
+            eval_branch(read_txn, ctx, schema, validated, udfs, budget)
         }
         SetTree::Op { op, left, right } => {
-            let l = eval_tree(read_txn, ctx, schemas, left, udfs)?;
-            let r = eval_tree(read_txn, ctx, schemas, right, udfs)?;
+            let l = eval_tree(read_txn, ctx, schemas, left, udfs, budget)?;
+            let r = eval_tree(read_txn, ctx, schemas, right, udfs, budget)?;
 
             if l.columns.len() != r.columns.len() {
                 return Err(SqlSurfaceError::datatype_mismatch(format!(
@@ -292,6 +391,10 @@ fn eval_tree(
                     let mut rows = Vec::new();
                     for row in l.rows.into_iter().chain(r.rows) {
                         let key = row_key(&row)?;
+                        // 行キー生成も文全体で共有する累計バイト予算の対象
+                        // （PR #1105 レビュー指摘対応。`seen` への格納で複製される
+                        // 分の追加メモリを見逃さない）。
+                        budget.charge(key.len())?;
                         if seen.contains(&key) {
                             continue;
                         }
@@ -308,13 +411,16 @@ fn eval_tree(
                 SetOperator::Intersect | SetOperator::Except => {
                     let mut right_keys: HashSet<Vec<u8>> = HashSet::new();
                     for row in &r.rows {
-                        right_keys.insert(row_key(row)?);
+                        let key = row_key(row)?;
+                        budget.charge(key.len())?;
+                        right_keys.insert(key);
                     }
                     let keep_if_present = matches!(op, SetOperator::Intersect);
                     let mut seen: HashSet<Vec<u8>> = HashSet::new();
                     let mut rows = Vec::new();
                     for row in l.rows.into_iter() {
                         let key = row_key(&row)?;
+                        budget.charge(key.len())?;
                         let present = right_keys.contains(&key);
                         if present != keep_if_present || seen.contains(&key) {
                             continue;
@@ -353,14 +459,46 @@ pub(crate) fn execute(
     udfs: &UdfRegistry,
     limit: Option<u32>,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let outcome = eval_tree(read_txn, ctx, schemas, tree, udfs)?;
+    execute_with_budget(
+        read_txn,
+        ctx,
+        schemas,
+        tree,
+        udfs,
+        limit,
+        crate::arena::MAX_ARENA_TOTAL_BYTES,
+    )
+}
+
+/// [`execute`] の本体。`budget_cap` は文全体で共有する累計バイト予算
+/// （[`SetOpBudget`]）の上限。[`execute`] は既定値
+/// （[`crate::arena::MAX_ARENA_TOTAL_BYTES`]）を渡すだけの薄いラッパーで、
+/// 小さい上限を注入できる回帰テスト（本モジュール内の `tests`）専用に分離して
+/// いる（`sql::scan::execute_scan`／`execute_scan_with_budget` と同じ設計判断）。
+pub(crate) fn execute_with_budget(
+    read_txn: &redb::ReadTransaction,
+    ctx: &PolicyContext,
+    schemas: &HashMap<String, TableSchema>,
+    tree: &SetTree,
+    udfs: &UdfRegistry,
+    limit: Option<u32>,
+    budget_cap: usize,
+) -> Result<QueryResult, SqlSurfaceError> {
+    // PR #1105 レビュー指摘対応: 全体 `LIMIT` の範囲検証（`1..=MAX_SEARCH_K`）を
+    // 全枝の走査・合成より前に行う（[`describe_columns`] と同じ検証を共有し、
+    // Execute／Describe の受理・拒否を一致させる。従来は `eval_tree` 完了後の
+    // 切り詰め直前でのみ検証しており、範囲外の `LIMIT` でも全枝を走査・合成し
+    // 終えてから拒否していた）。
+    let validated_limit = match limit {
+        Some(n) => Some(crate::sql::parser::validate_search_limit(n)?),
+        None => None,
+    };
+    let mut budget = SetOpBudget::new(budget_cap);
+    let outcome = eval_tree(read_txn, ctx, schemas, tree, udfs, &mut budget)?;
     // §2.4: 上限判定（`MAX_SET_OP_ROWS`）は全体 `LIMIT` による切り詰めより前に
-    // 完結している（`eval_tree` が既に検証済み）。ここでは範囲検証のみ行う。
-    let rows = match limit {
-        Some(n) => {
-            let n = crate::sql::parser::validate_search_limit(n)?;
-            outcome.rows.into_iter().take(n).collect()
-        }
+    // 完結している（`eval_tree` が既に検証済み）。
+    let rows = match validated_limit {
+        Some(n) => outcome.rows.into_iter().take(n).collect(),
         None => outcome.rows,
     };
     Ok(QueryResult {
@@ -371,13 +509,20 @@ pub(crate) fn execute(
 
 /// Describe（拡張クエリプロトコル）向けに、検索本体を実行せず結果列メタデータ
 /// だけを導出する。`bind_scan_with_dummy_flags` で枝を束縛し、[`execute`] と
-/// 同じ型整合検証（§2.2）を行う（行走査は一切行わない）。
+/// 同じ型整合検証（§2.2）を行う（行走査は一切行わない）。`limit` は全体
+/// `LIMIT`（任意）で、[`execute`] と同じ範囲検証（`1..=MAX_SEARCH_K`）を行う
+/// （PR #1105 レビュー指摘対応: 従来は Describe が全体 `LIMIT` を一切検証せず、
+/// Execute では拒否される範囲外の値が Describe だけ受理されてしまっていた）。
 pub(crate) fn describe_columns(
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,
     udfs: &UdfRegistry,
     dummy_equality_flags: &[bool],
+    limit: Option<u32>,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+    if let Some(n) = limit {
+        crate::sql::parser::validate_search_limit(n)?;
+    }
     Ok(describe_tree(schemas, tree, udfs, dummy_equality_flags)?.0)
 }
 
@@ -432,5 +577,239 @@ fn describe_tree(
             }
             Ok((l_columns, l_has_vector))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+    use crate::recovery::required_op_id::OperationId;
+    use crate::row_codec::Value;
+    use crate::sql::allowlist::{Projection, SetOperator, ValidatedScan};
+    use crate::sql::udf_call::UdfRegistry;
+    use crate::storage::{Storage, Visibility};
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+    use redb::ReadableDatabase;
+
+    fn text_schema(name: &str) -> TableSchema {
+        TableSchema::new(
+            name,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    fn insert_text_row(storage: &Storage, table: &str, tenant_ctx: &PolicyContext, body: &str) {
+        let op_id = OperationId::parse(&format!("seed-{table}")).expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            storage,
+            table,
+            tenant_ctx,
+            1,
+            Visibility::Public,
+            &[Value::Vector(vec![0.0, 0.0]), Value::Text(body.to_string())],
+            &op_id,
+        )
+        .expect("insert row");
+    }
+
+    fn text_branch(table: &str) -> SetTree {
+        SetTree::Branch(Box::new(ValidatedScan {
+            table_name: table.to_string(),
+            projection: Projection::Columns(vec!["body".to_string()]),
+            where_predicates: Vec::new(),
+            limit: crate::core::MAX_SEARCH_K as u32,
+            offset: 0,
+        }))
+    }
+
+    /// PR #1105 レビュー指摘の回帰: 各枝が独立に既定予算（1 GiB）を使うのではなく、
+    /// 文全体で 1 つの累計バイト予算を共有すること。1 枝だけなら収まるが、2 枝を
+    /// 合成すると超える上限を注入し、`UNION ALL`（重複除去なし。行キー生成の影響を
+    /// 排除して枝単体の計上だけを確認する）が `54000` になることを確認する。
+    #[test]
+    fn shared_byte_budget_rejects_when_combined_branches_exceed_the_injected_cap() {
+        let path = unique_db_path("set-op-shared-budget-reject");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&text_schema("a")).expect("create a");
+        storage.create_table(&text_schema("b")).expect("create b");
+        let tenant_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let body = "x".repeat(4096);
+        insert_text_row(&storage, "a", &tenant_ctx, &body);
+        insert_text_row(&storage, "b", &tenant_ctx, &body);
+
+        let tree = SetTree::Op {
+            op: SetOperator::UnionAll,
+            left: Box::new(text_branch("a")),
+            right: Box::new(text_branch("b")),
+        };
+        let mut table_names = Vec::new();
+        collect_branch_tables(&tree, &mut table_names);
+
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), text_schema("a"));
+        schemas.insert("b".to_string(), text_schema("b"));
+        let udfs = UdfRegistry::default();
+
+        // 1 枝分（約 4096 バイト＋構造体オーバーヘッド）は収まるが、2 枝合計は
+        // 超える上限を注入する。
+        let small_cap = 4096 + 512;
+        let err = execute_with_budget(
+            &read_txn,
+            &tenant_ctx,
+            &schemas,
+            &tree,
+            &udfs,
+            None,
+            small_cap,
+        )
+        .expect_err("combined branch bytes must exceed the injected shared budget");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// 上のちょうど対照: 2 枝合計が収まる上限を注入すれば成功することを確認する
+    /// （回帰テストが常に失敗するだけの壊れた検証になっていないことの確認）。
+    #[test]
+    fn shared_byte_budget_succeeds_when_combined_branches_fit_the_injected_cap() {
+        let path = unique_db_path("set-op-shared-budget-accept");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&text_schema("a")).expect("create a");
+        storage.create_table(&text_schema("b")).expect("create b");
+        let tenant_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let body = "x".repeat(4096);
+        insert_text_row(&storage, "a", &tenant_ctx, &body);
+        insert_text_row(&storage, "b", &tenant_ctx, &body);
+
+        let tree = SetTree::Op {
+            op: SetOperator::UnionAll,
+            left: Box::new(text_branch("a")),
+            right: Box::new(text_branch("b")),
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), text_schema("a"));
+        schemas.insert("b".to_string(), text_schema("b"));
+        let udfs = UdfRegistry::default();
+
+        let generous_cap = 1024 * 1024;
+        let result = execute_with_budget(
+            &read_txn,
+            &tenant_ctx,
+            &schemas,
+            &tree,
+            &udfs,
+            None,
+            generous_cap,
+        )
+        .expect("combined branch bytes must fit the generous injected budget");
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    /// PR #1105 レビュー指摘の回帰: 行キー生成（`UNION` の重複除去）も共有予算の
+    /// 対象であること。2 枝分の行データ自体は収まるが、行キーの複製分を追加すると
+    /// 超える上限では `UNION`（重複除去あり）が `54000` になることを確認する
+    /// （`UNION ALL` は行キーを生成しないため同じ上限でも成功するはずだが、本
+    /// テストは行キー計上の有無に絞って確認するため `UNION` 側のみを検証する）。
+    #[test]
+    fn shared_byte_budget_also_charges_row_key_generation() {
+        let path = unique_db_path("set-op-shared-budget-row-key");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&text_schema("a")).expect("create a");
+        storage.create_table(&text_schema("b")).expect("create b");
+        let tenant_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        // UNION の重複除去では左右が別内容でないと両方が結果に残らないが、行キー
+        // 生成自体は一致・不一致に関わらず両方の行に対して行うため、内容は異なる
+        // ものにしておく。
+        insert_text_row(&storage, "a", &tenant_ctx, &"x".repeat(4096));
+        insert_text_row(&storage, "b", &tenant_ctx, &"y".repeat(4096));
+
+        let tree = SetTree::Op {
+            op: SetOperator::Union,
+            left: Box::new(text_branch("a")),
+            right: Box::new(text_branch("b")),
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), text_schema("a"));
+        schemas.insert("b".to_string(), text_schema("b"));
+        let udfs = UdfRegistry::default();
+
+        // 2 枝分の行データ（約 8192 バイト＋構造体オーバーヘッド）はちょうど収まるが、
+        // 行キー（各行の複製で約 8192 バイト追加）までは収まらない上限。
+        let cap_without_row_key_room = 4096 * 2 + 1024;
+        let err = execute_with_budget(
+            &read_txn,
+            &tenant_ctx,
+            &schemas,
+            &tree,
+            &udfs,
+            None,
+            cap_without_row_key_room,
+        )
+        .expect_err("row key generation must be charged against the shared budget");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// PR #1105 レビュー指摘の回帰: 全体 `LIMIT` の範囲外検証（`22000`）は全枝の
+    /// 走査より前に行う。存在しないテーブルを枝に含めても（走査すれば `XX000`
+    /// 相当の内部エラーになるはずの構成）、範囲外 `LIMIT` が先に `22000` で拒否
+    /// することを確認する。
+    #[test]
+    fn out_of_range_limit_is_rejected_before_branches_are_scanned() {
+        let path = unique_db_path("set-op-limit-before-scan");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        let tenant_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let tree = text_branch("missing_table");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        // 意図的にスキーマを解決しない（走査されれば `schemas.get` が `None` を
+        // 返し `Internal` エラーになる構成）。
+        let schemas: HashMap<String, TableSchema> = HashMap::new();
+        let udfs = UdfRegistry::default();
+
+        let err = execute(&read_txn, &tenant_ctx, &schemas, &tree, &udfs, Some(0))
+            .expect_err("LIMIT 0 must be rejected before any branch is scanned");
+        assert_eq!(err.wire_code(), "22000");
+
+        let err = execute(
+            &read_txn,
+            &tenant_ctx,
+            &schemas,
+            &tree,
+            &udfs,
+            Some(crate::core::MAX_SEARCH_K as u32 + 1),
+        )
+        .expect_err("LIMIT over MAX_SEARCH_K must be rejected before any branch is scanned");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// PR #1105 レビュー指摘の回帰: Describe 経路（`describe_columns`）も Execute
+    /// と同じ全体 `LIMIT` 範囲検証を行う（従来は検証していなかった）。
+    #[test]
+    fn describe_columns_rejects_out_of_range_limit_like_execute() {
+        let tree = text_branch("a");
+        let schemas: HashMap<String, TableSchema> = HashMap::new();
+        let udfs = UdfRegistry::default();
+
+        let err = describe_columns(&schemas, &tree, &udfs, &[], Some(0))
+            .expect_err("LIMIT 0 must be rejected by describe_columns");
+        assert_eq!(err.wire_code(), "22000");
+
+        let err = describe_columns(
+            &schemas,
+            &tree,
+            &udfs,
+            &[],
+            Some(crate::core::MAX_SEARCH_K as u32 + 1),
+        )
+        .expect_err("LIMIT over MAX_SEARCH_K must be rejected by describe_columns");
+        assert_eq!(err.wire_code(), "22000");
     }
 }

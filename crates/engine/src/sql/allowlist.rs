@@ -1334,7 +1334,9 @@ pub(crate) enum SetTree {
 pub struct ValidatedSetOperation {
     pub(crate) tree: SetTree,
     /// 全体 `LIMIT n`（任意）。範囲検証（`1..=core::MAX_SEARCH_K`）は
-    /// `sql::set_op::execute` が実行直前に行う。
+    /// `sql::set_op::execute` が全枝の走査より前に、`sql::set_op::
+    /// describe_columns` が Describe 経路で同じ検証を行う（PR #1105 レビュー
+    /// 指摘対応。Execute／Describe の受理・拒否を一致させる）。
     pub(crate) limit: Option<u32>,
 }
 

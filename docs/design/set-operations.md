@@ -71,8 +71,12 @@ branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
   確定できないため fail-closed で拒否する
 
 全体に対する `LIMIT <n>` は任意（`1..=core::MAX_SEARCH_K`。範囲外は
-`22000`）。括弧の入れ子上限は 4（実装既定値）、超過は `54000`。枝数の上限は
-16（実装既定値）で、超過は `Vec` に積む前に判定し `54000`。
+`22000`）。範囲検証は `sql::set_op::execute` が全枝の走査より前に行い、
+`sql::set_op::describe_columns`（Describe 経路）も同じ検証を行う（PR #1105
+レビュー指摘対応。従来は Execute のみ全枝の走査・合成の後に検証しており、
+Describe は検証していなかったため範囲外の値が Describe だけ受理されていた）。
+括弧の入れ子上限は 4（実装既定値）、超過は `54000`。枝数の上限は 16
+（実装既定値）で、超過は `Vec` に積む前に判定し `54000`。
 
 `UNION`／`INTERSECT`/`EXCEPT` は [`crate::sql::lexer::Keyword`] 化しない
 （既存の列名・テーブル名としての用法を壊さないため）。検出は「演算子ident
@@ -104,9 +108,14 @@ branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
 - 単一スナップショット: `EngineCore::read_txn_with_schemas`（`Self::
   read_txn_with_schema` の複数テーブル版）が `storage.db().begin_read()` を
   1 回だけ開き、枝が参照する全テーブルのスキーマをまとめて解決する。
-- 各枝の評価は既存の `execute_scan`（既定バイト予算）をそのまま呼ぶ。可視
-  行数が `core::MAX_SEARCH_K` を超える場合は `54000`（超過検出のため
-  `MAX_SEARCH_K + 1` を上限として走査する）。
+- 各枝の評価は `execute_scan_with_budget` を呼ぶ。可視行数が
+  `core::MAX_SEARCH_K` を超える場合は `54000`（超過検出のため
+  `MAX_SEARCH_K + 1` を上限として走査する）。バイト予算は文全体（全枝の走査・
+  合成・行キー生成）で 1 つの累計予算（`sql::set_op::SetOpBudget`。単一クエリ
+  の結果予算と同じ上限）を共有し、枝ごとに独立の予算を持たせない（PR #1105
+  レビュー指摘対応。従来は各枝が独立に同予算を使い、最大 16 枝分の結果を
+  同時に保持し得たため、単一クエリの結果予算をはるかに超える合計メモリを
+  SQL 入力だけで確保できていた）。
 - RLS: 全枝に、呼び出しセッション自身の `PolicyContext` を独立して渡す
   （scan 経路の既存 RLS には一切手を入れない）。
 - 重複除去の基数上限・合成結果の行数上限: いずれも `core::MAX_SEARCH_K`
@@ -128,8 +137,6 @@ branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
 
 ## スコープ外（Issue #929 の対象外事項）
 
-- 全枝で共有する累計バイト予算（各枝は独立予算のまま。`sql::set_op`
-  モジュールドキュメント参照）
 - 集計・`DISTINCT`・`ORDER BY`・`OFFSET`・ベクトル順位付けを含む枝、集合演算
   の結果に対する `ORDER BY`
 - `INTERSECT ALL`／`EXCEPT ALL`、括弧内の `LIMIT`
