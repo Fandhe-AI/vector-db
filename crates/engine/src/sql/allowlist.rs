@@ -534,6 +534,12 @@ pub enum SqlSurfaceError {
     /// （[`crate::sql::set_op`] が束縛時に検証する。ERR-6: `42804`）。`detail`
     /// には列番号のみを含め、テーブル名・行の値は含めない（security.md P0）。
     DatatypeMismatch { detail: String },
+    /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10・
+    /// Issue #924）で、非修飾列参照が 2 つ以上の参照テーブルに一致した
+    /// （候補が曖昧で一意に解決できない）。ERR-6: `42702`。文言には列名のみを
+    /// 含め、候補テーブルの列挙はしない（security.md P0「存在情報を漏らさない」
+    /// 対応。曖昧な列は「どのテーブルの候補があるか」自体が情報になり得る）。
+    AmbiguousColumn { name: String },
 }
 
 impl SqlSurfaceError {
@@ -706,6 +712,15 @@ impl SqlSurfaceError {
             detail: truncate_for_error(&detail.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::relation::BindingScope::resolve`（SQL-28・RLS-10、
+    /// Issue #924）が非修飾列参照の曖昧な解決を報告するために使う。列名は
+    /// untrusted な字句解析結果のため他 variant と同じ切り詰め規約を経由する。
+    pub(crate) fn ambiguous_column(name: impl Into<String>) -> Self {
+        SqlSurfaceError::AmbiguousColumn {
+            name: truncate_for_error(&name.into()),
+        }
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -754,6 +769,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
             SqlSurfaceError::DatatypeMismatch { .. } => ErrorClass::DatatypeMismatch,
+            SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
         }
     }
 
@@ -895,6 +911,9 @@ impl std::fmt::Display for SqlSurfaceError {
                     f,
                     "datatype mismatch between set operation branches: {detail}"
                 )
+            }
+            SqlSurfaceError::AmbiguousColumn { name } => {
+                write!(f, "column reference {name:?} is ambiguous")
             }
         }
     }
