@@ -46,6 +46,7 @@ use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
 use crate::sql::udf_call::{self, BinOp, ExprValue};
 use crate::storage;
 use redb::ReadableTable;
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
 /// `GROUP BY` が生成してよいグループ数の上限（無制限 `BTreeMap` 確保を避ける）。
@@ -254,6 +255,100 @@ impl From<SqlSurfaceError> for GroupAccumulateError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupKey(Vec<Option<String>>);
 
+/// [`GroupKey`]（所有）と、複数列 `GROUP BY` の行走査ループが構築する借用成分列
+/// （[`BorrowedGroupKey`]）を同一の比較規約で扱うためのビュー。`GroupKey::cmp`・
+/// [`cmp_group_key_views`] は本トレイトの同じ実装へ委譲するため両者の順序は
+/// 構造的に一致する（`Borrow` の契約である「借用後も `Ord` が変わらない」を
+/// 保証する）。
+///
+/// PR #1099 レビュー指摘（Cursor Bugbot・codex-review、複数列 `GROUP BY` 経路）
+/// 対応: 単一列経路（`string_groups: BTreeMap<String, _>`。`String: Borrow<str>`）
+/// と同様に、複数列経路でも `multi_groups: BTreeMap<GroupKey, _>` を借用キーで
+/// 先に検索できるようにする（[`Borrow<dyn GroupKeyView>`] impl 参照）。これにより
+/// 既存グループへの累積行では成分の所有化（[`try_clone_str`]）が発生せず、新規
+/// グループが確定した行のみ [`check_new_group_budget`] の予算検査を経てから
+/// キーを 1 回所有化する。
+trait GroupKeyView {
+    /// キーの成分数（`GROUP BY` 対象列数）。
+    fn len(&self) -> usize;
+    /// `i` 番目の成分（`None` は NULL 値のグループ）。範囲外は NULL 相当。
+    fn component(&self, i: usize) -> Option<&str>;
+}
+
+impl GroupKeyView for GroupKey {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn component(&self, i: usize) -> Option<&str> {
+        self.0.get(i).and_then(|c| c.as_deref())
+    }
+}
+
+/// 行走査ループが構築する借用成分列（各成分は `scanned` から借用した `&str`）。
+/// 所有化前に [`GroupKeyView`] 経由で既存グループを検索するための一時ビュー。
+struct BorrowedGroupKey<'a>(&'a [Option<&'a str>]);
+
+impl GroupKeyView for BorrowedGroupKey<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn component(&self, i: usize) -> Option<&str> {
+        self.0.get(i).copied().flatten()
+    }
+}
+
+/// [`GroupKeyView`] 実装同士の辞書式比較（成分ごとに `Some` は常に `None` より
+/// 小さい＝NULL は末尾）。所有 [`GroupKey`] 同士の比較（`Ord`）・所有と借用の
+/// 比較（`BTreeMap` 探索、`Borrow<dyn GroupKeyView>` 経由）の両方がこの 1 つの
+/// 実装に委譲するため、順序が食い違うことはない。
+fn cmp_group_key_views(a: &dyn GroupKeyView, b: &dyn GroupKeyView) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let len = a.len().min(b.len());
+    for i in 0..len {
+        let component_order = match (a.component(i), b.component(i)) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        if component_order != Ordering::Equal {
+            return component_order;
+        }
+    }
+    // 成分数は同一クエリ内では常に揃う（`bound.group_by.column_indices` の
+    // 宣言列数で固定されるため）。念のため長さの違いも決定的に扱う。
+    a.len().cmp(&b.len())
+}
+
+impl PartialEq for dyn GroupKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        cmp_group_key_views(self, other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for dyn GroupKeyView + '_ {}
+
+impl PartialOrd for dyn GroupKeyView + '_ {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for dyn GroupKeyView + '_ {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_group_key_views(self, other)
+    }
+}
+
+/// `BTreeMap<GroupKey, _>::get_mut` を所有化前の借用キー（[`BorrowedGroupKey`]）
+/// で呼ぶための `Borrow` 実装。`&self` の生存期間のまま `&dyn GroupKeyView` を
+/// 返すだけで新たな確保は発生しない。
+impl<'a> Borrow<dyn GroupKeyView + 'a> for GroupKey {
+    fn borrow(&self) -> &(dyn GroupKeyView + 'a) {
+        self
+    }
+}
+
 impl PartialOrd for GroupKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -262,21 +357,7 @@ impl PartialOrd for GroupKey {
 
 impl Ord for GroupKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        for (a, b) in self.0.iter().zip(other.0.iter()) {
-            let component_order = match (a, b) {
-                (Some(x), Some(y)) => x.cmp(y),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            };
-            if component_order != Ordering::Equal {
-                return component_order;
-            }
-        }
-        // 成分数は同一クエリ内では常に揃う（`bound.group_by.column_indices` の
-        // 宣言列数で固定されるため）。念のため長さの違いも決定的に扱う。
-        self.0.len().cmp(&other.0.len())
+        cmp_group_key_views(self, other)
     }
 }
 
@@ -1554,16 +1635,23 @@ pub(crate) fn execute_grouped_aggregate(
                     }
                 } else {
                     // 複数キー（SQL-25 (d)）: 索引経路を持たない全走査専用の
-                    // `multi_groups` へ振り分ける。キーはタプル（`GroupKey`）
-                    // として組み立て、各成分は単一キーと同じ規約
+                    // `multi_groups` へ振り分ける。各成分は単一キーと同じ規約
                     // （`TEXT` 限定・fail-closed で NULL 扱い）で解決する。
-                    // 各成分の所有化は単一キー経路の `try_clone_str` と同じ
-                    // `try_reserve_exact` ベースの確保にする（`str::to_string`
-                    // 等の無条件のインフォリブルな確保は、untrusted な格納済み
-                    // TEXT 列値のサイズに対して確保失敗時に abort し得るため
-                    // 使わない。`.claude/rules/security.md`「不安全な設計」対応）。
-                    let mut key_components: Vec<Option<String>> = Vec::new();
-                    key_components
+                    //
+                    // PR #1099 レビュー指摘（Cursor Bugbot・codex-review）対応:
+                    // 単一キー経路（`string_groups.get_mut(key_str)`。上記
+                    // 484〜489 行目のコメント参照）と同じく、まず借用成分列
+                    // （`scanned` から借用した `&str`。所有化なし）で
+                    // `multi_groups` を検索し（[`GroupKey`] の
+                    // `Borrow<dyn GroupKeyView>` impl 経由）、既存グループへの
+                    // 累積だけで済む行では成分の所有化（[`try_clone_str`]）を
+                    // 一切発生させない。新規グループが確定した行のみ
+                    // [`check_new_group_budget`] の予算検査を経てから成分を
+                    // 1 回所有化する（旧実装は探索前に毎行 `try_clone_str` で
+                    // 所有化しており、既存グループ更新行でも不要な複製が発生し、
+                    // かつ予算超過で拒否される行でも複製コストを先払いしていた）。
+                    let mut borrowed_components: Vec<Option<&str>> = Vec::new();
+                    borrowed_components
                         .try_reserve_exact(group_by.column_indices.len())
                         .map_err(|_| {
                             SqlSurfaceError::payload_too_large(
@@ -1582,14 +1670,11 @@ pub(crate) fn execute_grouped_aggregate(
                                 accumulator_bug("GROUP BY key length accounting overflowed")
                             })?;
                         }
-                        key_components.push(match value {
-                            Some(s) => Some(try_clone_str(s)?),
-                            None => None,
-                        });
+                        borrowed_components.push(value);
                     }
-                    let group_key = GroupKey(key_components);
+                    let probe = BorrowedGroupKey(&borrowed_components);
                     let total_group_count = multi_groups.len();
-                    if let Some(accs) = multi_groups.get_mut(&group_key) {
+                    if let Some(accs) = multi_groups.get_mut(&probe as &dyn GroupKeyView) {
                         accumulate_row(
                             accs,
                             &bound.items,
@@ -1610,6 +1695,28 @@ pub(crate) fn execute_grouped_aggregate(
                             total_text_accumulator_bytes,
                             &budget,
                         )?;
+                        // 予算検査を通過した行のみ、各成分を所有化する
+                        // （`str::to_string` 等の無条件のインフォリブルな確保は、
+                        // untrusted な格納済み TEXT 列値のサイズに対して確保失敗時
+                        // に abort し得るため使わず、単一キー経路の
+                        // `try_clone_str` と同じ `try_reserve_exact` ベースの
+                        // 確保にする。`.claude/rules/security.md`「不安全な設計」
+                        // 対応）。
+                        let mut key_components: Vec<Option<String>> = Vec::new();
+                        key_components
+                            .try_reserve_exact(borrowed_components.len())
+                            .map_err(|_| {
+                                SqlSurfaceError::payload_too_large(
+                                    "GROUP BY key allocation exceeds available memory",
+                                )
+                            })?;
+                        for value in &borrowed_components {
+                            key_components.push(match value {
+                                Some(s) => Some(try_clone_str(s)?),
+                                None => None,
+                            });
+                        }
+                        let group_key = GroupKey(key_components);
                         let mut accs = new_accumulators(&bound.items)?;
                         accumulate_row(
                             &mut accs,
