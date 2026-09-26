@@ -316,23 +316,38 @@ fn resolve_in_subquery(
         ));
     }
     // 内側の結果行数（0 行を含む）に関わらず、対象列の存在・型を必ず検証する。
-    validate_in_target_column(column, outer_schema)?;
+    let target_ty = validate_in_target_column(column, outer_schema)?;
 
     let mut branches = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
         let cell = row.cells.first().ok_or_else(|| SqlSurfaceError::Internal {
             detail: "subquery row missing projected cell".to_string(),
         })?;
-        if let Some(leaf) = cell_to_equality_predicate(column, cell)? {
-            *in_leaf_budget = in_leaf_budget.checked_sub(1).ok_or_else(|| {
-                SqlSurfaceError::payload_too_large(format!(
-                    "subquery IN expansion leaf count exceeds limit {MAX_SUBQUERY_IN_LEAVES}"
-                ))
-            })?;
-            branches.push(vec![leaf]);
+        let Some(leaf) = cell_to_equality_predicate(column, cell)? else {
+            // NULL セルは照合から除く（`WherePredicate::InSubquery` ドキュメント・
+            // NULL の意味論参照）。
+            continue;
+        };
+        // 対象列が ENUM の場合、内側の値が語彙外のラベルなら「その値には
+        // 一致しない（fail-closed に文全体を落とさない）」として展開対象
+        // から除外する（PR #1103 追加 codex-review P1 指摘対応）。除外せず
+        // `Equality` 葉として残すと、後段の
+        // `declarative_filter::DeclarativeFilter::bind` が語彙外ラベルを
+        // `22000` で拒否し、外側 ENUM の語彙にない値が内側に 1 件でも
+        // 混じるだけで `IN` 全体（照合不一致になるべき箇所）が失敗して
+        // しまう。語彙外の値は葉予算（`in_leaf_budget`）も消費しない。
+        if let (ColumnType::Enum(def), WherePredicate::Equality { value, .. }) = (target_ty, &leaf)
+        {
+            if !def.contains(value) {
+                continue;
+            }
         }
-        // NULL セルは照合から除く（`WherePredicate::InSubquery` ドキュメント・
-        // NULL の意味論参照）。
+        *in_leaf_budget = in_leaf_budget.checked_sub(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large(format!(
+                "subquery IN expansion leaf count exceeds limit {MAX_SUBQUERY_IN_LEAVES}"
+            ))
+        })?;
+        branches.push(vec![leaf]);
     }
     Ok(WherePredicate::Or(branches))
 }

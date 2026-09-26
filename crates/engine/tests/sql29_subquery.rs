@@ -12,12 +12,13 @@
 //!   省略・相関サブクエリ・拡張クエリプロトコル（Parse/Bind）経由・
 //!   `NOT IN`/`NOT EXISTS`。
 
-use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::catalog::{ColumnDef, ColumnType, EnumTypeDef, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::mode::SessionState;
 use engine::storage::{Storage, Visibility};
+use std::sync::Arc;
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -27,7 +28,13 @@ const DOCS: &str = "docs";
 const ALLOWED_LANGS: &str = "allowed_langs";
 const VISITS: &str = "visits";
 
-fn docs_schema() -> TableSchema {
+const ENUM_TYPE: &str = "mood";
+
+fn enum_labels() -> Vec<String> {
+    vec!["happy".to_string(), "sad".to_string()]
+}
+
+fn docs_schema(mood_def: Arc<EnumTypeDef>) -> TableSchema {
     TableSchema::new(
         DOCS,
         vec![
@@ -38,6 +45,12 @@ fn docs_schema() -> TableSchema {
             // 分岐が `WherePredicate::Equality` 経由で常に失敗していたバグの
             // 回帰テスト用。`insert_doc` は指定しないため NULL 許容にする）。
             ColumnDef::new("priority", ColumnType::BigInt, true),
+            // ENUM 列を対象にした `IN (SELECT ...)`（PR #1103 追加 codex-review
+            // P1 指摘対応。`sql::subquery::validate_in_target_column` は ENUM
+            // 列を対象として許可するが、内側の投影値が語彙外のラベルを含む
+            // 場合の回帰テスト用。`insert_doc` は指定しないため NULL 許容
+            // にする）。
+            ColumnDef::new("mood", ColumnType::Enum(mood_def), true),
         ],
     )
 }
@@ -68,7 +81,12 @@ fn visits_schema() -> TableSchema {
 fn new_core() -> (EngineCore, std::path::PathBuf) {
     let path = unique_db_path("sql29-subquery");
     let storage = Storage::open(&path).expect("open storage");
-    storage.create_table(&docs_schema()).expect("create docs");
+    let mood_def = storage
+        .create_enum_type(ENUM_TYPE, enum_labels())
+        .expect("create mood enum type");
+    storage
+        .create_table(&docs_schema(mood_def))
+        .expect("create docs");
     storage
         .create_table(&allowed_langs_schema())
         .expect("create allowed_langs");
@@ -114,6 +132,18 @@ fn insert_doc_with_priority(
         &format!(
             "INSERT INTO {DOCS} (id, embedding, lang, priority) VALUES \
              ({id}, '[0.{id},0.1]', '{lang}', {priority}) USING OPERATION_ID 'doc-{id}'"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("insert doc id={id} should succeed: {e:?}"));
+}
+
+fn insert_doc_with_mood(core: &EngineCore, ctx: &PolicyContext, id: u64, lang: &str, mood: &str) {
+    core.execute_sql_in_session(
+        ctx,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {DOCS} (id, embedding, lang, mood) VALUES \
+             ({id}, '[0.{id},0.1]', '{lang}', '{mood}') USING OPERATION_ID 'doc-{id}'"
         ),
     )
     .unwrap_or_else(|e| panic!("insert doc id={id} should succeed: {e:?}"));
@@ -437,6 +467,80 @@ fn in_subquery_expansion_leaf_count_exceeds_limit_is_rejected() {
         err,
         engine::sql::allowlist::SqlSurfaceError::PayloadTooLarge { .. }
     ));
+}
+
+// PR #1103 追加 codex-review P1 指摘の回帰テスト: 対象列が ENUM の場合、
+// 内側の投影値に語彙外のラベルが混ざっていても、それは「一致しない値」
+// として展開対象から除外するだけで、文全体を失敗させてはならない
+// （除外せず `Equality` 葉として残すと、後段の `DeclarativeFilter::bind`
+// が語彙外ラベルを `22000` で拒否し、`IN` が本来「照合不一致」になる
+// べき場面で文全体が失敗してしまっていた）。`mood` 列の語彙は
+// `enum_labels()`（"happy"・"sad"）。
+
+#[test]
+fn in_subquery_enum_target_mixed_vocabulary_matches_only_valid_labels() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_mood(&core, &ctx, 1, "ja", "happy");
+    insert_doc_with_mood(&core, &ctx, 2, "en", "sad");
+    // 内側の投影値は語彙内（"happy"）・語彙外（"other"）が混在する。
+    insert_visit(&core, &ctx, 1, "happy");
+    insert_visit(&core, &ctx, 2, "other");
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE mood IN (SELECT note FROM {VISITS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    // 語彙外の "other" は展開対象から除外され、"happy" のみが一致する
+    // （id=2 の "sad" は一致しない＝エラーにはならず単に不一致）。
+    assert_eq!(ids, vec![1]);
+}
+
+#[test]
+fn in_subquery_enum_target_all_out_of_vocabulary_matches_no_rows() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_mood(&core, &ctx, 1, "ja", "happy");
+    insert_doc_with_mood(&core, &ctx, 2, "en", "sad");
+    // 内側の投影値はすべて語彙外。
+    insert_visit(&core, &ctx, 1, "other");
+    insert_visit(&core, &ctx, 2, "unknown");
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE mood IN (SELECT note FROM {VISITS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    // 全値が語彙外 ＝ 空の Or（常に偽）。エラーにはならない。
+    assert!(ids.is_empty());
+}
+
+#[test]
+fn in_subquery_enum_target_within_vocabulary_matches_independent_oracle() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_mood(&core, &ctx, 1, "ja", "happy");
+    insert_doc_with_mood(&core, &ctx, 2, "en", "sad");
+    insert_doc_with_mood(&core, &ctx, 3, "fr", "happy");
+    // 内側の投影値はすべて語彙内。
+    insert_visit(&core, &ctx, 1, "happy");
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE mood IN (SELECT note FROM {VISITS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert_eq!(ids, vec![1, 3]);
 }
 
 // --- EXISTS (SELECT ...) ----------------------------------------------------
