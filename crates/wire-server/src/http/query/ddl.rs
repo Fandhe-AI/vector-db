@@ -344,6 +344,15 @@ fn build_constraint_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
 
     match kind {
         "primary_key" | "unique" => {
+            // `references` は `foreign_key` 専用フィールドだが
+            // `DDL_CONSTRAINT_SCHEMA` は `kind` に関わらず形状として許容する
+            // （意味検証は本関数が担う）。`kind` と矛盾する `references` を
+            // 黙って無視すると、書き手が意図した外部キー制約が静かに
+            // primary_key／unique として登録されてしまうため、fail-closed
+            // 方針（曖昧な入力は拒否側に倒す）に従い明示的に拒否する。
+            if map.contains_key("references") {
+                return Err(DdlError::InvalidRequest);
+            }
             let columns = v.required_array("columns").map_err(DdlError::from)?;
             let mut tokens = if kind == "primary_key" {
                 vec![
@@ -690,5 +699,205 @@ pub fn handle_drop_table(
     match execute_drop_table(core, principal, validated) {
         Ok(()) => http_response::encode_ok(OK_BODY, now_wall),
         Err(err) => http_response::encode_error(err.error_class(), &err.client_message(), now_wall),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! トークン列写像の境界値を固定する unit tests（モジュール doc
+    //! 「untrusted 入力の取り扱い」参照）。HTTP フレーミング越しの結合検証は
+    //! `crates/wire-server/tests/nosql13_ddl.rs` が担う（同ファイル冒頭の
+    //! コメント参照）。
+
+    use super::*;
+    use engine::json::parse_json;
+
+    fn obj(json: &str) -> JsonValue {
+        parse_json(json).expect("test fixture must be valid JSON")
+    }
+
+    // --- default_literal_tokens ------------------------------------------
+
+    #[test]
+    fn default_literal_tokens_accepts_plain_string() {
+        let value = obj("\"hello\"");
+        let tokens = default_literal_tokens(&value).expect("string DEFAULT must succeed");
+        assert_eq!(tokens, vec![Token::StringLiteral("hello".to_string())]);
+    }
+
+    #[test]
+    fn default_literal_tokens_rejects_control_characters() {
+        let value = JsonValue::String("a\u{0000}b".to_string());
+        let err = default_literal_tokens(&value).expect_err("control char must be rejected");
+        assert!(matches!(err, DdlError::InvalidRequest));
+    }
+
+    #[test]
+    fn default_literal_tokens_splits_negative_number_into_punct_and_number() {
+        let value = obj("-3");
+        let tokens = default_literal_tokens(&value).expect("negative number must succeed");
+        assert_eq!(
+            tokens,
+            vec![Token::Punct('-'), Token::Number("3".to_string())]
+        );
+    }
+
+    #[test]
+    fn default_literal_tokens_accepts_positive_number_without_punct() {
+        let value = obj("3");
+        let tokens = default_literal_tokens(&value).expect("positive number must succeed");
+        assert_eq!(tokens, vec![Token::Number("3".to_string())]);
+    }
+
+    #[test]
+    fn default_literal_tokens_rejects_exponent_notation() {
+        let value = obj("1e10");
+        let err = default_literal_tokens(&value).expect_err("exponent form must be rejected");
+        assert!(matches!(err, DdlError::InvalidRequest));
+    }
+
+    #[test]
+    fn default_literal_tokens_rejects_non_scalar_json_values() {
+        for json in ["true", "null", "[1]", "{}"] {
+            let value = obj(json);
+            let err = default_literal_tokens(&value)
+                .expect_err("bool/null/array/object DEFAULT must be rejected");
+            assert!(matches!(err, DdlError::InvalidRequest), "input: {json}");
+        }
+    }
+
+    // --- build_add_column_type_tokens（numeric precision/scale 上限） ------
+
+    fn add_column_validated(json: &str) -> JsonValue {
+        obj(json)
+    }
+
+    #[test]
+    fn add_column_numeric_accepts_boundary_precision_and_scale() {
+        let value =
+            add_column_validated(r#"{"name":"n","type":"numeric","precision":255,"scale":255}"#);
+        let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
+        let tokens = build_add_column_type_tokens(&v).expect("precision/scale 255 must succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("NUMERIC".to_string()),
+                Token::Punct('('),
+                Token::Number("255".to_string()),
+                Token::Punct(','),
+                Token::Number("255".to_string()),
+                Token::Punct(')'),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_column_numeric_rejects_precision_above_upper_bound() {
+        let value =
+            add_column_validated(r#"{"name":"n","type":"numeric","precision":256,"scale":0}"#);
+        let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
+        let err = build_add_column_type_tokens(&v).expect_err("precision 256 must be rejected");
+        assert!(matches!(err, DdlError::InvalidRequest));
+    }
+
+    #[test]
+    fn add_column_numeric_rejects_scale_above_upper_bound() {
+        let value =
+            add_column_validated(r#"{"name":"n","type":"numeric","precision":0,"scale":256}"#);
+        let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
+        let err = build_add_column_type_tokens(&v).expect_err("scale 256 must be rejected");
+        assert!(matches!(err, DdlError::InvalidRequest));
+    }
+
+    // --- build_add_column_type_tokens（enum の予約キーワード判定） ---------
+
+    #[test]
+    fn is_reserved_type_keyword_matches_case_insensitively() {
+        assert!(is_reserved_type_keyword("vector"));
+        assert!(is_reserved_type_keyword("VECTOR"));
+        assert!(is_reserved_type_keyword("Numeric"));
+        assert!(!is_reserved_type_keyword("mood"));
+    }
+
+    #[test]
+    fn add_column_enum_rejects_reserved_type_keyword() {
+        let value = add_column_validated(r#"{"name":"n","type":"enum","enum_type":"TEXT"}"#);
+        let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
+        let err =
+            build_add_column_type_tokens(&v).expect_err("reserved keyword enum_type must fail");
+        assert!(matches!(err, DdlError::InvalidRequest));
+    }
+
+    #[test]
+    fn add_column_enum_accepts_non_reserved_type_name() {
+        let value = add_column_validated(r#"{"name":"n","type":"enum","enum_type":"mood"}"#);
+        let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
+        let tokens = build_add_column_type_tokens(&v).expect("non-reserved enum_type must succeed");
+        assert_eq!(tokens, vec![Token::Ident("mood".to_string())]);
+    }
+
+    // --- build_constraint_tokens（foreign_key 以外への references 混入） ---
+
+    #[test]
+    fn build_constraint_tokens_foreign_key_maps_references() {
+        let value = obj(r#"{"kind":"foreign_key","columns":["parent_id"],
+                "references":{"table":"parents","columns":["id"]}}"#);
+        let tokens = build_constraint_tokens(&value).expect("foreign_key must succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("FOREIGN".to_string()),
+                Token::Ident("KEY".to_string()),
+                Token::Punct('('),
+                Token::Ident("parent_id".to_string()),
+                Token::Punct(')'),
+                Token::Ident("REFERENCES".to_string()),
+                Token::Ident("parents".to_string()),
+                Token::Punct('('),
+                Token::Ident("id".to_string()),
+                Token::Punct(')'),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_constraint_tokens_primary_key_rejects_stray_references() {
+        let value = obj(r#"{"kind":"primary_key","columns":["id"],
+                "references":{"table":"parents"}}"#);
+        let err = build_constraint_tokens(&value)
+            .expect_err("primary_key with references must be rejected (fail-closed)");
+        assert!(matches!(err, DdlError::InvalidRequest));
+    }
+
+    #[test]
+    fn build_constraint_tokens_unique_rejects_stray_references() {
+        let value = obj(r#"{"kind":"unique","columns":["email"],
+                "references":{"table":"parents"}}"#);
+        let err = build_constraint_tokens(&value)
+            .expect_err("unique with references must be rejected (fail-closed)");
+        assert!(matches!(err, DdlError::InvalidRequest));
+    }
+
+    #[test]
+    fn build_constraint_tokens_primary_key_without_references_still_succeeds() {
+        let value = obj(r#"{"kind":"primary_key","columns":["id"]}"#);
+        let tokens = build_constraint_tokens(&value).expect("plain primary_key must succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("PRIMARY".to_string()),
+                Token::Ident("KEY".to_string()),
+                Token::Punct('('),
+                Token::Ident("id".to_string()),
+                Token::Punct(')'),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_constraint_tokens_check_is_feature_not_supported() {
+        let value = obj(r#"{"kind":"check"}"#);
+        let err = build_constraint_tokens(&value).expect_err("check must be unsupported");
+        assert!(matches!(err, DdlError::FeatureNotSupported(_)));
     }
 }
