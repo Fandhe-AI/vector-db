@@ -920,6 +920,28 @@ pub trait TableLookup {
         let _ = name;
         Ok(None)
     }
+
+    /// `name` が実テーブルであれば、束縛時（`sql::parser::bind_projection`）に
+    /// 許可される投影列名の集合（実カラム名 ＋ `id` 疑似列。スキーマが実カラム
+    /// `id` を宣言していれば重複させない）を返す。テーブルが存在しない場合・
+    /// 呼び出し側がこの照会に対応していない場合は `Ok(None)`（「列集合が
+    /// 分からないため、ここでは検査しない」を意味する。既定実装。`table_exists`
+    /// 自体の存在確認とは独立）。
+    ///
+    /// 参照される CTE・VIEW は最終的に `sql::parser::bind` が実テーブル
+    /// スキーマに対して列存在を検査するため、このメソッドが `None` を返しても
+    /// fail-open にはならない。唯一の例外はどこからも参照されない leaf CTE
+    /// （`sql::allowlist::validate_sql_tokens` の WITH 事前検証ループ）で、
+    /// これは bind に到達しないため、実テーブル直下の場合はこのメソッドの
+    /// 戻り値で列存在を検査する（Issue #928 レビュー指摘: Codex P1、
+    /// PR #1100 追加指摘）。既定実装が `Ok(None)` を返す既存の `TableLookup`
+    /// 実装（テスト用モック等）は、この場合に限り列存在検査を省略したまま
+    /// 動作し続ける（無変更でコンパイル・実行可能。`view_definition` の
+    /// 既定実装と同じ後方互換の方針）。
+    fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+        let _ = name;
+        Ok(None)
+    }
 }
 
 /// ORDER BY 関数呼び出し形（`FunctionCall`, TASK-75）の 1 引数。本モジュールは
@@ -4342,6 +4364,75 @@ impl<'a> Parser<'a> {
         self.expect_ident_matching("VIEW")?;
         self.expect_ident()
     }
+
+    /// `WITH <name> AS (<body>)[, <name> AS (<body>)]*`（非再帰 CTE。SQL-29 (b)・
+    /// RLS-10 (b)、TASK-213、Issue #928）を切り出し、各定義を
+    /// [`super::cte::CteDef`] へ積む。`<body>` は [`parse_view_body`]（`CREATE
+    /// VIEW` 本文と同一の許可パーサー）で検証する——本関数は第 2 の SELECT
+    /// パーサーを持たない。呼び出し元（[`validate_sql_tokens`] の `WITH`
+    /// 分岐）が、返した `Vec<CteDef>` と本関数消費後の残りトークン列
+    /// （主クエリ）を [`super::cte::resolve_relation`] へ渡す。
+    ///
+    /// 受理しない形（いずれも `42601`。SQL-29 (b) の対象外規定）:
+    /// `WITH RECURSIVE`・列名リスト `<name>(a, b)`・`MATERIALIZED`／
+    /// `NOT MATERIALIZED` 指定・本文内の `;`（`split_parenthesized` で切り出した
+    /// 括弧内トークン列に対して明示的に検査する。`parse_view_body` の
+    /// `expect_end_of_statement` は末尾の単一 `;` を許容してしまうため、
+    /// ここで先に弾かないと `WITH x AS (SELECT * FROM t;) ...` のような入力を
+    /// 誤って受理しうる）。定義数の上限は [`super::cte::check_definition_count`]、
+    /// 名前重複は [`super::cte::check_no_duplicate_name`] が判定する。
+    fn parse_with_clause(&mut self) -> Result<Vec<super::cte::CteDef>, SqlSurfaceError> {
+        self.expect_ident_matching("WITH")?;
+        if self.peek_ident_matches("RECURSIVE") {
+            return Err(SqlSurfaceError::unsupported(
+                "WITH RECURSIVE is not supported",
+            ));
+        }
+        let mut ctes: Vec<super::cte::CteDef> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            // `AS` を消費する前に `(` が現れるのは列名リスト形のみ（本文の
+            // `(` は必ず `AS` の後）。
+            if matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "CTE column name list is not supported",
+                ));
+            }
+            self.expect_ident_matching("AS")?;
+            if self.peek_ident_matches("MATERIALIZED") || self.peek_ident_matches("NOT") {
+                return Err(SqlSurfaceError::unsupported(
+                    "CTE MATERIALIZED hint is not supported",
+                ));
+            }
+            if !matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "expected '(' to start CTE body",
+                ));
+            }
+            let (inner, after) = split_parenthesized(self.remaining())?;
+            if inner.iter().any(|t| matches!(t, Token::Punct(';'))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "CTE body must not contain a statement separator",
+                ));
+            }
+            let body = parse_view_body(inner)?;
+            super::cte::check_no_duplicate_name(&ctes, &name)?;
+            ctes.push(super::cte::CteDef { name, body });
+            super::cte::check_definition_count(ctes.len())?;
+            // `split_parenthesized` はスライスのみを返す（`Parser` の内部位置を
+            // 持たない）ため、残りトークン数から `self.pos` を復元する。`after`
+            // は構造的に `self.tokens` の suffix であり `after.len()` は
+            // `self.tokens.len()` を超えないが、coding-rust.md の checked/
+            // saturating 演算方針に従い `saturating_sub` で明示する。
+            self.pos = self.tokens.len().saturating_sub(after.len());
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(ctes)
+    }
 }
 
 /// `CREATE VIEW ... AS` 本文の許可形状（TABLE-18・SQL-23・TASK-205、
@@ -5148,6 +5239,56 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
 /// `sql::params`（Issue #935・WIRE-12。拡張クエリプロトコルの `$n` 束縛）も、Bind 時に
 /// `Token::Param` を実値のトークンへ置換したトークン列を SQL テキストを経由せず
 /// この関数へ渡し、[`validate_sql`] と同一の判定順序・エラー分類を再利用する。
+/// `sql::view::resolve_from`・`sql::cte::resolve_relation` いずれの名前解決
+/// 結果（[`super::view::Resolved`]）からも、広域取得クエリ自身の形（射影・
+/// `WHERE`・`LIMIT`・`OFFSET`）を合成して [`ValidatedScan`] を組み立てる唯一の
+/// 実装（TABLE-18・TASK-205、TASK-213・Issue #928）。ビュー経由・CTE 経由の
+/// いずれの参照も畳み込み後は完全に同じ形になり、束縛・実行・RLS 適用は
+/// すべて既存経路をそのまま通る（第 2 の実行器を作らない設計）。
+fn build_scan_from_resolved(
+    table_name: String,
+    resolved: super::view::Resolved,
+    projection: Projection,
+    where_predicates: Vec<WherePredicate>,
+    limit: u32,
+    offset: u32,
+) -> Result<ValidatedScan, SqlSurfaceError> {
+    match resolved {
+        super::view::Resolved::Table => Ok(ValidatedScan {
+            table_name,
+            projection,
+            where_predicates,
+            limit,
+            offset,
+        }),
+        super::view::Resolved::View {
+            base_table,
+            view_predicates,
+            view_columns,
+        } => {
+            super::view::check_columns_within_view(
+                view_columns.as_deref(),
+                &projection,
+                &where_predicates,
+            )?;
+            let projection = if let (Projection::All, Some(cols)) = (&projection, &view_columns) {
+                Projection::Columns(cols.clone())
+            } else {
+                projection
+            };
+            let mut merged = view_predicates;
+            merged.extend(where_predicates);
+            Ok(ValidatedScan {
+                table_name: base_table,
+                projection,
+                where_predicates: merged,
+                limit,
+                offset,
+            })
+        }
+    }
+}
+
 pub(crate) fn validate_sql_tokens(
     tokens: &[Token],
     lookup: &impl TableLookup,
@@ -5157,6 +5298,10 @@ pub(crate) fn validate_sql_tokens(
     // 区別せず判定する。
     let is_set_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SET"));
+    // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）も `SET`・`CREATE`
+    // と同方針で、statement 先頭という文脈でのみ大文字小文字を区別せず判定する。
+    let is_with_statement =
+        matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("WITH"));
     let is_create_function_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"));
     // `EXPLAIN` も `SET`・`CREATE` と同方針（字句解析段階のキーワードにせず、
@@ -5242,41 +5387,136 @@ pub(crate) fn validate_sql_tokens(
             // 参照と完全に同じ `ValidatedScan` になり、束縛・実行・RLS 適用は
             // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
             ParsedSelect::Scan(shape) => {
-                match super::view::resolve_from(lookup, &shape.table_name)? {
-                    super::view::Resolved::Table => Ok(Statement::Scan(ValidatedScan {
-                        table_name: shape.table_name,
-                        projection: shape.projection,
-                        where_predicates: shape.where_predicates,
-                        limit: shape.limit,
-                        offset: shape.offset,
-                    })),
-                    super::view::Resolved::View {
-                        base_table,
-                        view_predicates,
-                        view_columns,
-                    } => {
-                        super::view::check_columns_within_view(
-                            view_columns.as_deref(),
-                            &shape.projection,
-                            &shape.where_predicates,
-                        )?;
-                        let projection = match (&shape.projection, &view_columns) {
-                            (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
-                            (other, _) => other.clone(),
-                        };
-                        let mut where_predicates = view_predicates;
-                        where_predicates.extend(shape.where_predicates);
-                        Ok(Statement::Scan(ValidatedScan {
-                            table_name: base_table,
-                            projection,
-                            where_predicates,
-                            limit: shape.limit,
-                            offset: shape.offset,
-                        }))
-                    }
-                }
+                let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
+                Ok(Statement::Scan(build_scan_from_resolved(
+                    shape.table_name,
+                    resolved,
+                    shape.projection,
+                    shape.where_predicates,
+                    shape.limit,
+                    shape.offset,
+                )?))
             }
         },
+        // TASK-213・SQL-29 (b)・RLS-10 (b)（Issue #928）: 非再帰 CTE。CTE は
+        // 「クエリの中だけで有効な名前なしビュー」として、`sql::cte::
+        // resolve_relation` を経由し `sql::view::resolve_from` と同じ
+        // `build_scan_from_resolved` へ合流させる（第 2 の実行器を作らない）。
+        // 主クエリは広域取得（`ParsedSelect::Scan`）のみを受理し、順位付き
+        // （`ORDER BY`／`USING PLAN`）・集計は明示的に拒否する（`WITH` 句を
+        // 剥がして後段へ流すと同名の実テーブルを黙って読む危険があるため、
+        // 絶対に行わない）。
+        _ if is_with_statement => {
+            let mut p = Parser::new(tokens);
+            let ctes = p.parse_with_clause()?;
+            let main_tokens = p.remaining();
+
+            if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "WITH must be followed by a SELECT statement",
+                ));
+            }
+            let main_contains_group_by = main_tokens.windows(2).any(|w| {
+                matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+                    && matches!(w[1], Token::Keyword(Keyword::By))
+            });
+            let main_is_aggregate_select = (matches!(main_tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+                && matches!(main_tokens.get(2), Some(Token::Punct('('))))
+                || main_contains_group_by;
+            if main_is_aggregate_select {
+                return Err(SqlSurfaceError::unsupported(
+                    "WITH does not support an aggregate main query",
+                ));
+            }
+            let shape = match parse_select_shape(main_tokens)? {
+                ParsedSelect::Scan(shape) => shape,
+                ParsedSelect::Search(_) => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "WITH does not support a ranked main query (ORDER BY / USING PLAN)",
+                    ));
+                }
+            };
+
+            // 参照されない CTE も含め、すべての定義本文を検証する（決定性・
+            // fail-closed のため。構造検証・存在確認を省略しない）。
+            // 上限カウンタ（`ResolveBudget`）は「1 回のトップレベル呼び出し
+            // （1 つの CTE 定義の事前検証、または主クエリの解決）」ごとに
+            // 新規生成する（`cte::MAX_CTE_REFERENCES` のドキュメント参照。
+            // Issue #928 レビュー指摘）。文全体で 1 つのカウンタを使い回すと、
+            // このループが各定義のチェーンを再帰的に辿るたびに参照回数が
+            // 名前ごとではなく呼び出し回数分累積し、定義数・連鎖の深さの
+            // どちらも上限内の有効なクエリを誤って `54000` で拒否する。
+            // 連鎖の深さは `MAX_CTE_NESTING_DEPTH` で呼び出しごとに独立して
+            // 上限が掛かるため、リセットしても DoS 対策としての上限は失われない。
+            //
+            // `resolve_relation` は `def.body.table_name`（FROM）の名前解決
+            // 連鎖だけを検証し、`def` 自身の射影・`WHERE`（`compose` が本来
+            // 適用する `check_columns_within_view`）は「他の CTE・主クエリから
+            // 参照され `compose` を通る」場合にしか検証されない。参照されない
+            // leaf CTE はどこからも `compose` されないため、FROM 解決結果
+            // （`resolved` の公開列集合）に対して `def` 自身の射影・`WHERE` を
+            // ここで明示的に検証しないと、先行 CTE が非公開列を隠していても
+            // 参照されない後続 CTE がそれを射影・条件に使う文を通してしまう
+            // （Issue #928 レビュー指摘: Codex P1・Cursor Bugbot Low、同一欠陥）。
+            //
+            // `resolved` の公開列集合が `None`（`Resolved::Table` か、連鎖の
+            // どの段も列を絞り込んでいない `Resolved::View { view_columns: None,
+            // .. }`）の場合、実テーブル直下の列存在検査は通常
+            // `sql::parser::bind` に委ねている（`sql::view::resolve_from` の
+            // 同種コメント参照）。これは**参照される** CTE・VIEW には妥当
+            // （最終的に `ValidatedScan` へ畳み込まれ bind を通る）だが、
+            // どこからも参照されない leaf CTE は bind に到達しないため、
+            // ここで実テーブルのスキーマへ問い合わせて代わりに検証する
+            // （PR #1100 追加レビュー指摘: Codex P1・Cursor Bugbot Low）。
+            // `TableLookup::table_columns` の既定実装は `Ok(None)`（検査省略・
+            // 後方互換）を返すため、これに対応しない `TableLookup` 実装
+            // （テスト用モック等）は無変更のまま今まで通り動作する。
+            for (idx, def) in ctes.iter().enumerate() {
+                let mut budget = super::cte::ResolveBudget::new();
+                let resolved = super::cte::resolve_relation(
+                    lookup,
+                    &ctes,
+                    idx,
+                    &def.body.table_name,
+                    0,
+                    &mut budget,
+                )?;
+                let (base_table, view_columns): (&str, Option<Vec<String>>) = match &resolved {
+                    super::view::Resolved::Table => (def.body.table_name.as_str(), None),
+                    super::view::Resolved::View {
+                        base_table,
+                        view_columns,
+                        ..
+                    } => (base_table.as_str(), view_columns.clone()),
+                };
+                let exposed = match view_columns {
+                    Some(cols) => Some(cols),
+                    None => lookup.table_columns(base_table)?,
+                };
+                super::view::check_columns_within_view(
+                    exposed.as_deref(),
+                    &def.body.projection,
+                    &def.body.where_predicates,
+                )?;
+            }
+            let mut budget = super::cte::ResolveBudget::new();
+            let resolved = super::cte::resolve_relation(
+                lookup,
+                &ctes,
+                ctes.len(),
+                &shape.table_name,
+                0,
+                &mut budget,
+            )?;
+            Ok(Statement::Scan(build_scan_from_resolved(
+                shape.table_name,
+                resolved,
+                shape.projection,
+                shape.where_predicates,
+                shape.limit,
+                shape.offset,
+            )?))
+        }
         _ if is_set_statement => {
             let value = parse_set_search_mode(tokens)?;
             Ok(Statement::SetSearchMode { value })
@@ -5854,7 +6094,8 @@ pub enum CopyStatement {
 }
 
 /// `(<items>)` の対応する丸括弧を見つけ、内側・外側後続のトークン列へ分割する
-/// （`COPY (<SELECT>) TO STDOUT` の内側 SELECT を切り出すための唯一の実装。
+/// （`COPY (<SELECT>) TO STDOUT` の内側 SELECT、`WITH <name> AS (<body>)`
+/// の CTE 本文〔TASK-213・SQL-29 (b)、Issue #928〕の双方が使う唯一の実装。
 /// 文字列リテラル内の `(`/`)` は字句解析時点で既に 1 個の `Token::StringLiteral`
 /// へ吸収されているため、本関数はトークン列上の `Token::Punct('('/')')` だけを
 /// 深さで数えれば安全に対応を取れる）。`tokens` の先頭は必ず `(` であること
@@ -5869,10 +6110,10 @@ fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurf
                 depth -= 1;
                 if depth == 0 {
                     let inner = tokens.get(1..i).ok_or_else(|| {
-                        SqlSurfaceError::unsupported("malformed COPY (...) clause")
+                        SqlSurfaceError::unsupported("malformed parenthesized clause")
                     })?;
                     let after = tokens.get(i + 1..).ok_or_else(|| {
-                        SqlSurfaceError::unsupported("malformed COPY (...) clause")
+                        SqlSurfaceError::unsupported("malformed parenthesized clause")
                     })?;
                     return Ok((inner, after));
                 }
@@ -5881,7 +6122,7 @@ fn split_parenthesized(tokens: &[Token]) -> Result<(&[Token], &[Token]), SqlSurf
         }
     }
     Err(SqlSurfaceError::unsupported(
-        "unterminated parenthesized expression in COPY statement",
+        "unterminated parenthesized expression",
     ))
 }
 
@@ -10928,5 +11169,401 @@ mod tests {
             format!("SELECT {expr} FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10");
         let err = validate_statement(&sql, &lookup).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    // --- 非再帰 CTE（`WITH` 句。SQL-29 (b)・RLS-10 (b)、TASK-213、Issue #928） ---
+
+    #[test]
+    fn accepts_single_cte() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.table_name(), "documents");
+        assert_eq!(scan.limit(), 10);
+    }
+
+    #[test]
+    fn accepts_cte_chain() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH a AS (SELECT id FROM documents), b AS (SELECT id FROM a) SELECT * FROM b LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.table_name(), "documents");
+    }
+
+    #[test]
+    fn accepts_cte_referencing_view() {
+        struct ViewCatalog;
+        impl TableLookup for ViewCatalog {
+            fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+                Ok(name == "documents")
+            }
+            fn view_definition(
+                &self,
+                name: &str,
+            ) -> Result<Option<crate::catalog::ViewDef>, SqlSurfaceError> {
+                if name == "docs_view" {
+                    Ok(Some(crate::catalog::ViewDef {
+                        base_relation: "documents".to_string(),
+                        body_sql: "SELECT id FROM documents".to_string(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let scan = expect_scan(
+            "WITH x AS (SELECT id FROM docs_view) SELECT * FROM x LIMIT 10",
+            &ViewCatalog,
+        );
+        assert_eq!(scan.table_name(), "documents");
+    }
+
+    #[test]
+    fn accepts_cte_composed_with_main_query_where() {
+        // CTE 本文が `SELECT *`（列を絞り込まない）であれば、主クエリの
+        // `WHERE` は CTE 本文が公開しない列という制約を受けない。
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH x AS (SELECT * FROM documents WHERE lang = 'ja') SELECT * FROM x WHERE flag LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(
+            scan.where_predicates(),
+            &[
+                WherePredicate::Equality {
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
+                },
+                WherePredicate::BoolColumn {
+                    column: "flag".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_select_star_over_column_restricted_cte() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(
+            scan.projection(),
+            &Projection::Columns(vec!["id".to_string()])
+        );
+    }
+
+    #[test]
+    fn accepts_unreferenced_cte() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH unused AS (SELECT id FROM documents) SELECT * FROM documents LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.table_name(), "documents");
+    }
+
+    #[test]
+    fn cte_name_hides_real_table_of_the_same_name() {
+        // `documents` という名前の CTE を定義すると、主クエリの `FROM
+        // documents` は実テーブルではなく CTE を指す（PostgreSQL と同じ
+        // 名前解決の意味論）。CTE 本文は実テーブルを参照する。
+        let lookup = catalog_with(&["documents"]);
+        let scan = expect_scan(
+            "WITH documents AS (SELECT id FROM documents WHERE lang = 'ja') SELECT * FROM documents LIMIT 10",
+            &lookup,
+        );
+        assert_eq!(scan.table_name(), "documents");
+        assert_eq!(
+            scan.where_predicates(),
+            &[WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: "ja".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn accepts_cte_definition_count_at_limit_rejects_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let defs_at_limit: Vec<String> = (0..crate::sql::cte::MAX_CTE_DEFINITIONS)
+            .map(|i| format!("c{i} AS (SELECT id FROM documents)"))
+            .collect();
+        let sql_ok = format!(
+            "WITH {} SELECT * FROM c0 LIMIT 10",
+            defs_at_limit.join(", ")
+        );
+        expect_scan(&sql_ok, &lookup);
+
+        let defs_over_limit: Vec<String> = (0..=crate::sql::cte::MAX_CTE_DEFINITIONS)
+            .map(|i| format!("c{i} AS (SELECT id FROM documents)"))
+            .collect();
+        let sql_over = format!(
+            "WITH {} SELECT * FROM c0 LIMIT 10",
+            defs_over_limit.join(", ")
+        );
+        let err = validate_sql(&sql_over, &lookup).expect_err("must exceed CTE definition limit");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn accepts_many_definitions_referencing_a_shared_chain_within_documented_limits() {
+        // Issue #928 レビュー指摘の回帰テスト: 定義数（<= MAX_CTE_DEFINITIONS =
+        // 16）・連鎖の深さ（主クエリが参照する d11 の解決は d11→c2→c1→c0→
+        // documents の 4 回のリレー、すなわち MAX_CTE_NESTING_DEPTH = 4 の
+        // 境界ちょうど）のどちらも文書化された上限内に収まる有効なクエリが、
+        // 事前検証ループでの参照回数の誤積算により `54000`（"CTE reference
+        // count exceeds limit"）へ誤って拒否されないことを確認する。
+        // c0..c2 の 3 段連鎖に加え、末尾の c2 を直接参照する d0..d11 の
+        // 12 定義（計 15 定義）を用意する。事前検証ループは各 d_i の FROM を
+        // 独立に解決し（c2→c1→c0 の 3 回の CTE 名マッチ）、ResolveBudget が
+        // 文全体で 1 つに共有されていた旧実装では d_i 12 件分だけで 36 回
+        // （> MAX_CTE_REFERENCES = 32）を消費し誤って拒否されていた。
+        let lookup = catalog_with(&["documents"]);
+        let mut defs = vec!["c0 AS (SELECT id FROM documents)".to_string()];
+        for i in 1..3 {
+            defs.push(format!("c{i} AS (SELECT id FROM c{})", i - 1));
+        }
+        for i in 0..12 {
+            defs.push(format!("d{i} AS (SELECT id FROM c2)"));
+        }
+        assert_eq!(defs.len(), 15);
+        let sql = format!("WITH {} SELECT * FROM d11 LIMIT 10", defs.join(", "));
+        expect_scan(&sql, &lookup);
+    }
+
+    #[test]
+    fn accepts_cte_nesting_depth_at_limit_rejects_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        // `MAX_CTE_NESTING_DEPTH` 件の CTE 連鎖（c0 は基底テーブルを直接参照し、
+        // c1..c{depth-1} はそれぞれ 1 つ前を参照する）はちょうど上限内で受理する。
+        // 1 件多い連鎖（`depth + 1` 件）は基底テーブル解決の 1 手前で深さが
+        // 上限を超え `54000` になる。
+        let depth = crate::sql::cte::MAX_CTE_NESTING_DEPTH as usize;
+        let mut defs = vec!["c0 AS (SELECT id FROM documents)".to_string()];
+        for i in 1..depth {
+            defs.push(format!("c{i} AS (SELECT id FROM c{})", i - 1));
+        }
+        let last = depth - 1;
+        let sql_ok = format!("WITH {} SELECT * FROM c{last} LIMIT 10", defs.join(", "));
+        expect_scan(&sql_ok, &lookup);
+
+        defs.push(format!("c{depth} AS (SELECT id FROM c{last})"));
+        let sql_over = format!("WITH {} SELECT * FROM c{depth} LIMIT 10", defs.join(", "));
+        let err = validate_sql(&sql_over, &lookup).expect_err("must exceed CTE nesting depth");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn rejects_with_recursive() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH RECURSIVE x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("WITH RECURSIVE must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_cte_column_name_list() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x (a) AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("CTE column name list must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_cte_materialized_hint() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS MATERIALIZED (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS NOT MATERIALIZED (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("MATERIALIZED hint must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_cte_name() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents), x AS (SELECT id FROM documents) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("duplicate CTE name must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_cte_body_with_order_by_limit_aggregate_or_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS (SELECT id FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT id FROM documents LIMIT 5) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT COUNT(*) FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT id FROM documents;) SELECT * FROM x LIMIT 10",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_main_query_ranked_or_aggregate_over_cte() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "WITH x AS (SELECT id FROM documents) SELECT COUNT(*) FROM x",
+        ] {
+            let err = validate_sql(sql, &lookup)
+                .expect_err("ranked or aggregate main query over CTE must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_data_modifying_cte() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "WITH x AS (DELETE FROM documents) SELECT * FROM x LIMIT 10",
+            "WITH x AS (SELECT id FROM documents) INSERT INTO documents (id) VALUES ('1')",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("data-modifying CTE must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_cte_referencing_undefined_relation() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM ghost) SELECT * FROM x LIMIT 10",
+            &lookup,
+        )
+        .expect_err("undefined relation in CTE body must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn rejects_out_of_scope_column_over_cte() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x WHERE body = 'y' LIMIT 10",
+            &lookup,
+        )
+        .expect_err("column outside CTE's exposed set must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_unreferenced_cte_projecting_column_outside_preceding_ctes_exposed_set() {
+        // Issue #928 レビュー指摘の回帰テスト（Codex P1・Cursor Bugbot Low、
+        // 同一欠陥）: 先行 CTE `x` が `id` のみを公開していても、後続 CTE
+        // `unused` がどこからも参照されない（`compose` を通らない）ことを
+        // 悪用して非公開列を射影・条件に使う文を通してはならない。事前検証
+        // ループは各定義の FROM 解決結果に対して定義自身の射影・`WHERE` も
+        // 検証すること（`check_columns_within_view` 相当）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents), unused AS (SELECT body FROM x) SELECT * FROM documents LIMIT 10",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE projecting a column outside its FROM's exposed set must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+
+        let err = validate_sql(
+            "WITH x AS (SELECT id FROM documents), unused AS (SELECT id FROM x WHERE body = 'y') SELECT * FROM documents LIMIT 10",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE filtering on a column outside its FROM's exposed set must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    /// `table_columns` を実装するフェイク（PR #1100 追加レビュー指摘の
+    /// 回帰テスト専用）。既存の `FakeCatalog` は `table_columns` 未実装
+    /// （既定実装 `Ok(None)` のまま）で、それらのテストは本回帰の対象外
+    /// （後方互換の確認を兼ねる）。
+    struct SchemaCatalog {
+        tables: std::collections::HashMap<&'static str, &'static [&'static str]>,
+    }
+
+    impl TableLookup for SchemaCatalog {
+        fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError> {
+            Ok(self.tables.contains_key(name))
+        }
+        fn table_columns(&self, name: &str) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+            // `catalog::Storage` の実装契約（実カラム ＋ 未宣言なら `id` 疑似列）
+            // を模す（`TableLookup::table_columns` のドキュメント参照）。
+            Ok(self.tables.get(name).map(|cols| {
+                let mut columns: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+                if !columns.iter().any(|c| c == "id") {
+                    columns.push("id".to_string());
+                }
+                columns
+            }))
+        }
+    }
+
+    #[test]
+    fn rejects_unreferenced_cte_projecting_unknown_real_table_column() {
+        // PR #1100 追加レビュー指摘の回帰テスト（Codex P1・Cursor Bugbot Low、
+        // 同一欠陥）: 事前検証ループは `Resolved::Table`（FROM が実テーブル）の
+        // 場合に公開列集合を `None` のまま `check_columns_within_view` へ渡して
+        // いたため、実テーブルに存在しない列を射影・条件に使う未参照 CTE も
+        // 検査をすり抜けて受理していた。`TableLookup::table_columns` で実テーブル
+        // のスキーマへ問い合わせて検証すること。
+        let lookup = SchemaCatalog {
+            tables: [("documents", ["id", "body"].as_slice())].into(),
+        };
+        let err = validate_sql(
+            "WITH unused AS (SELECT missing FROM documents) SELECT id FROM documents LIMIT 1",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE projecting an unknown real table column must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+
+        let err = validate_sql(
+            "WITH unused AS (SELECT id FROM documents WHERE missing = 'y') SELECT id FROM documents LIMIT 1",
+            &lookup,
+        )
+        .expect_err("unreferenced CTE filtering on an unknown real table column must be rejected");
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn accepts_unreferenced_cte_projecting_id_pseudo_column_over_real_table() {
+        // 対照確認（regression guard）: `table_columns` は実カラムに加えて
+        // 疑似列 `id` も許可列へ含めること（`sql::parser::bind_projection` が
+        // `id` を疑似列として受理する契約と一致させる）。スキーマが `id` という
+        // 実カラムを宣言していない場合の対照。
+        let lookup = SchemaCatalog {
+            tables: [("documents", ["body"].as_slice())].into(),
+        };
+        expect_scan(
+            "WITH unused AS (SELECT id FROM documents) SELECT * FROM documents LIMIT 1",
+            &lookup,
+        );
+    }
+
+    #[test]
+    fn accepts_with_statement_containing_literal_where_param_placeholder_check_is_deferred() {
+        // TASK-213: `$n` を含む WITH 文は `sql::params::validate_param_positions`
+        // が拒否する（本テストは構造検証自体〔`validate_sql`〕が受理し得ることを
+        // 確認するのみで、`$n` 拒否は `sql::params` の単体テストが担う）。
+        let lookup = catalog_with(&["documents"]);
+        expect_scan(
+            "WITH x AS (SELECT id FROM documents) SELECT * FROM x WHERE id = 'lit' LIMIT 10",
+            &lookup,
+        );
     }
 }
