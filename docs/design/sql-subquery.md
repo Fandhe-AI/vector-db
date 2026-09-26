@@ -31,21 +31,13 @@
 | 内側が集計（`GROUP BY`）・ランキング付き検索 SELECT | **非対応**（`42601`） |
 | 内側の `LIMIT` 省略 | **非対応**（`42601`。内側は常に明示 `LIMIT` が必要） |
 | 内側の `OFFSET` | 未検証（構文上は Scan 形状を再利用するため通るが、意味論は未確認。将来の Issue 課題） |
-| 相関サブクエリ | **非対応**。専用の構造検出は持たず、内側の束縛（`bind_scan`）が内側テーブルの
-  スキーマにない列参照を既存の `22000`（unknown column）へ落とすことに委ねる
-  （内側は常に自分の FROM テーブルのスキーマのみで束縛される） |
+| 相関サブクエリ | **非対応**。専用の構造検出は持たず、内側の束縛（`bind_scan`）が内側テーブルのスキーマにない列参照を既存の `22000`（unknown column）へ落とすことに委ねる（内側は常に自分の FROM テーブルのスキーマのみで束縛される） |
 | `NOT IN`・`NOT EXISTS` | **非対応**（文法自体が `NOT` を持たない） |
-| `IN` 対象列が疑似列 `id` | 実測範囲外（このリポの既存 `WherePredicate::Equality` 束縛自体が疑似列 `id`
-  を対象にしていないため。`sql::subquery::cell_to_equality_predicate` の
-  `Cell::Integer` 分岐は将来の拡張に備えて到達可能コードとして残す） |
-| `IN` 対象値の型 | `TEXT`／`BOOLEAN` のみ。`INTEGER`／`BIGINT`（`WherePredicate::Equality`
-  が `TEXT`／`ENUM` 列専用のため対象外。等価比較自体がこのリポ未実装
-  〔レーン A〕）・`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`VECTOR`／
-  配列／JSON は `22000`（push 前 Review 指摘対応。Issue #927） |
+| `IN` 対象列が疑似列 `id` | 実測範囲外（このリポの既存 `WherePredicate::Equality` 束縛自体が疑似列 `id` を対象にしていないため。`sql::subquery::cell_to_equality_predicate` の `Cell::Integer` 分岐は将来の拡張に備えて到達可能コードとして残す） |
+| `IN` 対象値の型 | `TEXT`／`BOOLEAN` のみ。`INTEGER`／`BIGINT`（`WherePredicate::Equality` が `TEXT`／`ENUM` 列専用のため対象外。等価比較自体がこのリポ未実装〔レーン A〕）・`DATE`／`TIMESTAMP`／`NUMERIC`／`UUID`／`BYTEA`／`VECTOR`／配列／JSON は `22000`（push 前 Review 指摘対応。Issue #927） |
 | 拡張クエリプロトコル（Parse/Bind、`$n`） | **非対応**（`42601`。理由は後述） |
 | Describe（拡張クエリプロトコルの投影列導出） | 対象外（拡張クエリプロトコル自体が非対応のため） |
-| `EXPLAIN`・カーソル `DECLARE`・`COPY (SELECT ...) TO`・CHECK 制約本体・
-  `CREATE VIEW` 本体・述語形 `UPDATE`/`DELETE`・明示トランザクション内 | **非対応**（`42601`。すべて構文解析段でゲート） |
+| `EXPLAIN`・カーソル `DECLARE`・`COPY (SELECT ...) TO`・CHECK 制約本体・`CREATE VIEW` 本体・述語形 `UPDATE`/`DELETE`・明示トランザクション内 | **非対応**（`42601`。すべて構文解析段でゲート） |
 
 ## 設計
 
