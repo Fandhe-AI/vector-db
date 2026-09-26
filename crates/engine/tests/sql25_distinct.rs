@@ -494,3 +494,240 @@ fn select_distinct_rejects_when_distinct_value_count_exceeds_max_groups() {
         .expect_err("SELECT DISTINCT must reject when distinct values exceed MAX_GROUPS");
     assert_eq!(err.wire_code(), "54000");
 }
+
+// --- NULL 契約: COUNT(DISTINCT) は NULL を除外し、SELECT DISTINCT は NULL を
+//     1 行にまとめて末尾に置く（受け入れ条件 4「NULL の扱いを明示する」） -----
+
+fn schema_nullable_text() -> TableSchema {
+    TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM as u32), false),
+            ColumnDef::new("lang", ColumnType::Text, true),
+        ],
+    )
+}
+
+#[test]
+fn count_distinct_excludes_null_and_is_zero_when_all_null() {
+    let path = unique_db_path("sql25-count-distinct-null");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage
+        .create_table(&schema_nullable_text())
+        .expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // ja, ja, NULL, NULL, en の 5 行 → 異なり値は {ja, en} の 2 件（NULL 除外）。
+    for (id, lang) in (1u64..).zip([Some("ja"), Some("ja"), None, None, Some("en")]) {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32; DIM]),
+                lang.map(|s| Value::Text(s.to_string()))
+                    .unwrap_or(Value::Null),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let result = core
+        .execute_sql(&ctx, "SELECT COUNT(DISTINCT lang) AS n FROM docs")
+        .expect("COUNT(DISTINCT lang) should succeed");
+    assert_eq!(as_integer(&result.rows[0].cells[0]), 2);
+
+    // 全行 NULL → 空集合契約で 0（PostgreSQL 互換。既存の COUNT と同じ）。
+    let path2 = unique_db_path("sql25-count-distinct-all-null");
+    let _guard2 = CleanupGuard(path2.clone());
+    let storage2 = open_storage(&path2);
+    storage2
+        .create_table(&schema_nullable_text())
+        .expect("create table");
+    for id in 1u64..=3 {
+        engine::tenant::insert_typed_row(
+            &storage2,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(vec![0.0f32; DIM]), Value::Null],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op2-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+    let core2 = new_core(storage2);
+    let result2 = core2
+        .execute_sql(&ctx, "SELECT COUNT(DISTINCT lang) AS n FROM docs")
+        .expect("COUNT(DISTINCT lang) over all-NULL column should succeed");
+    assert_eq!(as_integer(&result2.rows[0].cells[0]), 0);
+}
+
+#[test]
+fn select_distinct_merges_null_rows_into_a_single_trailing_row() {
+    let path = unique_db_path("sql25-select-distinct-null");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage
+        .create_table(&schema_nullable_text())
+        .expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    for (id, lang) in (1u64..).zip([Some("ja"), None, Some("en"), None, Some("ja")]) {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32; DIM]),
+                lang.map(|s| Value::Text(s.to_string()))
+                    .unwrap_or(Value::Null),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let result = core
+        .execute_sql(&ctx, "SELECT DISTINCT lang FROM docs")
+        .expect("SELECT DISTINCT should succeed");
+    // NULL は 1 行にまとめられ常に末尾（既存の GROUP BY 契約を継承。ASC/DESC を
+    // 問わず末尾に置かれる契約は `sql::group_by::order_with_nulls_last` 参照）。
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(as_text(&result.rows[0].cells[0]).as_deref(), Some("en"));
+    assert_eq!(as_text(&result.rows[1].cells[0]).as_deref(), Some("ja"));
+    assert_eq!(as_text(&result.rows[2].cells[0]), None);
+}
+
+// --- 数値正準化: -0.0 と 0.0 は同一視される（`canon_f64`） -------------------
+
+#[test]
+fn count_distinct_on_double_column_treats_negative_zero_as_equal_to_zero() {
+    let path = unique_db_path("sql25-count-distinct-double-neg-zero");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM as u32), false),
+            ColumnDef::new("score", ColumnType::Double, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    for (id, score) in (1u64..).zip([0.0f64, -0.0f64, 1.5f64]) {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(vec![0.0f32; DIM]), Value::Double(score)],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let result = core
+        .execute_sql(&ctx, "SELECT COUNT(DISTINCT score) AS n FROM docs")
+        .expect("COUNT(DISTINCT score) should succeed");
+    // 0.0 と -0.0 は同一視されるため異なり値は {0.0, 1.5} の 2 件。
+    assert_eq!(as_integer(&result.rows[0].cells[0]), 2);
+}
+
+// --- 上限: COUNT(DISTINCT) の累計バイト数上限（16 MiB） ------------------------
+
+#[test]
+fn count_distinct_rejects_when_accumulated_key_bytes_exceed_budget() {
+    let path = unique_db_path("sql25-count-distinct-byte-budget");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage
+        .create_table(&schema_nullable_text())
+        .expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // 一意な TEXT 値（各 200,000 バイト。`row_codec::MAX_TEXT_FIELD_LEN`〔4 MiB〕
+    // を大きく下回るため列単体の上限には抵触しない）を 90 行分挿入する。
+    // `DistinctBudget` の累計上限は 16 MiB（エントリごとの固定オーバーヘッド
+    // 込み）で、90 件 ×（200,000 + 32）バイト ≈ 18.0 MiB は上限を超えるため、
+    // 途中の挿入で `54000` になる（`16,777,216 / 200,032 ≈ 83.9` 件目付近）。
+    const VALUE_LEN: usize = 200_000;
+    for id in 1u64..=90 {
+        // 値ごとに先頭バイトを変えて一意にする。
+        let mut value = vec![b'a'; VALUE_LEN];
+        value[0..8].copy_from_slice(format!("{id:08}").as_bytes());
+        let text = String::from_utf8(value).expect("ascii bytes are valid utf-8");
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(vec![0.0f32; DIM]), Value::Text(text)],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let err = core
+        .execute_sql(&ctx, "SELECT COUNT(DISTINCT lang) AS n FROM docs")
+        .expect_err("COUNT(DISTINCT) must reject when accumulated key bytes exceed the budget");
+    assert_eq!(err.wire_code(), "54000");
+}
+
+// --- HAVING が COUNT(DISTINCT) の別名を参照できる -----------------------------
+
+#[test]
+fn having_can_reference_count_distinct_alias() {
+    let path = unique_db_path("sql25-count-distinct-having");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // lang="ja": id 1..=3 (3 件), lang="en": id 4..=4 (1 件)。
+    for (id, lang) in (1u64..).zip(["ja", "ja", "ja", "en"]) {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32; DIM]),
+                Value::Text(lang.to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT lang, COUNT(DISTINCT id) AS n FROM docs GROUP BY lang HAVING n >= 2",
+        )
+        .expect("HAVING referencing COUNT(DISTINCT) alias should succeed");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(as_text(&result.rows[0].cells[0]).as_deref(), Some("ja"));
+    assert_eq!(as_integer(&result.rows[0].cells[1]), 3);
+}

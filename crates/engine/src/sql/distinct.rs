@@ -11,8 +11,13 @@
 //!
 //! キーの数値正準化（`-0.0` を `+0.0` へ、NaN を単一表現へ正規化）は
 //! [`crate::constraint::push_canonical_component`]（UNIQUE／FOREIGN KEY の
-//! 正準キー）と役割は異なるが、境界曖昧性を避ける「型タグ＋長さ＋payload」の
-//! 発想は同じ設計を踏襲する。
+//! 正準キー）と役割は異なる。1 つの `CountDistinct` アキュムレータは束縛時に
+//! 決まった単一の入力型（`AggregateInput`）しか観測しないため、
+//! `push_canonical_component` のような「複数コンポーネントを連結する際の境界
+//! 曖昧性」は生じず（`sql::aggregate::Accumulator::observe_distinct` は型タグ・
+//! 長さ接頭辞を付けない生の正準バイト列をそのままキーにする）、本モジュールは
+//! その正準化プリミティブ（`canon_f64`）と予算管理（[`DistinctBudget`]）のみを
+//! 提供する。
 
 use crate::sql::allowlist::SqlSurfaceError;
 

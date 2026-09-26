@@ -4715,7 +4715,7 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
 /// 経ないため `GroupByClause::column` はここでの唯一の列名をそのまま使う）。
 /// `GROUP BY`・`HAVING`・`OFFSET`・ベクトル順位付け（`ORDER BY <=>`・`HYBRID`・
 /// `USING PLAN`・`USING MODE`・`HINT ORDER`）はいずれもこの構文自体が持たない
-/// ため、併用は構造的に `42601` へ落ちる（SQL-25 (a) の排他規定）。列の型が
+/// ため、併用は構造的に `42601` へ落ちる（SQL-25 (a) 参照）。列の型が
 /// `TEXT` であることの検査は意味論層（`sql::parser::bind_group_by_clause`）が
 /// 担う（`VECTOR` 列・`TEXT` 以外のスカラー列はいずれも `22000`）。
 fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
@@ -9150,9 +9150,9 @@ mod tests {
 
     #[test]
     fn rejects_select_distinct_star_with_vector_ranking() {
-        // SQL-25 (a) の排他規定: `SELECT DISTINCT *` はベクトル順位付けと併用
-        // できない（既存の `rejects_distinct` と同じ入力を、`SELECT DISTINCT`
-        // 対応後も一貫して拒否することを確認する）。
+        // `SELECT DISTINCT *` とベクトル順位付けの併用は引き続き `42601` で
+        // 拒否する（SQL-25 (a) 参照。既存の `rejects_distinct` と同じ入力を、
+        // `SELECT DISTINCT` 対応後も一貫して拒否することを確認する）。
         assert_rejected_as_syntax_error(
             "SELECT DISTINCT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
