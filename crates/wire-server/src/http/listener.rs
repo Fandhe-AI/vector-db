@@ -25,7 +25,13 @@
 //! RequestHandler`] 実装を注入できる。
 //!
 //! 同時接続数上限超過時の 503 応答は
-//! [`crate::http::conn::reject_too_many_connections`] が担う。
+//! [`crate::http::conn::reject_too_many_connections`] が担う（TLS 構成時は
+//! 応答を書かずに閉じる。Issue #968・H4）。
+//!
+//! [`accept_loop_with_router_tls`]（Issue #968）は `main.rs::run_server` が
+//! nosql 選択時に `--tls-cert`／`--tls-key` を構成した場合の入口。接続 1 本
+//! ごとの TLS／平文判定・ハンドシェイクは
+//! [`crate::http::tls_transport::serve_connection`] へ委譲する。
 //!
 //! untrusted なバイト列は [`crate::http::conn`] 側でのみ扱う（本モジュールは
 //! 受理・タイムアウト適用・スレッド分岐のみで、ストリームの中身を読み書き
@@ -37,7 +43,10 @@ use std::time::Duration;
 
 use crate::http::conn::{self, RequestHandler};
 use crate::http::router::Router;
+use crate::http::tls_transport;
 use crate::limits::{self, ConnectionLimiter, RejectWorkerLimiter};
+use crate::tls::server_handshake::TlsServerConfig;
+use crate::tls_opt::TlsMode;
 
 /// 接続を受理した直後に閉じるだけの accept ループ（stub）。
 ///
@@ -81,6 +90,7 @@ pub fn accept_loop_with_limiter(
         limiter,
         read_timeout,
         Arc::new(conn::PlaceholderRouter),
+        None,
     );
 }
 
@@ -98,7 +108,35 @@ pub fn accept_loop_with_router(
     read_timeout: Duration,
     router: Router,
 ) {
-    accept_loop_with_handler(listener, limiter, read_timeout, Arc::new(router));
+    accept_loop_with_handler(listener, limiter, read_timeout, Arc::new(router), None);
+}
+
+/// [`accept_loop_with_router`] の TLS opt-in 版（Issue #968・親 #941・
+/// TASK-228）。`main.rs::run_server` が nosql 選択時に `--tls-cert`／
+/// `--tls-key` を構成した場合の唯一の呼び出し元。接続 1 本ごとの TLS／平文
+/// 判定・ハンドシェイクは [`crate::http::tls_transport::serve_connection`] が
+/// 担う（詳細・fail-closed の設計判断は同モジュールの doc 参照）。
+///
+/// `mode` が [`TlsMode::Require`] の下では、平文と判定した接続へ一切応答を
+/// 書かずに閉じる（H2）。TLS 構成を伴わない既存呼び出し元
+/// （[`accept_loop_with_router`]・[`accept_loop_with_limiter`]）は本関数を
+/// 経由せず、`tls: None` で [`accept_loop_with_handler`] を直接呼ぶため
+/// ビット単位で従来と同一のまま。
+pub fn accept_loop_with_router_tls(
+    listener: TcpListener,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+    router: Router,
+    tls_config: Arc<TlsServerConfig>,
+    mode: TlsMode,
+) {
+    accept_loop_with_handler(
+        listener,
+        limiter,
+        read_timeout,
+        Arc::new(router),
+        Some((tls_config, mode)),
+    );
 }
 
 /// [`accept_loop_with_limiter`] の本体。SQL wire の
@@ -126,6 +164,7 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
     limiter: ConnectionLimiter,
     read_timeout: Duration,
     handler: Arc<H>,
+    tls: Option<(Arc<TlsServerConfig>, TlsMode)>,
 ) {
     // 拒否応答ワーカースレッドの有界化専用リミッター（`limiter` とは別枠。
     // `crate::server::accept_loop_inner` と同じ review 是正方針）。
@@ -141,14 +180,26 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
         };
 
         let Some(permit) = limiter.try_acquire() else {
-            // 上限超過: ハンドラへ進ませず、スレッドを生成せずに 503／53300 を
-            // 返してから即座にクローズする（WIRE-6）。ピアアドレス等の識別
-            // 情報はログに出さない。
+            // 上限超過: ハンドラへ進ませず、スレッドを生成せずにクローズする
+            // （WIRE-6）。ピアアドレス等の識別情報はログに出さない。
             eprintln!(
                 "wire-server: rejecting connection: too many connections (active={}, max={})",
                 limiter.active(),
                 limiter.max()
             );
+            // H4（Issue #968・`docs/design/tls-wire-connection.md`
+            // 「HTTPS 表層」節）: TLS を構成している場合、平文の 503 応答を
+            // 書かずに閉じる。TLS ハンドシェイクをしていない接続へ平文
+            // バイト列を送ると `--tls-mode require` の意図（平文を一切
+            // 送出しない）に反するうえ、TLS クライアントにとっては意味の
+            // 無い応答になる。拒否ワーカーの中でハンドシェイクもしない
+            // （`RejectWorkerLimiter` の有界性を維持するため。遅いクライアント
+            // でワーカーが `HANDSHAKE_READ_TIMEOUT` 分ふさがるのを避ける）。
+            // TLS 未構成時は既存の 503／`53300` 経路とバイト単位で同一。
+            if tls.is_some() {
+                let _ = stream.shutdown(Shutdown::Both);
+                continue;
+            }
             match reject_limiter.try_acquire() {
                 Some(reject_permit) => {
                     // `std::thread::spawn` はスレッド生成失敗時に panic し、
@@ -184,6 +235,7 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
         // 失敗時は当該接続の `permit`／ストリームを解放して accept ループを
         // 継続する（fail-closed。プロセス全体を落とさない）。
         let handler_for_thread = Arc::clone(&handler);
+        let tls_for_thread = tls.clone();
         if let Err(e) = std::thread::Builder::new().spawn(move || {
             // 接続処理中は `permit` を保持し続け、スレッド終了時（正常終了・
             // panic いずれも）に Drop で確実に枠を解放する。
@@ -193,7 +245,19 @@ pub(crate) fn accept_loop_with_handler<H: RequestHandler + Send + Sync + 'static
             // 参照）。接続受理直後に `apply_read_timeout` へ渡した値と同じ
             // 1 つの値を「受理直後のソケットタイムアウト」と「要求読み取り
             // 全体の期限」の双方に使う契約。
-            conn::handle_connection_with(stream, handler_for_thread.as_ref(), read_timeout);
+            match &tls_for_thread {
+                Some(tls) => {
+                    tls_transport::serve_connection(
+                        stream,
+                        handler_for_thread.as_ref(),
+                        read_timeout,
+                        tls,
+                    );
+                }
+                None => {
+                    conn::handle_connection_with(stream, handler_for_thread.as_ref(), read_timeout);
+                }
+            }
         }) {
             eprintln!("wire-server: failed to spawn connection handler thread: {e}");
             // クロージャへ move された `permit` はスレッド生成失敗時に

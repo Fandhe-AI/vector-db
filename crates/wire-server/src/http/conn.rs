@@ -77,6 +77,19 @@
 //! 受信データ経路（要求行・ヘッダ・本文の読み取り）のため
 //! `unwrap`／`expect`／添字アクセス（`[]`）を用いない。
 //!
+//! ## ストリーム抽象（Issue #968）
+//!
+//! 接続ハンドラ本体・その内部ヘルパ（[`build_outcome`]・[`read_head`]・
+//! [`read_body`]・[`fill_remaining_body`]・[`respond_and_close`]）は
+//! `S: `[`crate::wire_stream::WireStream`] に一般化されており、平文
+//! `TcpStream`・TLS 上の `TlsStream`（[`crate::http::tls_transport`]。
+//! Issue #968）のどちらを渡しても分岐・応答内容・順序は一切変わらない
+//! （型を広げるだけ）。呼び出し元は [`crate::http::listener::
+//! accept_loop_with_handler`]（平文専用の後方互換経路）と
+//! [`crate::http::tls_transport::serve_connection`]（先頭バイトで TLS／平文を
+//! 判定した後、平文はそのまま・TLS はハンドシェイク後の `TlsStream` を渡す）
+//! の 2 系統。
+//!
 //! ## RECOVER-5（応答境界）と `catch_unwind` の相互作用
 //!
 //! 上記の `catch_unwind` は production では `fail_fast` の panic hook が
@@ -92,7 +105,7 @@
 //! （`crate::simple_query::execute_and_respond` が SQL wire 側で使うのと
 //! 同じ機構。詳細は [`build_outcome`] 内のコメント参照）。
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{Shutdown, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::{Duration, Instant, SystemTime};
@@ -106,6 +119,7 @@ use crate::http::response;
 use crate::http::{body, error_body, status};
 use crate::limits::REJECT_WRITE_TIMEOUT;
 use crate::protocol_dispatch::{drain_and_close, LINGER_DRAIN_TIMEOUT};
+use crate::wire_stream::WireStream;
 
 /// 要求の「頭」（要求行＋ヘッダ部）を読み取る固定長スタックバッファの長さ。
 ///
@@ -177,7 +191,10 @@ const REQUEST_READ_DEADLINE: Duration = crate::limits::READ_TIMEOUT;
 ///
 /// [`read_head`]・[`read_body`] の読み取りループが共有する（`protocol_dispatch::
 /// drain_and_close` と同型のパターンをこの 1 関数へ集約し重複させない）。
-fn arm_read_timeout_for_deadline(stream: &TcpStream, deadline: Instant) -> Option<()> {
+/// `S: WireStream` は平文 `TcpStream`・TLS 上の `TlsStream`（Issue #968）の
+/// 双方で同じロジックを走らせるための一般化（Issue #966 の `wire_stream`
+/// 抽象を HTTP 接続ハンドラへも適用する）。
+fn arm_read_timeout_for_deadline<S: WireStream>(stream: &mut S, deadline: Instant) -> Option<()> {
     let remaining = match deadline.checked_duration_since(Instant::now()) {
         Some(d) if d > Duration::from_millis(1) => d,
         _ => return None,
@@ -305,8 +322,8 @@ pub(crate) enum Outcome {
 /// production では常に [`crate::limits::READ_TIMEOUT`]＝30 秒だが、値そのものは
 /// 呼び出し元が決める）。本ファイルの単体テストはこの引数へ短縮値を渡すことで
 /// [`crate::limits::READ_TIMEOUT`]（30 秒）を待たずに期限切れ経路を検証する。
-pub(crate) fn handle_connection_with<H: RequestHandler>(
-    mut stream: TcpStream,
+pub(crate) fn handle_connection_with<S: WireStream, H: RequestHandler>(
+    mut stream: S,
     handler: &H,
     request_read_deadline: Duration,
 ) {
@@ -321,7 +338,11 @@ pub(crate) fn handle_connection_with<H: RequestHandler>(
             respond_and_close(&mut stream, &bytes, drain_budget);
         }
         Ok(Outcome::CloseSilently) => {
-            let _ = stream.shutdown(Shutdown::Both);
+            // H7（Issue #968）: TLS 上では `close_notify` を送ってから
+            // 両方向を閉じる（平文 `TcpStream` の `graceful_close` は
+            // no-op のため既存挙動とビット同一のまま）。
+            stream.graceful_close();
+            let _ = stream.shutdown_both();
         }
         Err(_panic_payload) => {
             // panic payload（`Any`）はログ・応答のいずれにも出さない（内部詳細の
@@ -362,8 +383,11 @@ pub(crate) fn handle_connection_with<H: RequestHandler>(
 /// `commit_boundary.rs` 参照）により、`catch_unwind` 内側の panic が
 /// `catch_unwind` で止まった時点でスレッドは非 panicking に戻り、外側ガードの
 /// 通常 drop は abort しない——保護がかえって失われるため意図的に行わない。
-fn respond_and_close(stream: &mut TcpStream, bytes: &[u8], drain_budget: usize) {
+fn respond_and_close<S: WireStream>(stream: &mut S, bytes: &[u8], drain_budget: usize) {
     let _ = stream.write_all(bytes);
+    // `drain_and_close` は内部で `shutdown_write` を呼ぶ。TLS 上ではこれが
+    // `close_notify` の送出を兼ねる（`crate::wire_stream::WireStream::
+    // shutdown_write` の doc・H7 参照。平文 `TcpStream` は従来どおり FIN のみ）。
     drain_and_close(stream, LINGER_DRAIN_TIMEOUT, drain_budget);
 }
 
@@ -376,8 +400,8 @@ fn respond_and_close(stream: &mut TcpStream, bytes: &[u8], drain_budget: usize) 
 /// （呼び出し元 [`handle_connection_with`] の doc 参照）を 1 度だけ
 /// 絶対期限へ変換し、頭・本文の読み取り（[`read_head`]・[`read_body`]）の
 /// 双方へ同じ期限を渡す（期限はリセットしない。Slowloris 対策の doc 参照）。
-fn build_outcome<H: RequestHandler>(
-    stream: &mut TcpStream,
+fn build_outcome<S: WireStream, H: RequestHandler>(
+    stream: &mut S,
     handler: &H,
     request_read_deadline: Duration,
 ) -> Outcome {
@@ -603,8 +627,8 @@ fn parse_completed_head(
 /// の doc 参照）。各 `read` 呼び出しの**前**に [`arm_read_timeout_for_deadline`]
 /// で残り時間をソケットへ反映し、期限切れなら（個々の read が速く応答して
 /// いても）無応答クローズへ倒す。
-fn read_head<'buf>(
-    stream: &mut TcpStream,
+fn read_head<'buf, S: WireStream>(
+    stream: &mut S,
     buf: &'buf mut [u8; HEAD_BUF_LEN],
     deadline: Instant,
 ) -> HeadOutcome<'buf> {
@@ -710,8 +734,8 @@ enum BodyOutcome {
 /// `read_timeout` しか効かせられず、[`read_head`] と同型の Slowloris 経路を
 /// 残してしまうため使わず、[`read_head`] と同じ「各 `read` 前に残り時間を
 /// 都度反映する」手書きループ（[`fill_remaining_body`]）に委ねる。
-fn read_body(
-    stream: &mut TcpStream,
+fn read_body<S: WireStream>(
+    stream: &mut S,
     residual: &[u8],
     content_length: usize,
     deadline: Instant,
@@ -758,8 +782,8 @@ enum FillOutcome {
 /// `target` を宣言長ぶんの本文で埋めるまで、期限を都度反映しながら `read` を
 /// 繰り返す（[`read_head`] の読み取りループと同じ Slowloris 対策パターン。
 /// [`REQUEST_READ_DEADLINE`] の doc 参照）。
-fn fill_remaining_body(
-    stream: &mut TcpStream,
+fn fill_remaining_body<S: WireStream>(
+    stream: &mut S,
     target: &mut [u8],
     deadline: Instant,
 ) -> Result<FillOutcome, Vec<u8>> {
@@ -903,6 +927,7 @@ fn encode_reject_response() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::net::TcpListener;
     use std::time::Duration;
 
