@@ -39,7 +39,7 @@ use crate::sql::aggregate::{
     accumulator_bug, storage_internal, try_clone_str, Accumulator, DecodeTier, ReferencedColumns,
     RowVector,
 };
-use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::allowlist::{SqlSurfaceError, MAX_GROUP_BY_COLUMNS};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
@@ -1650,16 +1650,27 @@ pub(crate) fn execute_grouped_aggregate(
                     // 1 回所有化する（旧実装は探索前に毎行 `try_clone_str` で
                     // 所有化しており、既存グループ更新行でも不要な複製が発生し、
                     // かつ予算超過で拒否される行でも複製コストを先払いしていた）。
-                    let mut borrowed_components: Vec<Option<&str>> = Vec::new();
-                    borrowed_components
-                        .try_reserve_exact(group_by.column_indices.len())
-                        .map_err(|_| {
-                            SqlSurfaceError::payload_too_large(
-                                "GROUP BY key allocation exceeds available memory",
-                            )
-                        })?;
+                    //
+                    // PR #1099 レビュー再指摘（codex-review P2）対応: 借用成分列
+                    // 自体（`Vec<Option<&str>>`）も既存グループに一致する行で
+                    // 毎行ヒープ確保していた。`GROUP BY` 列数は束縛段
+                    // （[`crate::sql::allowlist::check_group_by_column_count`]）で
+                    // 列を `push` する前に [`MAX_GROUP_BY_COLUMNS`] 以下へ検査済み
+                    // のため、固定長スタック配列で足り、行走査のたびの確保が
+                    // 不要になる。束縛段の不変条件が破れて上限を超えていた場合は
+                    // fail-closed で `accumulator_bug`（`XX000`）へ落とす。
+                    let key_count = group_by.column_indices.len();
+                    if key_count > MAX_GROUP_BY_COLUMNS {
+                        return Err(accumulator_bug(
+                            "GROUP BY column count exceeds MAX_GROUP_BY_COLUMNS at execution time",
+                        ));
+                    }
+                    let mut borrowed_storage: [Option<&str>; MAX_GROUP_BY_COLUMNS] =
+                        [None; MAX_GROUP_BY_COLUMNS];
                     let mut key_len: usize = 0;
-                    for &column_index in &group_by.column_indices {
+                    for (slot, &column_index) in
+                        borrowed_storage.iter_mut().zip(&group_by.column_indices)
+                    {
                         let value = scanned
                             .get(column_index)
                             .copied()
@@ -1670,9 +1681,10 @@ pub(crate) fn execute_grouped_aggregate(
                                 accumulator_bug("GROUP BY key length accounting overflowed")
                             })?;
                         }
-                        borrowed_components.push(value);
+                        *slot = value;
                     }
-                    let probe = BorrowedGroupKey(&borrowed_components);
+                    let borrowed_components = &borrowed_storage[..key_count];
+                    let probe = BorrowedGroupKey(borrowed_components);
                     let total_group_count = multi_groups.len();
                     if let Some(accs) = multi_groups.get_mut(&probe as &dyn GroupKeyView) {
                         accumulate_row(
@@ -1710,7 +1722,7 @@ pub(crate) fn execute_grouped_aggregate(
                                     "GROUP BY key allocation exceeds available memory",
                                 )
                             })?;
-                        for value in &borrowed_components {
+                        for value in borrowed_components {
                             key_components.push(match value {
                                 Some(s) => Some(try_clone_str(s)?),
                                 None => None,
