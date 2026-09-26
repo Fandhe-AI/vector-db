@@ -237,6 +237,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため e2e-three-client をスキップ"
 endif
 
+.PHONY: e2e-three-client-tls
+e2e-three-client-tls: ## TASK-228（WIRE-9・WIRE-1）Issue #969: TLS 1.3 越しの psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可。証明書・鍵は RFC 8032 TEST 1 の公開テストベクタから実行時生成）
+ifdef HAS_CARGO
+	cargo test -p fandhe-vector-db-wire-server --test wire9_tls -- --ignored --nocapture --test-threads=1
+else
+	@echo "skip: Cargo.toml 未追加のため e2e-three-client-tls をスキップ"
+endif
+
 .PHONY: e2e-three-client-http
 e2e-three-client-http: ## TASK-183（HTTP-13）NoSQL 表層（--surface nosql）の無改造 HTTP クライアント（curl／urllib／fetch）統合テスト（opt-in・`ci` には含めない。要 curl・python3・node（≥18）・psql（Issue #779 の SQL 経路パリティ・Issue #877 の UPDATE/DELETE DML パリティに使用。PSQL_BIN で上書き可）。CURL_BIN／PYTHON_BIN／NODE_BIN で上書き可。各テストが `[e2e-record]` 行を stderr へ出力（秘密情報非含有）。記録様式は docs/design/three-client-e2e-harness.md 参照）
 ifdef HAS_CARGO
