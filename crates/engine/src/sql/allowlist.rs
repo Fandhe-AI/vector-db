@@ -47,7 +47,7 @@ const MAX_CREATE_TABLE_COLUMNS: usize = 256;
 /// が照合する語と一致させる契約。型を追加する際はここも同時に拡張する）。
 /// `CHECK` 制約名がこれらと一致する場合は拒否する（TABLE-16・TASK-204、
 /// Issue #906。[`Parser::peek_check_clause_start`] の「曖昧さの排除」参照）。
-const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &["TEXT", "VECTOR"];
+const CREATE_TABLE_COLUMN_TYPE_KEYWORDS: &[&str] = &["TEXT", "VECTOR", "INTEGER", "BIGINT"];
 
 /// `PRIMARY KEY (<col>[, <col>]*)` に宣言できる列数の上限（TABLE-16・
 /// TASK-204、Issue #903）。`catalog::validate_schema` が同じ上限
@@ -350,6 +350,11 @@ pub enum SqlSurfaceError {
     /// 存在情報を漏らさない」対応）。固定文言のみを保持し、テーブル名・
     /// ユーザー名を含めない。
     InsufficientPrivilege,
+    /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
+    /// 存在しない（WIRE-15・TASK-218）。他セッション所有のカーソル名・単に
+    /// 存在しない名前のいずれも区別しない固定文言のみを保持し、カーソル名
+    /// 自体を含めない（security.md「存在情報を漏らさない」対応。ERR-6: `34000`）。
+    InvalidCursorName,
     /// `DROP TABLE`／`DROP VIEW` の対象を、それを参照するビューが 1 つ以上
     /// 残っているため削除できない（TABLE-18・SQL-23・TASK-205、Issue #909。
     /// ERR-6: `2BP01`）。依存元の名前一覧はエラー文言に含めない
@@ -386,6 +391,17 @@ pub enum SqlSurfaceError {
     /// [`crate::tenant::TenantWriteError::CheckViolation`] の写像。制約名のみを
     /// 保持する（行の値・id・テナントは含めない。security.md P0）。
     CheckViolation { constraint: String },
+    /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
+    /// （[`crate::tenant::TenantWriteError::ForeignKeyViolation`] の写像。ERR-6:
+    /// `23503`）。値・行 id・テナント・参照先テーブル名、および参照先が「不在」か
+    /// 「他テナント所有」かを区別する情報を一切含めない固定文言（RLS-9・
+    /// RLS-10 (c)。security.md P0）。
+    ForeignKeyViolation,
+    /// `FOREIGN KEY` 宣言の参照先列が主キー・UNIQUE 制約（または `id` 疑似列）と
+    /// 一致しない、あるいは参照元列と型が一致しない（TABLE-17・TASK-205、
+    /// Issue #907。[`crate::catalog::CatalogError::InvalidForeignKey`] の写像。
+    /// ERR-6: `42830`）。`detail` はカタログ情報（列名・テーブル名）のみ。
+    InvalidForeignKey { detail: String },
 }
 
 impl SqlSurfaceError {
@@ -477,6 +493,18 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `sql::cursor::CursorRegistry::fetch`／`close`（WIRE-15・TASK-218）が、
+    /// 現在のトランザクション内に存在しないカーソル名を報告するために使う。
+    /// 固定 variant（データを持たない）のため引数はない。`pub`（`pub(crate)`
+    /// から昇格。PR #1049 レビュー指摘対応）——`wire-server::extended_query`
+    /// が、カーソル `FETCH` 由来 portal の中断保持分を再送出する前に
+    /// `CLOSE`／`COMMIT`／`ROLLBACK`／再 `DECLARE` を挟んでいないか検証する
+    /// 経路で、同じ `34000` を直接構築するために使う（第 2 の実行器・第 2 の
+    /// エラー分類を作らない設計）。
+    pub fn invalid_cursor_name() -> Self {
+        SqlSurfaceError::InvalidCursorName
+    }
+
     /// `pub(crate)`: `sql::aggregate`（TASK-166・SQL-13）が集計の数値演算オーバー
     /// フロー（`u64` の `checked_add` 失敗・`f64` の非有限値化）を報告するために使う。
     pub(crate) fn numeric_out_of_range(detail: impl Into<String>) -> Self {
@@ -529,6 +557,15 @@ impl SqlSurfaceError {
             constraint: truncate_for_error(&constraint.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::ddl::execute_create_table`（TABLE-17・TASK-205、
+    /// Issue #907）が [`crate::catalog::CatalogError::InvalidForeignKey`] を写像する
+    /// ために使う。他 variant と同じ切り詰め規約を経由する。
+    pub(crate) fn invalid_foreign_key(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidForeignKey {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -564,6 +601,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::DuplicateTable { .. } => ErrorClass::DuplicateTable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InsufficientPrivilege => ErrorClass::ForbiddenTenantMismatch,
+            SqlSurfaceError::InvalidCursorName => ErrorClass::InvalidCursorName,
             SqlSurfaceError::DependentObjectsStillExist { .. } => {
                 ErrorClass::DependentObjectsStillExist
             }
@@ -573,6 +611,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::UndefinedObject { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::UndefinedColumn { .. } => ErrorClass::UndefinedColumn,
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
+            SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
+            SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
         }
     }
 
@@ -663,6 +703,12 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::InsufficientPrivilege => {
                 write!(f, "permission denied for DDL statement")
             }
+            // カーソル名・他セッション所有かどうかを一切含めない固定文言
+            // （security.md P0。`SqlSurfaceError::InvalidCursorName` ドキュメント
+            // 参照）。
+            SqlSurfaceError::InvalidCursorName => {
+                write!(f, "cursor does not exist")
+            }
             // 依存元の名前一覧は含めない固定文言（security.md P0）。
             SqlSurfaceError::DependentObjectsStillExist { name } => {
                 write!(f, "cannot drop {name} because other objects depend on it")
@@ -692,6 +738,14 @@ impl std::fmt::Display for SqlSurfaceError {
             // security.md P0。`TenantWriteError::CheckViolation` と同じ文言）。
             SqlSurfaceError::CheckViolation { constraint } => {
                 write!(f, "new row violates check constraint {constraint:?}")
+            }
+            // 固定文言（`TenantWriteError::ForeignKeyViolation` と同じ。値・参照先の
+            // 有無の理由を含めない。RLS-9・RLS-10 (c)）。
+            SqlSurfaceError::ForeignKeyViolation => {
+                write!(f, "foreign key constraint violation")
+            }
+            SqlSurfaceError::InvalidForeignKey { detail } => {
+                write!(f, "invalid foreign key declaration: {detail}")
             }
         }
     }
@@ -1264,6 +1318,9 @@ struct ParsedCreateTableColumn {
     /// 列定義の後ろに続く列制約 `[CONSTRAINT <name>] CHECK (...)`（0 個以上。
     /// TABLE-16・TASK-204、Issue #906）。
     checks: Vec<ParsedCheck>,
+    /// 列制約 `REFERENCES <table> [(<col>[, <col>]*)]`（TABLE-17・TASK-205、
+    /// Issue #907）の参照先テーブル名と参照先列名（省略時は空）。
+    references: Option<(String, Vec<String>)>,
 }
 
 /// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
@@ -1479,7 +1536,14 @@ pub enum DeleteStatement {
 /// `PRIMARY KEY (<col>[, <col>]*)`・`UNIQUE (<col>[, <col>]*)`（複合キーを含む）
 /// を許可形状として追加受理する（TABLE-16・TASK-204。詳細は
 /// `docs/design/sql-primary-key.md`・`docs/design/unique-constraint.md` 参照）。
-/// TABLE-13/14 の追加型は別 Issue の管轄。
+/// `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の列制約
+/// `REFERENCES <table> [(<col>[, <col>]*)]`・表制約
+/// `FOREIGN KEY (<col>[, <col>]*) REFERENCES <table> [(<col>[, <col>]*)]`
+/// （いずれも後続に `ON DELETE`／`ON UPDATE` の `NO ACTION`／`RESTRICT` のみ可）と、
+/// `id` 参照の参照元列に使う列型 `INTEGER`／`BIGINT` も受理する
+/// （`docs/design/foreign-key.md` 参照）。`REFERENCES` を上記以外の文
+/// （`ALTER TABLE ... ADD COLUMN` 等）に付与する形は許可リスト外のまま。
+/// TABLE-13/14 のその他の追加型は別 Issue の管轄。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedCreateTable {
     /// カタログ存在確認前のテーブル名（識別子形式のみ検証済み）。
@@ -1504,6 +1568,36 @@ pub struct ValidatedCreateTable {
     /// （列の存在・型・許可関数）を検証しない——`sql::ddl::execute_create_table`
     /// が `sql::check_constraint::validate_and_build` で検証する。
     pub checks: Vec<ParsedCheck>,
+    /// 宣言順の `FOREIGN KEY` 制約（列制約・表制約のいずれも本フィールドへ集約する。
+    /// TABLE-17・TASK-205、Issue #907）。参照元列の実在は構造検証段階
+    /// （[`finalize_foreign_keys`]）で判定済み。参照先列を省略した宣言は
+    /// `parent_columns()` が空のまま運ばれ、参照先の名前解決・主キー／UNIQUE
+    /// 制約との照合とともに `catalog::Storage::create_table` の write トランザクション
+    /// 内で解決される。
+    pub foreign_keys: Vec<crate::catalog::ForeignKeyDef>,
+}
+
+/// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
+/// `FOREIGN KEY` 制約の参照元列の解決（TABLE-17・TASK-205、Issue #907）。表制約は
+/// 宣言順に関わらず任意位置の列を参照できるため、全列が出揃った後にまとめて行う。
+/// 未宣言列（`id` 疑似列を含む）の参照は `42601`（UNIQUE の
+/// [`finalize_unique_constraints`] と同じ分類）。列型の適格性・参照先との照合は
+/// カタログ層（`catalog::validate_schema`・`Storage::create_table`）が `42830` として
+/// 判定する。
+fn finalize_foreign_keys(
+    foreign_keys: Vec<crate::catalog::ForeignKeyDef>,
+    columns: &[ColumnDef],
+) -> Result<Vec<crate::catalog::ForeignKeyDef>, SqlSurfaceError> {
+    for fk in &foreign_keys {
+        for name in fk.columns() {
+            if !columns.iter().any(|c| &c.name == name) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "FOREIGN KEY references unknown column: {name}"
+                )));
+            }
+        }
+    }
+    Ok(foreign_keys)
 }
 
 /// `CREATE TABLE` の `CHECK` 制約 1 件分の構文段中間表現（TABLE-16・TASK-204、
@@ -3074,6 +3168,10 @@ impl<'a> Parser<'a> {
         // `CHECK` 制約（列制約・表制約。TABLE-16・TASK-204、Issue #906）。意味論
         // 検証は `sql::check_constraint::validate_and_build`（`sql::ddl` から）が行う。
         let mut checks: Vec<ParsedCheck> = Vec::new();
+        // `FOREIGN KEY` 制約（列制約・表制約。TABLE-17・TASK-205、Issue #907）。
+        // 参照元列の解決は `finalize_foreign_keys`、参照先の解決・照合は
+        // `catalog::Storage::create_table` が行う。
+        let mut foreign_keys: Vec<crate::catalog::ForeignKeyDef> = Vec::new();
         loop {
             // 表制約 `PRIMARY KEY (<col>[, <col>]*)` は要素先頭が文脈的識別子
             // `PRIMARY` かつ次のトークンが `KEY` の場合にのみ判定する
@@ -3101,6 +3199,17 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 unique_constraints.push(self.parse_unique_table_constraint()?);
+            } else if self.peek_ident_matches("FOREIGN") && self.peek_ident_matches_at(1, "KEY") {
+                // 表制約 `FOREIGN KEY (<col>[, <col>]*) REFERENCES ...`（TABLE-17・
+                // TASK-205、Issue #907）。`KEY` は列型キーワードではないため、列名
+                // `foreign` の列定義との曖昧さは生じない。列を追加しないため列数上限の
+                // 判定対象外（位置非依存）。件数上限はパース前に判定する。
+                if foreign_keys.len() >= crate::catalog::MAX_FOREIGN_KEYS_PER_TABLE {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many FOREIGN KEY constraints in CREATE TABLE",
+                    ));
+                }
+                foreign_keys.push(self.parse_foreign_key_table_constraint()?);
             } else if self.peek_check_clause_start() {
                 // 表制約 `[CONSTRAINT <name>] CHECK (...)`（TABLE-16・TASK-204、
                 // Issue #906）。列を追加しないため列数上限の判定対象外（位置
@@ -3144,6 +3253,18 @@ impl<'a> Parser<'a> {
                     }
                     unique_constraints.push(vec![parsed.column.name.clone()]);
                 }
+                if let Some((parent_table, parent_columns)) = parsed.references {
+                    if foreign_keys.len() >= crate::catalog::MAX_FOREIGN_KEYS_PER_TABLE {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "too many FOREIGN KEY constraints in CREATE TABLE",
+                        ));
+                    }
+                    foreign_keys.push(crate::catalog::ForeignKeyDef::new(
+                        vec![parsed.column.name.clone()],
+                        parent_table,
+                        parent_columns,
+                    ));
+                }
                 columns.push(parsed.column);
             }
             if matches!(self.peek(), Some(Token::Punct(','))) {
@@ -3166,6 +3287,7 @@ impl<'a> Parser<'a> {
 
         let primary_key = finalize_primary_key(primary_key, &mut columns)?;
         let unique_constraints = finalize_unique_constraints(unique_constraints, &columns)?;
+        let foreign_keys = finalize_foreign_keys(foreign_keys, &columns)?;
 
         Ok(ValidatedCreateTable {
             table_name,
@@ -3173,6 +3295,7 @@ impl<'a> Parser<'a> {
             primary_key,
             unique_constraints,
             checks,
+            foreign_keys,
         })
     }
 
@@ -3324,9 +3447,43 @@ impl<'a> Parser<'a> {
             // VECTOR は常に非 nullable。`NOT NULL` の明示指定は冗長だが受理する
             // （`constraints.not_null` の値に関わらず `nullable = false` のまま）。
             ColumnDef::new(name, ColumnType::Vector(dim), false)
+        } else if self.peek_ident_matches("INTEGER") || self.peek_ident_matches("BIGINT") {
+            // `INTEGER`／`BIGINT`（TABLE-17・TASK-205、Issue #907。`id` を参照する
+            // `FOREIGN KEY` の参照元列に使う整数型）。列制約は `TEXT` と同じく
+            // `NOT NULL`／`DEFAULT <数値リテラル>`／`UNIQUE` を受理する（数値の範囲・
+            // 形式は `sql::parser::bind_literal_for_column` が束縛時に検証する）。
+            let ty = if self.peek_ident_matches("INTEGER") {
+                ColumnType::Integer
+            } else {
+                ColumnType::BigInt
+            };
+            self.advance();
+            let constraints = self.parse_column_constraints()?;
+            unique = constraints.unique;
+            let default = match constraints.default {
+                None => None,
+                Some(InsertLiteral::Number(n)) => {
+                    if n.len() > MAX_COLUMN_DEFAULT_LEN {
+                        return Err(SqlSurfaceError::payload_too_large(format!(
+                            "column {name:?} DEFAULT literal exceeds length limit"
+                        )));
+                    }
+                    Some(ColumnDefault::Number(n))
+                }
+                Some(_) => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "column {name:?} DEFAULT expects a numeric literal"
+                    )))
+                }
+            };
+            let mut column = ColumnDef::new(name, ty, !constraints.not_null);
+            if let Some(default) = default {
+                column = column.with_default(default);
+            }
+            column
         } else {
             return Err(SqlSurfaceError::unsupported(
-                "expected column type TEXT or VECTOR(<dim>)",
+                "expected column type TEXT, VECTOR(<dim>), INTEGER or BIGINT",
             ));
         };
 
@@ -3343,6 +3500,14 @@ impl<'a> Parser<'a> {
             true
         } else {
             false
+        };
+
+        // 列制約 `REFERENCES <table> [(<col>[, <col>]*)]`（TABLE-17・TASK-205、
+        // Issue #907）。`PRIMARY KEY` の後ろ・`CHECK` の前に高々 1 個置ける。
+        let references = if self.peek_ident_matches("REFERENCES") {
+            Some(self.parse_references_clause()?)
+        } else {
+            None
         };
 
         // 列制約 `[CONSTRAINT <name>] CHECK (...)`（TABLE-16・TASK-204、Issue #906）。
@@ -3369,7 +3534,113 @@ impl<'a> Parser<'a> {
             primary_key: is_pk,
             unique,
             checks,
+            references,
         })
+    }
+
+    /// `FOREIGN KEY` の列リスト `( <col>[, <col>]* )`（参照元・参照先の双方。
+    /// TABLE-17・TASK-205、Issue #907）。同一リスト内の列名重複は `42701`
+    /// （`parse_unique_table_constraint` と同じ分類）、列数上限
+    /// （[`crate::catalog::MAX_FOREIGN_KEY_COLUMNS`]）超過は `Vec` へ積む前に `54000`。
+    fn parse_foreign_key_column_list(&mut self) -> Result<Vec<String>, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let mut cols: Vec<String> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            crate::catalog::validate_identifier(&name).map_err(|e| {
+                SqlSurfaceError::unsupported(format!("invalid FOREIGN KEY column name: {e}"))
+            })?;
+            if cols.contains(&name) {
+                return Err(SqlSurfaceError::duplicate_column(name));
+            }
+            if cols.len() >= crate::catalog::MAX_FOREIGN_KEY_COLUMNS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many columns in FOREIGN KEY constraint",
+                ));
+            }
+            cols.push(name);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        Ok(cols)
+    }
+
+    /// `REFERENCES <table> [(<col>[, <col>]*)] [ON DELETE <act>] [ON UPDATE <act>]`
+    /// （TABLE-17・TASK-205、Issue #907）。列制約・表制約の双方から呼ばれる。
+    /// 参照先テーブルの存在・参照先列の一意性・型の照合はカタログ照会を要するため
+    /// 構造検証の対象外（`catalog::Storage::create_table` の write トランザクション内で
+    /// 判定する）。参照先列を省略した場合は空リストを返す（参照先の主キー、未宣言
+    /// なら `id` へ解決される）。
+    ///
+    /// 参照動作は既定の `NO ACTION`（非遅延の文単位検査のため `RESTRICT` と同値）
+    /// のみを実装するため、`ON DELETE`／`ON UPDATE` には `NO ACTION`／`RESTRICT` だけを
+    /// 各 1 回まで受理し、`CASCADE`／`SET NULL`／`SET DEFAULT`・重複指定は `42601`。
+    /// `MATCH`・`DEFERRABLE`／`INITIALLY` 等は本メソッドが消費しないため、呼び出し元の
+    /// 後続判定（カンマ・閉じ括弧）が余剰トークンとして `42601` で拒否する。
+    fn parse_references_clause(&mut self) -> Result<(String, Vec<String>), SqlSurfaceError> {
+        self.expect_contextual_keyword("REFERENCES")?;
+        let parent_table = self.expect_ident()?;
+        crate::catalog::validate_identifier(&parent_table).map_err(|e| {
+            SqlSurfaceError::unsupported(format!("invalid referenced table name: {e}"))
+        })?;
+        let parent_columns = if matches!(self.peek(), Some(Token::Punct('('))) {
+            self.parse_foreign_key_column_list()?
+        } else {
+            Vec::new()
+        };
+        let mut seen_delete = false;
+        let mut seen_update = false;
+        while self.peek_ident_matches("ON") {
+            self.advance();
+            let seen = if self.peek_ident_matches("DELETE") {
+                &mut seen_delete
+            } else if self.peek_ident_matches("UPDATE") {
+                &mut seen_update
+            } else {
+                return Err(SqlSurfaceError::unsupported(
+                    "expected DELETE or UPDATE after ON in FOREIGN KEY",
+                ));
+            };
+            if *seen {
+                return Err(SqlSurfaceError::unsupported(
+                    "duplicate referential action in FOREIGN KEY",
+                ));
+            }
+            *seen = true;
+            self.advance();
+            if self.peek_ident_matches("NO") && self.peek_ident_matches_at(1, "ACTION") {
+                self.advance();
+                self.advance();
+            } else if self.peek_ident_matches("RESTRICT") {
+                self.advance();
+            } else {
+                return Err(SqlSurfaceError::unsupported(
+                    "only NO ACTION or RESTRICT is supported as a FOREIGN KEY referential action",
+                ));
+            }
+        }
+        Ok((parent_table, parent_columns))
+    }
+
+    /// 表制約 `FOREIGN KEY (<col>[, <col>]*) REFERENCES ...`（TABLE-17・TASK-205、
+    /// Issue #907）。参照元列の実在は [`finalize_foreign_keys`] が列リスト全体の
+    /// 構文判定後に判定する（表制約は宣言順に関わらず任意位置の列を参照できる）。
+    fn parse_foreign_key_table_constraint(
+        &mut self,
+    ) -> Result<crate::catalog::ForeignKeyDef, SqlSurfaceError> {
+        self.expect_contextual_keyword("FOREIGN")?;
+        self.expect_contextual_keyword("KEY")?;
+        let columns = self.parse_foreign_key_column_list()?;
+        let (parent_table, parent_columns) = self.parse_references_clause()?;
+        Ok(crate::catalog::ForeignKeyDef::new(
+            columns,
+            parent_table,
+            parent_columns,
+        ))
     }
 
     /// 表制約 `UNIQUE (<col>[, <col>]*)`（TABLE-16・TASK-204、Issue #905）の

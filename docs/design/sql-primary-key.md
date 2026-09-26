@@ -150,7 +150,8 @@ COLUMN`（Rust API。TABLE-19）は主キー構成列の削除を
 ## 既知のギャップ（スコープ外）
 
 - NOT NULL 違反の `23502` 統一・`DEFAULT`（Issue #904 で実装済み）、`UNIQUE`
-  （Issue #905 で実装済み）、`CHECK`（別 Issue）、`FOREIGN KEY`（別 Issue）。
+  （Issue #905 で実装済み）、`CHECK`（Issue #906 で実装済み）、`FOREIGN KEY`（Issue #907 で実装済み。
+  `docs/design/foreign-key.md`）。
 - `ALTER TABLE ADD/DROP CONSTRAINT`・`ADD PRIMARY KEY`、`ON CONFLICT (<主キー列>)`、
   NoSQL 表層の DDL op。
 - 主キー用の永続一意索引（書き込み時のテナント全行走査の解消）。

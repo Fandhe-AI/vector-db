@@ -28,16 +28,25 @@ pub const fn http_status(class: ErrorClass) -> u16 {
     match class {
         ErrorClass::AuthRequired | ErrorClass::AuthInvalid => 401,
         ErrorClass::ForbiddenTenantMismatch => 403,
-        ErrorClass::TableNotFound | ErrorClass::RowNotFound => 404,
+        // `InvalidCursorName`（`34000`。WIRE-15・TASK-218）は NoSQL 表層の `op`
+        // 語彙にカーソル操作が無く構造的に到達しないが、`ErrorClass` の網羅性
+        // のため「対象が存在しない」という同じ意味論を持つ `TableNotFound`／
+        // `RowNotFound` と同じ 404 へ寄せる。
+        ErrorClass::TableNotFound | ErrorClass::RowNotFound | ErrorClass::InvalidCursorName => {
+            404
+        }
         // `DuplicateTable`（`42P07`。SQL-23・TASK-85、Issue #899）は
         // `CREATE TABLE` が指定したテーブル名の既存衝突であり、`UniqueViolation`
         // と同じ「対象が既に存在する」意味論のため同じ 409 とする。
         // `CheckViolation`（`23514`。TABLE-16・TASK-204、Issue #906）は書き込む
         // 行の値が宣言済み制約と矛盾するという `UniqueViolation` と同じ
         // 「対象の状態と矛盾する」意味論のため、同じ 409 とする（ERR-6）。
-        ErrorClass::UniqueViolation | ErrorClass::DuplicateTable | ErrorClass::CheckViolation => {
-            409
-        }
+        // `ForeignKeyViolation`（`23503`。TABLE-17・TASK-205、Issue #907）も同じ
+        // 意味論（参照整合性と矛盾する書き込み）のため 409 とする（ERR-6）。
+        ErrorClass::UniqueViolation
+        | ErrorClass::DuplicateTable
+        | ErrorClass::CheckViolation
+        | ErrorClass::ForeignKeyViolation => 409,
         ErrorClass::PayloadTooLarge => 413,
         ErrorClass::InternalError => 500,
         ErrorClass::FeatureNotSupported => 501,
@@ -80,7 +89,11 @@ pub const fn http_status(class: ErrorClass) -> u16 {
         // NoSQL 表層の `op` 語彙に索引 DDL が無く構造的に到達しないが、
         // `ErrorClass` の網羅性のため射影を定める。
         | ErrorClass::UndefinedObject
-        | ErrorClass::UndefinedColumn => 400,
+        | ErrorClass::UndefinedColumn
+        // `InvalidForeignKey`（`42830`。TABLE-17・TASK-205、Issue #907）は
+        // `FOREIGN KEY` 宣言（`CREATE TABLE`。NoSQL 表層の `op` 語彙に DDL が無く
+        // 構造的に到達しない）の不正。ERR-6 新設行の射影規則に従い 400 とする。
+        | ErrorClass::InvalidForeignKey => 400,
     }
 }
 
@@ -90,7 +103,7 @@ mod tests {
 
     /// 期待表を明示的に列挙し、`ErrorClass::ALL` との突き合わせで非 vacuous に検証する。
     /// `match` にアームを足したが期待表の更新を忘れた、という乖離を (a)(b) が検出する。
-    const EXPECTED: [(ErrorClass, u16); 31] = [
+    const EXPECTED: [(ErrorClass, u16); 34] = [
         (ErrorClass::InvalidInput, 400),
         (ErrorClass::AuthInvalid, 401),
         (ErrorClass::AuthRequired, 401),
@@ -116,12 +129,15 @@ mod tests {
         (ErrorClass::InFailedSqlTransaction, 400),
         (ErrorClass::DuplicateTable, 409),
         (ErrorClass::DuplicateColumn, 400),
+        (ErrorClass::InvalidCursorName, 404),
         (ErrorClass::DependentObjectsStillExist, 400),
         (ErrorClass::WrongObjectType, 400),
         (ErrorClass::NotNullViolation, 400),
         (ErrorClass::UndefinedObject, 400),
         (ErrorClass::UndefinedColumn, 400),
         (ErrorClass::CheckViolation, 409),
+        (ErrorClass::ForeignKeyViolation, 409),
+        (ErrorClass::InvalidForeignKey, 400),
     ];
 
     #[test]

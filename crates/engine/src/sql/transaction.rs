@@ -114,6 +114,13 @@ struct ActiveTxn<'e> {
     written_tables: HashSet<String>,
     has_writes: bool,
     session_at_begin: SessionState,
+    /// `DECLARE`/`FETCH`/`CLOSE`（WIRE-15・TASK-218）が開いたカーソルの集合。
+    /// `ActiveTxn` に埋め込まれているため、トランザクションの終了（`commit`／
+    /// `rollback`／`fail`。いずれも `ActiveTxn` を `mem::replace` で取り出して
+    /// drop する）とともに保持していたカーソルもすべて自動的に消える
+    /// （カーソルの寿命がトランザクションの寿命に一致する設計。
+    /// `sql::cursor` モジュールドキュメント参照）。
+    cursors: crate::sql::cursor::CursorRegistry,
     _marker: std::marker::PhantomData<&'e ()>,
 }
 
@@ -152,6 +159,13 @@ impl Default for TransactionLimits {
 pub struct SessionTransaction<'e> {
     state: TxnState<'e>,
     limits: TransactionLimits,
+    /// `BEGIN`（`Idle` → `Active`）が成功するたびに 1 つ進む世代カウンタ
+    /// （`TxnState` を跨いでセッション全体で単調増加。`COMMIT`／`ROLLBACK`で
+    /// `ActiveTxn` が捨てられても値自体は保持し続ける）。wire-server 拡張
+    /// クエリの portal が、カーソル `FETCH` の中断保持分を後から再送出して
+    /// よいか（同一トランザクション内のままか）を突き合わせるために使う
+    /// （PR #1049 レビュー指摘対応。[`Self::active_generation`] 参照）。
+    generation: u64,
 }
 
 impl<'e> SessionTransaction<'e> {
@@ -159,6 +173,7 @@ impl<'e> SessionTransaction<'e> {
         Self {
             state: TxnState::Idle,
             limits,
+            generation: 0,
         }
     }
 
@@ -176,6 +191,17 @@ impl<'e> SessionTransaction<'e> {
         matches!(self.state, TxnState::Active(_))
     }
 
+    /// `Active` の間だけ、現在のトランザクションの世代番号を返す（PR #1049
+    /// レビュー指摘対応）。wire-server 拡張クエリの portal が、カーソル
+    /// `FETCH` の中断保持分（`PortalState::Suspended`）を束縛した時点の
+    /// 世代と、再送出しようとしている時点の世代を突き合わせ、その間に
+    /// `COMMIT`／`ROLLBACK`（→ `Idle`）や新しい `BEGIN` を挟んでいないかを
+    /// 検証するために使う。`None`（`Idle`／`Failed`）はトランザクションが
+    /// 既に終了しており、束縛が生きていた世代とは一致し得ないことを表す。
+    pub fn active_generation(&self) -> Option<u64> {
+        self.is_active().then_some(self.generation)
+    }
+
     /// `BEGIN`。`Idle` から `Active` へ遷移する。`storage` から
     /// [`crate::storage::Storage::begin_explicit_write_txn`] で単一ライタの
     /// permit を取得したまま保持する（`writer_gate` モジュールドキュメント
@@ -190,6 +216,24 @@ impl<'e> SessionTransaction<'e> {
                 let write_txn = storage
                     .begin_explicit_write_txn()
                     .map_err(map_write_lock_err)?;
+                // 世代番号を先に進めてから `Active` へ遷移する（PR #1049
+                // レビュー指摘対応。オーバーフロー目前で頭打ちにし、万一
+                // 到達しても既存の世代番号を使い回して衝突させることはない
+                // ―― 到達し得ない前提の防御的縮退のため専用の `wire_code`
+                // は設けず、`Internal` として拒否する）。`write_txn` を
+                // 閉包へ move させないよう、先に `match` で判定してから
+                // 代入する（`ok_or_else` クロージャは呼ばれない場合でも
+                // 構築時に move が確定するため使えない）。
+                let next_generation = match self.generation.checked_add(1) {
+                    Some(g) => g,
+                    None => {
+                        drop(write_txn);
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "internal error".to_string(),
+                        });
+                    }
+                };
+                self.generation = next_generation;
                 self.state = TxnState::Active(Box::new(ActiveTxn {
                     write_txn,
                     started_at: Instant::now(),
@@ -198,6 +242,7 @@ impl<'e> SessionTransaction<'e> {
                     written_tables: HashSet::new(),
                     has_writes: false,
                     session_at_begin: session.clone(),
+                    cursors: crate::sql::cursor::CursorRegistry::new(),
                     _marker: std::marker::PhantomData,
                 }));
                 Ok(())
@@ -354,6 +399,41 @@ impl<'e> SessionTransaction<'e> {
     pub(crate) fn write_txn(&self) -> Option<&redb::WriteTransaction> {
         match &self.state {
             TxnState::Active(active) => Some(&*active.write_txn),
+            _ => None,
+        }
+    }
+
+    /// `Active` のときのみ、カーソル集合への可変参照を返す（`DECLARE`/
+    /// `FETCH`/`CLOSE` の実行本体〔`core.rs::EngineCore::
+    /// execute_cursor_in_active_txn`〕が使う）。
+    pub(crate) fn cursors_mut(&mut self) -> Option<&mut crate::sql::cursor::CursorRegistry> {
+        match &mut self.state {
+            TxnState::Active(active) => Some(&mut active.cursors),
+            _ => None,
+        }
+    }
+
+    /// `name` のカーソルが `Active` なトランザクション内に存在すれば、その
+    /// 結果列メタデータを返す（Describe 専用の読み取り専用アクセサ。
+    /// `core.rs::EngineCore::describe_parsed_in_txn` が使う。検索本体・
+    /// カーソルの取得位置には一切触れない）。
+    pub(crate) fn cursor_columns(&self, name: &str) -> Option<Vec<crate::sql::exec::ColumnMeta>> {
+        match &self.state {
+            TxnState::Active(active) => active.cursors.columns(name),
+            _ => None,
+        }
+    }
+
+    /// `name` のカーソルが `Active` なトランザクション内に存在すれば、その
+    /// `DECLARE` インスタンス固有の識別子を返す（PR #1049 レビュー指摘対応。
+    /// `pub` — `wire-server::extended_query` が拡張クエリの portal 束縛検証
+    /// から直接呼ぶ。`Idle`／`Failed`、またはカーソルが `CLOSE` 済み・
+    /// 再 `DECLARE` された別インスタンスであれば `None`／不一致となり、
+    /// 呼び出し元はその中断保持分の再送出を拒否する契約。`docs/design/
+    /// sql-cursor.md`「wire-server 拡張クエリの portal 束縛」節参照）。
+    pub fn cursor_id(&self, name: &str) -> Option<u64> {
+        match &self.state {
+            TxnState::Active(active) => active.cursors.cursor_id(name),
             _ => None,
         }
     }

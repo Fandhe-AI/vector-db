@@ -66,6 +66,84 @@ pub(crate) fn accumulator_bug(detail: &str) -> SqlSurfaceError {
     }
 }
 
+/// 単一行集計（`GROUP BY` なし）の既定の結果バイト予算（PR #1049 レビュー指摘
+/// P0 対応）。`crate::sql::scan::MAX_SCAN_RESULT_BYTES`・
+/// `crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION` と同方針で、通常の
+/// （カーソル非経由の）集計呼び出しでは既存の実挙動を変えない十分大きな値を既定
+/// とし、[`crate::sql::cursor`] の `DECLARE` 経由の呼び出しだけがより小さい予算
+/// （[`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`]）を明示的に渡す。
+pub(crate) const MAX_AGGREGATE_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
+
+/// [`accumulate_text_budget`] の予算超過 detail 文言（[`is_aggregate_text_budget_error`]
+/// が照合する）。
+const AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL: &str = "aggregate result exceeds capacity";
+/// 同上。`checked_add` のオーバーフロー側の detail 文言。
+const AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL: &str = "aggregate text budget accounting overflowed";
+
+/// `err` が [`accumulate_text_budget`] の予算超過（処理順序に依存しうる一時的な
+/// 超過）かを判定する（PR #1049 レビュー指摘 codex P1 対応）。
+///
+/// `MIN`/`MAX(<TEXT 列>)` の保持文字列は後続行でより短い極値へ更新されると縮小する
+/// ため、途中の最大値は行の処理順序に依存する。索引経路の候補順と全走査の物理行順が
+/// 異なると、同じ最終結果でも索引経路だけが途中で予算を超えて失敗しうる——索引選択
+/// によってクエリの成否が変わってはならない（`sql::group_by::
+/// is_text_accumulator_budget_error` と同じ理由・同じ設計）ため、索引経路は
+/// この超過を検出したら結果を破棄して全走査（処理順序に依存しない基準実装）へ
+/// 退避する。
+fn is_aggregate_text_budget_error(err: &SqlSurfaceError) -> bool {
+    matches!(
+        err,
+        SqlSurfaceError::PayloadTooLarge { detail }
+            if detail == AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL
+                || detail == AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL
+    )
+}
+
+/// `MIN`/`MAX(<TEXT 列>)` 集計項目（[`Accumulator::TextMin`]/[`Accumulator::TextMax`]）
+/// がクエリ全体で保持する文字列の累計バイト数を、呼び出し元が指定する
+/// `max_result_bytes` 予算で頭打ちにする（PR #1049 レビュー指摘 P0 対応）。
+/// `GROUP BY` なしの単一行集計は項目ごとに高々 1 本の `String` しか保持しないが
+/// （[`Accumulator::text_len`] ドキュメント参照）、最大
+/// [`crate::sql::allowlist::MAX_AGGREGATE_ITEMS`]（32）項目がそれぞれ独立した
+/// `TEXT` 列（1 列あたり最大 [`crate::row_codec::MAX_TEXT_FIELD_LEN`]＝4 MiB）の
+/// 極値を同時に保持しうるため、項目数だけでは有界にならない
+/// （`sql::group_by::accumulate_row` の `MAX_TEXT_ACCUMULATOR_TOTAL_BYTES` と同じ
+/// 「クエリ全体での累計」という考え方を、`GROUP BY` なしの単一行経路にも適用する）。
+/// `before`／`after` の比較により、より短い極値への更新（保持量の縮小）を正しく
+/// 減算し、正常なクエリを誤って予算超過にしない（`sql::group_by::accumulate_row`
+/// と同方針）。
+///
+/// 超過時の detail は [`AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL`]／
+/// [`AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL`]。より短い極値への更新で縮小しうる
+/// ため途中の最大値は処理順序に依存し、索引経路（[`try_scalar_index_aggregate`]）は
+/// この超過を検出したら全走査へ退避する（[`is_aggregate_text_budget_error`] 参照）。
+fn accumulate_text_budget(
+    before: usize,
+    after: usize,
+    total_text_accumulator_bytes: &mut usize,
+    max_result_bytes: usize,
+) -> Result<(), SqlSurfaceError> {
+    if after > before {
+        let delta = after - before;
+        *total_text_accumulator_bytes = total_text_accumulator_bytes
+            .checked_add(delta)
+            .ok_or_else(|| {
+                SqlSurfaceError::payload_too_large(AGGREGATE_TEXT_BUDGET_OVERFLOW_DETAIL)
+            })?;
+        if *total_text_accumulator_bytes > max_result_bytes {
+            return Err(SqlSurfaceError::payload_too_large(
+                AGGREGATE_TEXT_BUDGET_EXCEEDED_DETAIL,
+            ));
+        }
+    } else if after < before {
+        let delta = before - after;
+        *total_text_accumulator_bytes = total_text_accumulator_bytes
+            .checked_sub(delta)
+            .ok_or_else(|| accumulator_bug("aggregate text budget accounting underflowed"))?;
+    }
+    Ok(())
+}
+
 /// 可視行 1 件から取り出した `VECTOR` 列の値のビュー（Issue #350）。
 /// [`ReferencedColumns::needs_embedding`] に応じて呼び出し元（`execute_aggregate`・
 /// `sql::group_by::execute_grouped_aggregate`）が `values` を実際にデコード済みの
@@ -1242,7 +1320,16 @@ pub fn execute_aggregate(
     schema: &TableSchema,
     bound: &BoundAggregate,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    execute_aggregate_with_cache(read_txn, ctx, schema, bound, None, None, None)
+    execute_aggregate_with_cache(
+        read_txn,
+        ctx,
+        schema,
+        bound,
+        MAX_AGGREGATE_RESULT_BYTES,
+        None,
+        None,
+        None,
+    )
 }
 
 /// [`crate::sql::parser::BoundAggregate`] を実行し、単一行の [`QueryResult`] を返す
@@ -1264,11 +1351,22 @@ pub fn execute_aggregate(
 /// 検証を毎行実施済みのため、構築コストは実質ゼロ）。`GROUP BY`（`sql::group_by`
 /// への分岐）・`DimAndScalar`/`Embedding` tier はこのキャッシュの対象外
 /// （詳細・スコープ判断は `docs/design/visible-bitmap-cache.md` 参照）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_aggregate_with_cache(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundAggregate,
+    // PR #1049 レビュー指摘 P0 対応: 集計結果（`MIN`/`MAX(<TEXT 列>)` の累計
+    // バイト数。`GROUP BY` ありは `sql::group_by::execute_grouped_aggregate` の
+    // グループキー・TEXT 集計状態の累計）が、完成した [`QueryResult`] を
+    // 呼び出し元へ返す前ではなく生成中に頭打ちになるようにする上限。通常の
+    // （カーソル非経由の）呼び出しは [`MAX_AGGREGATE_RESULT_BYTES`]（既存挙動を
+    // 変えない大きな既定値）を渡し、`sql::cursor::CursorStatement::Declare` の
+    // 内側実行（`core.rs::EngineCore::execute_cursor_inner_query`）だけがより
+    // 小さい [`crate::sql::cursor::MAX_CURSOR_BYTES_PER_SESSION`] を明示的に渡す
+    // （`sql::scan::execute_scan_with_budget` と同じ設計判断）。
+    max_result_bytes: usize,
     visible_cache: Option<crate::sql::visible_cache::VisibleCacheAccess<'_>>,
     // Issue #475: スカラー列二次索引（`sql::scalar_index::ScalarIndex`）経由の
     // 候補削減。索引対応述語（`TEXT` 列の等価・前方一致・`id` の単純比較）を
@@ -1289,6 +1387,7 @@ pub(crate) fn execute_aggregate_with_cache(
             ctx,
             schema,
             bound,
+            max_result_bytes,
             arena_cache,
             scalar_cache,
         );
@@ -1354,6 +1453,7 @@ pub(crate) fn execute_aggregate_with_cache(
                 expected_dim,
                 arena_access,
                 scalar_access,
+                max_result_bytes,
             )? {
                 return Ok(result);
             }
@@ -1423,6 +1523,10 @@ pub(crate) fn execute_aggregate_with_cache(
     // 借用ライフタイムが行ごとに変わることと両立しないため行ごとに新規確保して
     // いた）。
     let mut expr_scratch: Vec<StackValue> = Vec::new();
+
+    // PR #1049 レビュー指摘 P0 対応: `MIN`/`MAX(<TEXT 列>)` の累計バイト数予算
+    // （[`accumulate_text_budget`] ドキュメント参照）。
+    let mut total_text_accumulator_bytes: usize = 0;
 
     // Issue #478: `DecodeTier::Fast` のミス時（上のキャッシュヒット判定で
     // 早期リターンしなかった場合）は、この既存走査に相乗りして可視行の `id` を
@@ -1603,7 +1707,15 @@ pub(crate) fn execute_aggregate_with_cache(
                 },
             };
             for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+                let before = accumulator.text_len();
                 accumulator.observe(&item.input, id, &vector, &scanned, &mut expr_scratch)?;
+                let after = accumulator.text_len();
+                accumulate_text_budget(
+                    before,
+                    after,
+                    &mut total_text_accumulator_bytes,
+                    max_result_bytes,
+                )?;
             }
         }
     }
@@ -1709,6 +1821,9 @@ fn try_scalar_index_aggregate(
     expected_dim: u32,
     arena_access: &crate::sql::arena_cache::ArenaCacheAccess<'_>,
     scalar_access: &crate::sql::scalar_index::ScalarCacheAccess<'_>,
+    // PR #1049 レビュー指摘 P0 対応: [`observe_candidate_slots`] へそのまま渡す
+    // 結果バイト予算（[`execute_aggregate_with_cache`] ドキュメント参照）。
+    max_result_bytes: usize,
 ) -> Result<Option<QueryResult>, SqlSurfaceError> {
     // Cursor Bugbot Medium 指摘（PR #603）: キャッシュ照会・再利用ロジックを
     // [`ensure_scalar_index_snapshot`] へ一本化した（`sql::group_by` の
@@ -1767,14 +1882,26 @@ fn try_scalar_index_aggregate(
             acc.observe_present_n(hits)?;
         }
     } else {
-        observe_candidate_slots(
+        match observe_candidate_slots(
             &snapshot,
             &slots,
             schema,
             bound,
             referenced,
             &mut accumulators,
-        )?;
+            max_result_bytes,
+        ) {
+            Ok(()) => {}
+            // PR #1049 レビュー指摘 codex P1 対応: 候補順に依存しうる一時的な
+            // `TEXT` 予算超過は、索引経路の途中結果（`accumulators`）を破棄して
+            // 全走査へ退避する（[`is_aggregate_text_budget_error`] 参照）。全走査
+            // でも超過するなら、そこで同じ `54000` が返る。
+            Err(err) if is_aggregate_text_budget_error(&err) => {
+                scalar_access.cache.record_aggregate_plain_scan_fallback();
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        }
     }
     scalar_access.cache.record_aggregate_index_scan();
     Ok(Some(finish_aggregate_result(accumulators, bound)?))
@@ -1916,9 +2043,15 @@ pub(crate) fn observe_candidate_slots(
     bound: &BoundAggregate,
     referenced: &ReferencedColumns,
     accumulators: &mut [Accumulator],
+    // PR #1049 レビュー指摘 P0 対応: `MIN`/`MAX(<TEXT 列>)` の累計バイト数予算
+    // （[`accumulate_text_budget`] ドキュメント参照）。索引経由の候補走査は
+    // 通常の全走査ループ（本モジュール下部）と別の実行経路のため、同じ予算
+    // 検査を独立して適用する。
+    max_result_bytes: usize,
 ) -> Result<(), SqlSurfaceError> {
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
+    let mut total_text_accumulator_bytes: usize = 0;
     'candidates: for &slot in slots {
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
@@ -1972,7 +2105,15 @@ pub(crate) fn observe_candidate_slots(
             },
         };
         for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+            let before = accumulator.text_len();
             accumulator.observe(&item.input, id, &vector, &scanned, &mut expr_scratch)?;
+            let after = accumulator.text_len();
+            accumulate_text_budget(
+                before,
+                after,
+                &mut total_text_accumulator_bytes,
+                max_result_bytes,
+            )?;
         }
     }
     Ok(())
@@ -2185,6 +2326,36 @@ mod tests {
         }
     }
 
+    /// PR #1049 レビュー指摘 P0 対応の回帰テスト用: 同一 `(func, input)` の組を
+    /// `count` 個並べた `BoundAggregate`（`GROUP BY` なし）を組み立てる。
+    /// `MIN`/`MAX(<TEXT 列>)` を複数項目束ねることで、単一行集計が
+    /// [`Accumulator::text_len`] の累計をどれだけ保持しうるかを検証する。
+    fn bound_multi(func: AggregateFunc, input: AggregateInput, count: usize) -> BoundAggregate {
+        let items: Vec<BoundAggregateItem> = (0..count)
+            .map(|i| BoundAggregateItem {
+                func,
+                input: input.clone(),
+                name: format!("result_{i}"),
+            })
+            .collect();
+        let projection = (0..count)
+            .map(|i| crate::sql::parser::ProjectionColumn::Aggregate {
+                item_index: i,
+                name: format!("result_{i}"),
+            })
+            .collect();
+        BoundAggregate {
+            table: "docs".to_string(),
+            items,
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            rls_predicate_present: false,
+            projection,
+            group_by: None,
+        }
+    }
+
     /// 検証専用: `encode_row` で組み立てた妥当な行バイト列を、そのまま行テーブルへ
     /// 直接書き込む（`storage::encode_row` の検証をバイパスして任意バイト列を
     /// 挿入する `write_row_direct` とは異なり、ここでは呼び出し元が事前に破損させた
@@ -2233,17 +2404,33 @@ mod tests {
 
         // COUNT(embedding) は NULL 行（id=2）を数えない。
         let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
-        let result =
-            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_vec, None, None, None)
-                .expect("COUNT(embedding) should succeed even with a NULL row present");
+        let result = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_vec,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect("COUNT(embedding) should succeed even with a NULL row present");
         assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
 
         // COUNT(*) は VECTOR 値を参照しないため、nullable 列の NULL 行があっても
         // 次元不一致（旧 XX000）を返さず両方の可視行を数える（本 PR の中心的指摘）。
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let result =
-            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
-                .expect("COUNT(*) must not fail on a nullable VECTOR column's NULL row");
+        let result = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_star,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect("COUNT(*) must not fail on a nullable VECTOR column's NULL row");
         assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
     }
 
@@ -2276,9 +2463,17 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err =
-            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
-                .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        let err = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_star,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect_err("key/header tenant mismatch must be rejected fail-closed");
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -2314,9 +2509,17 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err =
-            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
-                .expect_err("COUNT(*) fast path must fail closed on a corrupted embedding section");
+        let err = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_star,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect_err("COUNT(*) fast path must fail closed on a corrupted embedding section");
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -2347,9 +2550,17 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
-        let err =
-            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_vec, None, None, None)
-                .unwrap_err();
+        let err = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_vec,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -2405,6 +2616,7 @@ mod tests {
             &ctx,
             &schema,
             &bound_star,
+            MAX_AGGREGATE_RESULT_BYTES,
             None,
             None,
             None,
@@ -2471,6 +2683,224 @@ mod tests {
     fn text_min_max_empty_set_is_null() {
         let min = Accumulator::TextMin(None);
         assert_eq!(min.finish().unwrap(), Cell::Null);
+    }
+
+    /// PR #1049 レビュー指摘 P0 対応の回帰テスト: `GROUP BY` なしの単一行集計が
+    /// `MIN`/`MAX(<TEXT 列>)` を複数項目束ねた場合、[`accumulate_text_budget`]
+    /// が呼び出し元の指定するバイト予算（`sql::cursor::
+    /// MAX_CURSOR_BYTES_PER_SESSION` 相当の小さい値を模した `1`）で行生成中に
+    /// 打ち切ることを固定する。[`crate::sql::scan::execute_scan_with_budget_
+    /// honors_caller_supplied_cap`] と同じ検証形（既定予算では成功・極端に
+    /// 小さい予算では `54000` で早期失敗）。
+    #[test]
+    fn execute_aggregate_with_cache_honors_caller_supplied_result_byte_budget_for_text_min_max() {
+        let path = unique_db_path("agg-text-budget-cap");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let metadata = row_codec::encode_scalar_columns(
+            &schema,
+            &[
+                row_codec::Value::Null,
+                row_codec::Value::Text("hello world".to_string()),
+            ],
+        )
+        .expect("encode scalar columns");
+        let buf = crate::storage::encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0],
+            metadata: &metadata,
+        })
+        .expect("encode row");
+        write_row_raw(&storage, "docs", "tenant-a", 1, &buf);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        // 5 項目（`MIN`/`MAX(body)` を交互に束ねる）の単一行集計。既定予算
+        // （[`MAX_AGGREGATE_RESULT_BYTES`]）では成功する。
+        let bound = bound_multi(AggregateFunc::Min, AggregateInput::TextColumn(1), 5);
+        execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect("default budget should succeed");
+
+        // 同じデータ・同じクエリでも、呼び出し元が極端に小さい予算を渡せば
+        // 行生成中に打ち切られる（`sql::cursor::CursorStatement::Declare` の
+        // 内側実行が `MAX_CURSOR_BYTES_PER_SESSION` を渡す経路の回帰）。
+        let err =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound, 1, None, None, None)
+                .expect_err("tiny caller-supplied budget must reject before default cap");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// PR #1049 レビュー指摘 codex P1 の回帰テスト: 単一行集計の索引経路
+    /// （候補走査）で、候補順に依存する一時的な `MIN(<TEXT 列>)` 予算超過が
+    /// 起きても `54000` で失敗させず、全走査（物理行順）へ退避して全走査と同じ
+    /// 結果を返す。
+    ///
+    /// 構成: redb 上は `id` 昇順（1:`a`、2:`bbbbbbbbbb`）だが、温めた
+    /// `SqlArenaSnapshot` には `id` 降順で積むため、候補走査は 2 → 1 の順に処理する。
+    /// `MIN(v)` の保持量のピークは物理行順なら 1 バイト、候補順なら 10 バイトに
+    /// なるため、予算 5 バイトでは候補順だけが途中で超過する。
+    #[test]
+    fn index_path_text_budget_overflow_falls_back_to_full_scan() {
+        let path = unique_db_path("agg-index-text-budget-fallback");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("kind", ColumnType::Text, false),
+                ColumnDef::new("v", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let rows: [(u64, &str, &str); 5] = [
+            (1, "x", "a"),
+            (2, "x", "bbbbbbbbbb"),
+            (3, "y", "z"),
+            (4, "y", "z"),
+            (5, "y", "z"),
+        ];
+        let metadata_of = |kind: &str, v: &str| {
+            row_codec::encode_scalar_columns(
+                &schema,
+                &[
+                    row_codec::Value::Null,
+                    row_codec::Value::Text(kind.to_string()),
+                    row_codec::Value::Text(v.to_string()),
+                ],
+            )
+            .expect("encode scalar columns")
+        };
+        for (id, kind, v) in rows {
+            let metadata = metadata_of(kind, v);
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 2.0, 3.0],
+                metadata: &metadata,
+            })
+            .expect("encode row");
+            write_row_raw(&storage, "docs", "tenant-a", id, &buf);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let expected_dim = schema.vector_dim().expect("vector dim");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let generation = crate::catalog::table_generation_in_txn(&read_txn, "docs")
+            .expect("read table generation");
+
+        // 物理行順と逆（`id` 降順）のスナップショットを温める。
+        let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
+            expected_dim,
+            crate::arena::MAX_ARENA_ROWS,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+        );
+        for (id, kind, v) in rows.iter().rev() {
+            capture.push(
+                *id,
+                "tenant-a",
+                Visibility::Public,
+                &[1.0, 2.0, 3.0],
+                &metadata_of(kind, v),
+                0,
+            );
+        }
+        let (arena, metadata) = capture.finish("docs").expect("capture");
+        let snapshot = crate::sql::arena_cache::SqlArenaSnapshot::new(
+            arena,
+            metadata,
+            ctx.clone(),
+            generation,
+        );
+        let arena_cache = crate::sql::arena_cache::SqlArenaCache::new();
+        let scalar_cache = crate::sql::scalar_index::ScalarIndexCache::new();
+        arena_cache.insert(&storage, "docs", &ctx, snapshot);
+
+        let crate::sql::allowlist::Statement::Aggregate(validated) =
+            crate::sql::allowlist::validate_sql(
+                "SELECT MIN(v) AS mn FROM docs WHERE kind = 'x'",
+                &storage,
+            )
+            .expect("validate")
+        else {
+            panic!("expected aggregate statement");
+        };
+        let bound = crate::sql::parser::bind_aggregate(
+            &validated,
+            &schema,
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+        .expect("bind");
+
+        let run = |budget: usize| {
+            execute_aggregate_with_cache(
+                &read_txn,
+                &ctx,
+                &schema,
+                &bound,
+                budget,
+                None,
+                Some(crate::sql::arena_cache::ArenaCacheAccess {
+                    storage: &storage,
+                    cache: &arena_cache,
+                }),
+                Some(crate::sql::scalar_index::ScalarCacheAccess {
+                    storage: &storage,
+                    cache: &scalar_cache,
+                }),
+            )
+        };
+
+        // 既定予算では索引経路をそのまま使う（非 vacuous 性の確認）。
+        let before = scalar_cache.stats();
+        let ok = run(MAX_AGGREGATE_RESULT_BYTES).expect("default budget succeeds");
+        assert_eq!(ok.rows[0].cells, vec![Cell::Text("a".to_string())]);
+        let after = scalar_cache.stats();
+        assert_eq!(
+            after.aggregate_index_scans,
+            before.aggregate_index_scans + 1,
+            "the candidate-walk index path must be taken"
+        );
+
+        // 予算 5 バイト: 候補順では途中で超過するが、全走査へ退避して成功する。
+        let before = scalar_cache.stats();
+        let result = run(5).expect("order-dependent overflow must fall back, not fail");
+        assert_eq!(result.rows[0].cells, vec![Cell::Text("a".to_string())]);
+        let after = scalar_cache.stats();
+        assert_eq!(
+            after.aggregate_plain_scan_fallbacks,
+            before.aggregate_plain_scan_fallbacks + 1,
+            "the index path must record a fallback to the full scan"
+        );
+        assert_eq!(after.aggregate_index_scans, before.aggregate_index_scans);
+
+        // 全走査でも超過する予算では、従来どおり `54000` で失敗する。
+        let err = run(0).expect_err("overflow on the full scan must still fail");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]
@@ -3057,18 +3487,32 @@ mod tests {
 
         // Fast tier: COUNT(*)
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err =
-            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None, None, None)
-                .expect_err("Fast tier must reject key/header tenant mismatch");
+        let err = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_star,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect_err("Fast tier must reject key/header tenant mismatch");
         assert_eq!(err.wire_code(), "XX000");
 
         // DimAndScalar tier: COUNT(<UUID 列>)（新型列参照）
         let bound_uuid = bound_single(AggregateFunc::Count, AggregateInput::UuidColumn(1));
-        let err =
-            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_uuid, None, None, None)
-                .expect_err(
-                    "DimAndScalar tier (new-type column) must reject key/header tenant mismatch",
-                );
+        let err = execute_aggregate_with_cache(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound_uuid,
+            MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+            None,
+        )
+        .expect_err("DimAndScalar tier (new-type column) must reject key/header tenant mismatch");
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -3120,6 +3564,7 @@ mod tests {
             &ctx,
             &schema,
             &bound_star,
+            MAX_AGGREGATE_RESULT_BYTES,
             None,
             None,
             None,

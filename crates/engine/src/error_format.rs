@@ -91,7 +91,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502"];
 
 define_error_classes! {
-    count = 31;
+    count = 34;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -210,6 +210,10 @@ define_error_classes! {
     /// TABLE-6・TASK-85（Issue #899）が追加。
     /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateColumn`] の写像。
     DuplicateColumn => ("42701", "DUPLICATE_COLUMN"),
+    /// `FETCH`／`CLOSE` が参照したカーソル名が、現在のトランザクション内に
+    /// 存在しない（`34000`）。WIRE-15・TASK-218 が追加。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidCursorName`] の写像。
+    InvalidCursorName => ("34000", "INVALID_CURSOR_NAME"),
     /// `DROP TABLE`／`DROP VIEW` の対象に、それを参照するビューが 1 つ以上残って
     /// いるため削除を拒否した（`2BP01`。TABLE-18・SQL-23・TASK-205、Issue #909）。
     /// [`crate::catalog::CatalogError::DependentViewsExist`] の写像。依存する
@@ -241,6 +245,17 @@ define_error_classes! {
     /// [`crate::tenant::TenantWriteError::CheckViolation`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::CheckViolation`] の写像。
     CheckViolation => ("23514", "CHECK_VIOLATION"),
+    /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
+    /// （`23503`）: 参照元の書き込みで参照先の値の組が同一テナント内に存在しない、
+    /// または参照先の削除・更新で参照元の行が残る。
+    /// [`crate::tenant::TenantWriteError::ForeignKeyViolation`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::ForeignKeyViolation`] の写像。
+    ForeignKeyViolation => ("23503", "FOREIGN_KEY_VIOLATION"),
+    /// `FOREIGN KEY` 宣言（TABLE-17・TASK-205、Issue #907）の参照先列が主キー・
+    /// UNIQUE 制約（または `id` 疑似列）と一致しない、あるいは参照元列と型が
+    /// 一致しない（`42830`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidForeignKey`] の写像。
+    InvalidForeignKey => ("42830", "INVALID_FOREIGN_KEY"),
 }
 
 impl ErrorClass {

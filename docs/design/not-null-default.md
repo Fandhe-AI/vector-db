@@ -185,8 +185,8 @@ NOT NULL 違反は新設の `ErrorClass::NotNullViolation`（`code` ラベル
 - `ALTER COLUMN SET/DROP DEFAULT`・`SET/DROP NOT NULL`。
 - SQL `VALUES` 内の `NULL` リテラルと `DEFAULT` キーワード（`INSERT INTO t
   (...) VALUES (DEFAULT, ...)` 形）。
-- `CHECK`／`FOREIGN KEY`（別 Issue。`PRIMARY KEY`・`UNIQUE` は Issue #903・
-  #905 で実装済み）・NoSQL 表層の DDL op。
+- NoSQL 表層の DDL op（`PRIMARY KEY`・`UNIQUE`・`CHECK`・`FOREIGN KEY` は
+  Issue #903・#905・#906・#907 で実装済み）。
 - `CREATE TABLE` の型拡張（`TEXT`／`VECTOR` 以外。TABLE-13／14）。
 - Rust API（`tenant::insert_typed_row` 等）の NOT NULL 拒否の分類変更（現状
   の `row_codec` 由来の分類を維持）と、Rust API での `DEFAULT` 適用（Rust

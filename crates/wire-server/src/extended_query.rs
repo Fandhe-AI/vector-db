@@ -49,6 +49,15 @@
 //! 残る）。Close(Statement) はその statement から作られた portal もまとめて
 //! 閉じる。
 //!
+//! カーソル `FETCH`（WIRE-15・TASK-218）から作った portal は、Sync 境界とは
+//! 別に、実行成功時点で束縛した [`CursorBinding`]（トランザクション世代・
+//! カーソル個体識別子）を中断保持分の再開前に突き合わせる——`CLOSE`／
+//! `COMMIT`／`ROLLBACK`（→ 世代不一致）・同名での再 `DECLARE`（→ 識別子
+//! 不一致）を、名前付き portal が Sync を跨がず生き残っている間に挟んでも
+//! 蓄積済みフレームを送出しない（PR #1049 レビュー指摘対応。詳細は
+//! `docs/design/sql-cursor.md`「wire-server 拡張クエリの portal 束縛」節
+//! 参照）。`Fetch` 以外の文から作った portal は対象外。
+//!
 //! 中断中の全 portal が保持するバイト数の合計（[`crate::limits::
 //! MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION`]）は接続（セッション）全体の
 //! 上限として運用する（[`PortalStore::total_suspended_bytes_excluding`]。
@@ -555,6 +564,26 @@ enum PortalState {
     Failed,
 }
 
+/// カーソル `FETCH`（[`engine::sql::cursor::CursorStatement::Fetch`]）を実行
+/// した portal が、その実行成功時点で束縛したトランザクション世代・カーソル
+/// 個体識別子（PR #1049 レビュー指摘対応: cursor Bugbot P1「終了した
+/// カーソルの FETCH portal から行を送出できる」）。この portal の中断保持分
+/// （[`PortalState::Suspended`]）を再送出する前に
+/// [`engine::sql::transaction::SessionTransaction::active_generation`]／
+/// `cursor_id` と突き合わせ、`CLOSE`／`COMMIT`／`ROLLBACK`（→ 世代不一致）や
+/// 同名での再 `DECLARE`（→ 識別子不一致）を挟んでいないかを検証する。`Fetch`
+/// 以外の文（通常の検索 `SELECT`・集計・広域取得等）から作られた portal は
+/// 常に `None`（この検証の対象外。既存の挙動を変えない）。
+#[derive(Debug, Clone)]
+struct CursorBinding {
+    /// 束縛先のカーソル名（`FETCH ... FROM <name>`）。再送出前の検証で
+    /// `SessionTransaction::cursor_id` を引くために使う（`portal.body` から
+    /// 都度再解体しない）。
+    cursor_name: String,
+    txn_generation: u64,
+    cursor_id: u64,
+}
+
 struct Portal {
     /// この portal を作った statement 名（Close(Statement) が派生 portal も
     /// 連動して閉じるために使う）。
@@ -572,6 +601,10 @@ struct Portal {
     /// （PostgreSQL の Bind 規則と同じ）。
     result_formats: Vec<result_encoder::FormatCode>,
     state: PortalState,
+    /// [`CursorBinding`] 参照。Bind 時点では常に `None`（内側 SELECT 未実行の
+    /// ため束縛先のカーソルが未確定）で、`FETCH` の初回実行が成功した直後
+    /// （`execute_portal`）に一度だけ設定する。
+    cursor_binding: Option<CursorBinding>,
 }
 
 /// 接続単位で portal を保持する（[`PreparedStatementStore`] と同型の設計）。
@@ -1058,6 +1091,7 @@ pub(crate) fn handle_describe<S: WireStream>(
     stream: &mut S,
     engine: &EngineCore,
     session: &SessionState,
+    txn: &engine::sql::transaction::SessionTransaction<'_>,
     state: &mut ExtendedQueryState,
 ) -> io::Result<LoopSignal> {
     let body = match framing::read_length_prefixed_body(
@@ -1074,7 +1108,7 @@ pub(crate) fn handle_describe<S: WireStream>(
         }
     };
 
-    match handle_describe_body(engine, session, state, &body) {
+    match handle_describe_body(engine, session, txn, state, &body) {
         Ok(DescribeResult::Statement(columns)) => {
             write_describe_response(stream, true, columns)?;
             Ok(LoopSignal::Continue)
@@ -1155,6 +1189,7 @@ fn write_describe_response_portal<S: WireStream>(
 fn handle_describe_body(
     engine: &EngineCore,
     session: &SessionState,
+    txn: &engine::sql::transaction::SessionTransaction<'_>,
     state: &ExtendedQueryState,
     body: &[u8],
 ) -> Result<DescribeResult, HandlerError> {
@@ -1167,8 +1202,13 @@ fn handle_describe_body(
                 .ok_or(HandlerError::UnknownStatement)?;
             let columns = match statement {
                 PreparedStatement::Empty => None,
+                // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替え、
+                // `ParsedSql::Cursor(CursorStatement::Fetch { .. })` に限り
+                // `txn` が保持する開いているカーソルの列メタデータを返す
+                // （それ以外の `ParsedSql` は `describe_parsed_in_session` と
+                // 完全に同一の判定へ委譲する）。
                 PreparedStatement::Parsed(parsed) => engine
-                    .describe_parsed_in_session(session, parsed)
+                    .describe_parsed_in_txn(session, txn, parsed)
                     .map_err(HandlerError::Sql)?,
             };
             Ok(DescribeResult::Statement(columns))
@@ -1294,8 +1334,11 @@ fn handle_bind_body(
         PreparedStatement::Empty => (PortalBody::Empty, None),
         PreparedStatement::Parsed(parsed) => {
             let parsed = parsed.clone();
+            // WIRE-15・TASK-218: `describe_parsed_in_txn` へ切り替える
+            // （`handle_describe_body` と同じ理由。`FETCH` の portal 列メタは
+            // Bind 時点で開いているカーソルの列を反映する）。
             let columns = engine
-                .describe_parsed_in_session(session, &parsed)
+                .describe_parsed_in_txn(session, txn, &parsed)
                 .map_err(HandlerError::Sql)?;
             (PortalBody::Parsed(parsed), columns)
         }
@@ -1323,6 +1366,7 @@ fn handle_bind_body(
         columns,
         result_formats,
         state: PortalState::Ready,
+        cursor_binding: None,
     };
 
     state
@@ -1572,6 +1616,27 @@ fn execute_portal<'e, S: WireStream>(
         })
         .map_err(HandlerError::Sql)?;
 
+        // `parsed` がカーソル `FETCH` なら、実行が成功したこの時点（`txn` は
+        // 実行後の状態）のトランザクション世代・カーソル個体識別子を portal へ
+        // 束縛する（PR #1049 レビュー指摘対応。cursor Bugbot P1「終了した
+        // カーソルの FETCH portal から行を送出できる」の是正）。`FETCH` 以外は
+        // 常に `None`（この検証の対象外。既存の挙動を変えない）。中断保持
+        // （`PortalState::Suspended`）へ回った場合はこの束縛を再送出前の
+        // 検証に使い、`CLOSE`／`COMMIT`／`ROLLBACK`／再 `DECLARE` を挟んで
+        // いれば以降の再 Execute を拒否する（本関数冒頭の検証ブロック参照）。
+        let cursor_binding = match &parsed {
+            ParsedSql::Cursor(engine::sql::cursor::CursorStatement::Fetch { name, .. }) => {
+                txn.active_generation().and_then(|txn_generation| {
+                    txn.cursor_id(name).map(|cursor_id| CursorBinding {
+                        cursor_name: name.clone(),
+                        txn_generation,
+                        cursor_id,
+                    })
+                })
+            }
+            _ => None,
+        };
+
         // ここに到達した時点で `is_write_statement` なら commit は既に成功
         // している（上のコメント参照）。これ以降（結果列整合検査・行
         // エンコード・中断バイト上限判定・応答フレーム送出）で発生する失敗は
@@ -1588,104 +1653,135 @@ fn execute_portal<'e, S: WireStream>(
             }
         };
 
-        match crate::simple_query::map_outcome(outcome) {
-            crate::simple_query::OutcomeResponse::Command { tag } => {
-                let portal = state
-                    .portals
-                    .get_mut(portal_name)
-                    .ok_or(HandlerError::UnknownPortal)?;
-                portal.state = PortalState::Done { tag: tag.clone() };
-                return write_command_complete(stream, &tag).map_err(commit_wrap);
-            }
-            crate::simple_query::OutcomeResponse::Rows { result, shape } => {
-                if Some(&result.columns) != expected_columns.as_ref() {
-                    return Err(commit_wrap(HandlerError::ResultTypeChanged));
+        // PR #1049 レビュー指摘 codex P1 対応: カーソル `FETCH` はエンジン実行が
+        // 成功した時点（上の `execute_parsed_in_txn`）で取得位置を進める。以降の
+        // 応答生成（行エンコード・中断保持バイト上限・送出）が失敗した場合、
+        // 位置だけが進んで行がクライアントへ届かないまま次の `FETCH` が続きを
+        // 返すことがあってはならない。ここで明示トランザクションを直ちに
+        // `Failed` へ遷移させ（カーソルは `ActiveTxn` とともに破棄される）、
+        // 以降の `FETCH` は `25P02` になる——PostgreSQL の「エラーでトランザク
+        // ションを中断する」契約（SQL-31）と同じで、行を飛ばした状態から再開
+        // する経路を持たない。`handshake::post_auth_loop` もエラー応答後に同じ
+        // 遷移を行う（`respond_error_and_await_sync` 参照）が、その受け渡しに
+        // 依存せずこの失敗箇所で局所的に保証する。`fail` は `Active` 以外では
+        // 何もしない（冪等）。
+        let is_cursor_fetch = cursor_binding.is_some();
+        let response = (|| -> Result<(), HandlerError> {
+            match crate::simple_query::map_outcome(outcome) {
+                crate::simple_query::OutcomeResponse::Command { tag } => {
+                    let portal = state
+                        .portals
+                        .get_mut(portal_name)
+                        .ok_or(HandlerError::UnknownPortal)?;
+                    portal.state = PortalState::Done { tag: tag.clone() };
+                    portal.cursor_binding = cursor_binding;
+                    write_command_complete(stream, &tag).map_err(commit_wrap)
                 }
-                let total = result.rows.len();
-                let take = if max_rows <= 0 {
-                    total
-                } else {
-                    (max_rows as usize).min(total)
-                };
-
-                // まず中断保持へ回る行（`take` 以降）だけを対象に、1 行
-                // エンコードするたびに合計バイト数をセッション全体
-                // （他の全 portal の中断保持分を含む。PR #1013 レビュー
-                // 指摘・P0: portal 単体判定だと名前付き portal 最大 64 個で
-                // 接続全体では上限の約 64 倍相当を保持できてしまう）で
-                // 判定し、超過が判明した時点で残りの行を一切エンコードせず
-                // 即座に拒否する。この判定は `take` 分の送出を始める前に
-                // 完了させる ―― 1 回の Execute は「`take` 行の送出（＋
-                // 完了／中断マーカー）が丸ごと成功する」か「1 バイトも送らず
-                // 失敗する」かのいずれかである契約を保つ（中断バイト上限
-                // 超過を理由に、既に一部の行を送ってしまった後で
-                // ErrorResponse を返す事態を避ける）。
-                let other_suspended_bytes =
-                    state.portals.total_suspended_bytes_excluding(portal_name);
-                let mut remaining_bytes: usize = 0;
-                let mut frames = std::collections::VecDeque::new();
-                for row in result.rows.iter().skip(take) {
-                    // Bind 時点で確定した結果 format code（WIRE-14。
-                    // `Portal::result_formats`）を反映する。`validate_binary_
-                    // formats` が Bind で事前検査済みのため、ここでの
-                    // `EncodeError` は呼び出し元（本モジュール）内部の不整合
-                    // のみを意味する（`XX000` 相当。`result_encoder`
-                    // モジュールドキュメント参照）。
-                    let mut frame = Vec::new();
-                    result_encoder::encode_data_row_into_with_formats(
-                        row,
-                        &result_formats,
-                        &mut frame,
-                    )
-                    .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
-                    remaining_bytes = remaining_bytes.saturating_add(frame.len());
-                    let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
-                    if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
-                        return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
+                crate::simple_query::OutcomeResponse::Rows { result, shape } => {
+                    if Some(&result.columns) != expected_columns.as_ref() {
+                        return Err(commit_wrap(HandlerError::ResultTypeChanged));
                     }
-                    frames.push_back(frame);
-                }
+                    let total = result.rows.len();
+                    let take = if max_rows <= 0 {
+                        total
+                    } else {
+                        (max_rows as usize).min(total)
+                    };
 
-                // 中断保持分の検査を通過した後で初めて `take` 分の送出へ移る。
-                // `take` 分は 1 行ずつエンコード→`ResponseBuffer` へ積んで
-                // その場で送出し、結果セット全体（`take` 分を含む）を先に
-                // メモリへ確保しない（PR #1013 レビュー指摘・P0: `max_rows`
-                // が非常に大きい／`max_rows<=0` の場合、`take` は `total` と
-                // 一致し得るため、`take` 分もここで先にすべてエンコードして
-                // 保持すると外部 wire 入力の結果セット規模で無制限にアロケー
-                // ションが発生してしまう）。
-                let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
-                    MAX_RESPONSE_BUFFER_BYTES,
-                    0,
-                );
-                for row in result.rows.iter().take(take) {
-                    let mut frame = Vec::new();
-                    result_encoder::encode_data_row_into_with_formats(
-                        row,
-                        &result_formats,
-                        &mut frame,
-                    )
-                    .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
-                    buffer
-                        .push_frame(stream, &frame)
-                        .map_err(|e| commit_wrap(io_to_handler(e)))?;
-                    if buffer.len() >= MAX_RESPONSE_BUFFER_BYTES {
+                    // まず中断保持へ回る行（`take` 以降）だけを対象に、1 行
+                    // エンコードするたびに合計バイト数をセッション全体
+                    // （他の全 portal の中断保持分を含む。PR #1013 レビュー
+                    // 指摘・P0: portal 単体判定だと名前付き portal 最大 64 個で
+                    // 接続全体では上限の約 64 倍相当を保持できてしまう）で
+                    // 判定し、超過が判明した時点で残りの行を一切エンコードせず
+                    // 即座に拒否する。この判定は `take` 分の送出を始める前に
+                    // 完了させる ―― 1 回の Execute は「`take` 行の送出（＋
+                    // 完了／中断マーカー）が丸ごと成功する」か「1 バイトも送らず
+                    // 失敗する」かのいずれかである契約を保つ（中断バイト上限
+                    // 超過を理由に、既に一部の行を送ってしまった後で
+                    // ErrorResponse を返す事態を避ける）。
+                    let other_suspended_bytes =
+                        state.portals.total_suspended_bytes_excluding(portal_name);
+                    let mut remaining_bytes: usize = 0;
+                    let mut frames = std::collections::VecDeque::new();
+                    for row in result.rows.iter().skip(take) {
+                        // Bind 時点で確定した結果 format code（WIRE-14。
+                        // `Portal::result_formats`）を反映する。`validate_binary_
+                        // formats` が Bind で事前検査済みのため、ここでの
+                        // `EncodeError` は呼び出し元（本モジュール）内部の不整合
+                        // のみを意味する（`XX000` 相当。`result_encoder`
+                        // モジュールドキュメント参照）。
+                        let mut frame = Vec::new();
+                        result_encoder::encode_data_row_into_with_formats(
+                            row,
+                            &result_formats,
+                            &mut frame,
+                        )
+                        .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
+                        remaining_bytes = remaining_bytes.saturating_add(frame.len());
+                        let session_total = other_suspended_bytes.saturating_add(remaining_bytes);
+                        if session_total > MAX_SUSPENDED_PORTAL_BYTES_PER_SESSION {
+                            return Err(commit_wrap(HandlerError::SuspendedBytesExceeded));
+                        }
+                        frames.push_back(frame);
+                    }
+
+                    // 中断保持分の検査を通過した後で初めて `take` 分の送出へ移る。
+                    // `take` 分は 1 行ずつエンコード→`ResponseBuffer` へ積んで
+                    // その場で送出し、結果セット全体（`take` 分を含む）を先に
+                    // メモリへ確保しない（PR #1013 レビュー指摘・P0: `max_rows`
+                    // が非常に大きい／`max_rows<=0` の場合、`take` は `total` と
+                    // 一致し得るため、`take` 分もここで先にすべてエンコードして
+                    // 保持すると外部 wire 入力の結果セット規模で無制限にアロケー
+                    // ションが発生してしまう）。
+                    let mut buffer = crate::response_buffer::ResponseBuffer::with_capacity_hint(
+                        MAX_RESPONSE_BUFFER_BYTES,
+                        0,
+                    );
+                    for row in result.rows.iter().take(take) {
+                        let mut frame = Vec::new();
+                        result_encoder::encode_data_row_into_with_formats(
+                            row,
+                            &result_formats,
+                            &mut frame,
+                        )
+                        .map_err(|_| commit_wrap(internal_error("failed to encode data row")))?;
+                        buffer
+                            .push_frame(stream, &frame)
+                            .map_err(|e| commit_wrap(io_to_handler(e)))?;
+                        if buffer.len() >= MAX_RESPONSE_BUFFER_BYTES {
+                            buffer
+                                .flush(stream)
+                                .map_err(|e| commit_wrap(io_to_handler(e)))?;
+                        }
+                    }
+
+                    if frames.is_empty() {
+                        // 全行を今回の Execute で送出済み。`CommandComplete` の
+                        // タグは portal 全体の累計送出行数（この場合は `take`
+                        // そのもの）から組み立てる（PR #1013 レビュー指摘・P1）。
+                        let tag = shape.render(take);
+                        let msg = result_encoder::encode_command_complete(&tag).map_err(|_| {
+                            commit_wrap(internal_error("failed to encode command complete"))
+                        })?;
+                        buffer
+                            .push_frame(stream, &msg)
+                            .map_err(|e| commit_wrap(io_to_handler(e)))?;
                         buffer
                             .flush(stream)
                             .map_err(|e| commit_wrap(io_to_handler(e)))?;
-                    }
-                }
 
-                if frames.is_empty() {
-                    // 全行を今回の Execute で送出済み。`CommandComplete` の
-                    // タグは portal 全体の累計送出行数（この場合は `take`
-                    // そのもの）から組み立てる（PR #1013 レビュー指摘・P1）。
-                    let tag = shape.render(take);
-                    let msg = result_encoder::encode_command_complete(&tag).map_err(|_| {
-                        commit_wrap(internal_error("failed to encode command complete"))
-                    })?;
+                        let portal = state
+                            .portals
+                            .get_mut(portal_name)
+                            .ok_or(HandlerError::UnknownPortal)?;
+                        portal.state = PortalState::Done { tag };
+                        portal.cursor_binding = cursor_binding;
+                        return Ok(());
+                    }
+
                     buffer
-                        .push_frame(stream, &msg)
+                        .push_frame(stream, &result_encoder::encode_portal_suspended())
                         .map_err(|e| commit_wrap(io_to_handler(e)))?;
                     buffer
                         .flush(stream)
@@ -1695,30 +1791,21 @@ fn execute_portal<'e, S: WireStream>(
                         .portals
                         .get_mut(portal_name)
                         .ok_or(HandlerError::UnknownPortal)?;
-                    portal.state = PortalState::Done { tag };
-                    return Ok(());
+                    portal.state = PortalState::Suspended(PortalRows {
+                        frames,
+                        shape,
+                        sent_so_far: take,
+                        committed: is_write_statement,
+                    });
+                    portal.cursor_binding = cursor_binding;
+                    Ok(())
                 }
-
-                buffer
-                    .push_frame(stream, &result_encoder::encode_portal_suspended())
-                    .map_err(|e| commit_wrap(io_to_handler(e)))?;
-                buffer
-                    .flush(stream)
-                    .map_err(|e| commit_wrap(io_to_handler(e)))?;
-
-                let portal = state
-                    .portals
-                    .get_mut(portal_name)
-                    .ok_or(HandlerError::UnknownPortal)?;
-                portal.state = PortalState::Suspended(PortalRows {
-                    frames,
-                    shape,
-                    sent_so_far: take,
-                    committed: is_write_statement,
-                });
-                return Ok(());
             }
+        })();
+        if response.is_err() && is_cursor_fetch {
+            txn.fail();
         }
+        return response;
     }
 
     let portal = state
@@ -1726,9 +1813,36 @@ fn execute_portal<'e, S: WireStream>(
         .get_mut(portal_name)
         .ok_or(HandlerError::UnknownPortal)?;
 
+    // 完了済み portal（`Done`）の再 Execute は保持済みの完了タグを再送する
+    // だけで行を一切送出しないため、カーソル束縛の検証より先に処理する
+    // （PR #1049 レビュー指摘 Cursor Bugbot Low 対応: `CLOSE`／`COMMIT`／
+    // `ROLLBACK` 後に完了済み `FETCH` portal を再 Execute すると `34000` を
+    // 返していた。`Done` の扱いを `FETCH` 以外の portal と揃える）。
     if let PortalState::Done { tag } = &portal.state {
         let tag = tag.clone();
         return write_command_complete(stream, &tag);
+    }
+
+    // カーソル `FETCH` 由来 portal の中断保持分（`PortalState::Suspended`）を
+    // 再送出する前に、実行成功時点で束縛した世代・カーソル個体識別子が現在も
+    // 有効かを検証する（PR #1049 レビュー指摘対応。cursor Bugbot P1「終了した
+    // カーソルの FETCH portal から行を送出できる」の是正）。`CLOSE`（同名の
+    // 再 `DECLARE` を含む）・`COMMIT`／`ROLLBACK`（→ 新しい世代／`Idle`）の
+    // いずれを挟んでいても不一致となり fail-closed に拒否する。検証対象は
+    // 保持行を送出し得る `Suspended` のみ（`Done` は直前で処理済み、`Failed`
+    // は下の分岐で `PortalFailed` になる）。`Fetch` 以外から作った portal は
+    // `cursor_binding` が常に `None` のため対象外（既存の挙動を変えない）。
+    // `Ready`（初回実行）はこの分岐に到達しない（`needs_execution` 判定で
+    // 上のブロックへ流れ、この時点では既に `return` 済みのため）。
+    if let (PortalState::Suspended(_), Some(binding)) = (&portal.state, &portal.cursor_binding) {
+        let still_valid = txn.active_generation() == Some(binding.txn_generation)
+            && txn.cursor_id(&binding.cursor_name) == Some(binding.cursor_id);
+        if !still_valid {
+            portal.state = PortalState::Failed;
+            return Err(HandlerError::Sql(
+                engine::sql::allowlist::SqlSurfaceError::invalid_cursor_name(),
+            ));
+        }
     }
 
     let finished_tag = {
@@ -2343,6 +2457,7 @@ mod tests {
                         columns: None,
                         result_formats: Vec::new(),
                         state: PortalState::Ready,
+                        cursor_binding: None,
                     },
                 )
                 .expect("insert within limit succeeds");
@@ -2355,6 +2470,7 @@ mod tests {
                 columns: None,
                 result_formats: Vec::new(),
                 state: PortalState::Ready,
+                cursor_binding: None,
             },
         );
         assert!(matches!(result, Err(PortalStoreError::TooManyPortals)));
@@ -2372,6 +2488,7 @@ mod tests {
                     columns: None,
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
+                    cursor_binding: None,
                 },
             )
             .expect("insert succeeds");
@@ -2384,6 +2501,7 @@ mod tests {
                     columns: None,
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
+                    cursor_binding: None,
                 },
             )
             .expect("insert succeeds");
@@ -2405,6 +2523,7 @@ mod tests {
                     columns: None,
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
+                    cursor_binding: None,
                 },
             )
             .expect("insert succeeds");
@@ -2417,6 +2536,7 @@ mod tests {
                     columns: None,
                     result_formats: Vec::new(),
                     state: PortalState::Ready,
+                    cursor_binding: None,
                 },
             )
             .expect("insert succeeds");
