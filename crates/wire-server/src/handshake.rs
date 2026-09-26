@@ -23,6 +23,7 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 
 use crate::auth::{self, base64_std, scram, AuthMethod, UserStore};
 use crate::framing::{self, FrameError};
+use crate::tls_opt::TlsMode;
 
 /// StartupMessage が名乗るべきプロトコルバージョン（3.0 = major 3, minor 0）。
 const PROTOCOL_VERSION_3_0: i32 = 0x0003_0000;
@@ -1105,21 +1106,45 @@ pub fn handle_connection_with_engine(
     handle_connection_inner(stream, store, Some(engine))
 }
 
-/// TLS opt-in を含む新しい公開入口（Issue #966）。`tls` が `Some` の場合に
-/// 限り `SSLRequest` へ `'S'` を返し、`crate::tls::server_handshake::
+/// TLS opt-in を含む公開入口（Issue #966）。`tls` が `Some` の場合に限り
+/// `SSLRequest` へ `'S'` を返し、`crate::tls::server_handshake::
 /// perform_server_handshake` を実行してから以後の pg wire メッセージを
 /// `crate::tls::stream::TlsStream` 上で処理する。`None` の場合は
 /// [`handle_connection_bounded`]／[`handle_connection_with_engine`] と
-/// ビット単位で同一の平文経路になる（受入基準 2）。CLI からの証明書・鍵
-/// 読み込みと `tls` の構築自体は対象外（#967。`server::accept_loop_with_tls`
-/// から呼ばれる想定）。
+/// ビット単位で同一の平文経路になる（受入基準 2）。
+///
+/// **`--tls-mode` opt-in（Issue #967）**: 本関数は常に
+/// [`TlsMode::Allow`]（`SSLRequest` を経ない平文 StartupMessage も受理する。
+/// #966 時点の既存挙動）で [`handle_connection_with_tls_mode`] へ委譲する
+/// 後方互換ラッパーとして維持する（AGENTS.md 公開 API 互換方針）。CLI から
+/// `--tls-mode require` を選んだ場合の平文拒否経路は新規エントリポイント
+/// [`handle_connection_with_tls_mode`] が担う。
 pub fn handle_connection_with_options(
     stream: TcpStream,
     store: &UserStore,
     engine: Option<&engine::core::EngineCore>,
     tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
 ) -> io::Result<()> {
-    handle_connection_inner_with_tls(stream, store, engine, tls)
+    handle_connection_with_tls_mode(stream, store, engine, tls, TlsMode::Allow)
+}
+
+/// TLS opt-in と平文接続ポリシー（[`TlsMode`]）の双方を含む新しい公開入口
+/// （Issue #967。`server::accept_loop_with_tls_mode` から呼ばれる想定）。
+///
+/// `tls` が `None` の場合、`mode` は無視され [`handle_connection_bounded`]／
+/// [`handle_connection_with_engine`] とビット単位で同一の平文経路になる
+/// （TLS を CLI で構成していない構成は `--tls-mode` の意味を持たない）。
+/// `tls` が `Some` の場合、`mode` が [`TlsMode::Require`] なら `SSLRequest`
+/// を経ない平文 StartupMessage を `08P01` で拒否する（受入基準 3。
+/// startup パラメータを解釈する前に拒否する。D8）。
+pub fn handle_connection_with_tls_mode(
+    stream: TcpStream,
+    store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
+    tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+    mode: TlsMode,
+) -> io::Result<()> {
+    handle_connection_inner_with_tls(stream, store, engine, tls, mode)
 }
 
 /// 認証の結果（成功時の `PolicyContext`、または失敗〔`ErrorResponse` は
@@ -1348,7 +1373,9 @@ fn handle_connection_inner(
     store: &UserStore,
     engine: Option<&engine::core::EngineCore>,
 ) -> io::Result<()> {
-    handle_connection_inner_with_tls(stream, store, engine, None)
+    // `tls: None` のため `mode` は意味を持たない（`handle_connection_inner_with_tls`
+    // ドキュメント参照）。既存呼び出し元とのビット単位互換のため `Allow` を渡す。
+    handle_connection_inner_with_tls(stream, store, engine, None, TlsMode::Allow)
 }
 
 /// [`negotiate_startup_or_upgrade`] の戻り値。
@@ -1358,15 +1385,21 @@ enum PreTlsOutcome {
     Ready(String),
     /// `SSLRequest` を受理し、TLS へ昇格すべき（Issue #966）。
     UpgradeTls,
+    /// `mode == TlsMode::Require` の下で、`SSLRequest` を経ない平文
+    /// StartupMessage を受けた（Issue #967・受入基準 3・D8）。startup
+    /// パラメータは解釈しない（`parse_startup_params` を呼ばない）。
+    PlaintextRejected,
 }
 
 /// `tls` opt-in 時の `SSLRequest`/`GSSENCRequest`/StartupMessage 受理
-/// （Issue #966）。既存の [`negotiate_startup`]（TLS 未設定時に使う。
+/// （Issue #966・#967）。既存の [`negotiate_startup`]（TLS 未設定時に使う。
 /// ビット単位で不変）と受理判定は同じだが、`SSLRequest` を受けた時点で
-/// `'N'` を返さず [`PreTlsOutcome::UpgradeTls`] を返す点だけが異なる
-/// （応答は呼び出し元が `'S'` を書いてから TLS ハンドシェイクへ進む）。
-/// GSSENC は本 Issue の対象外のまま `'N'`（既存契約を維持）。
-fn negotiate_startup_or_upgrade(stream: &mut TcpStream) -> Result<PreTlsOutcome> {
+/// `'N'` を返さず [`PreTlsOutcome::UpgradeTls`] を返す点、および
+/// `mode == TlsMode::Require` の下で平文 StartupMessage を
+/// [`PreTlsOutcome::PlaintextRejected`] として拒否する点が異なる（応答は
+/// 呼び出し元が組み立てる）。GSSENC は TLS 昇格の対象外のまま `'N'`
+/// （既存契約を維持。`mode` に関わらず同一）。
+fn negotiate_startup_or_upgrade(stream: &mut TcpStream, mode: TlsMode) -> Result<PreTlsOutcome> {
     // `SSLRequest` を受けた時点で即座に `UpgradeTls` を返す（呼び出し元が
     // 制御を引き継ぐ）ため、平文経路の `negotiate_startup` と異なり
     // `ssl_seen` フラグは不要 ―― この関数の同一呼び出し内で `SSLRequest` を
@@ -1398,6 +1431,12 @@ fn negotiate_startup_or_upgrade(stream: &mut TcpStream) -> Result<PreTlsOutcome>
                 ));
             }
             PROTOCOL_VERSION_3_0 => {
+                // D8（Issue #967）: `require` では平文 StartupMessage の
+                // パラメータを一切解釈せずに拒否する（ユーザー名等の
+                // untrusted な値を無駄に処理しない）。
+                if mode == TlsMode::Require {
+                    return Ok(PreTlsOutcome::PlaintextRejected);
+                }
                 return parse_startup_params(&body[4..]).map(PreTlsOutcome::Ready);
             }
             _ => {
@@ -1511,15 +1550,20 @@ fn run_authenticated_session<S: WireStream>(
     }
 }
 
-/// TLS opt-in を含む接続処理本体（Issue #966）。`tls` が `None` の場合は
+/// TLS opt-in と平文接続ポリシー（[`TlsMode`]）を含む接続処理本体
+/// （Issue #966・#967）。`tls` が `None` の場合は `mode` を無視し
 /// [`negotiate_startup`]（`'N'` 応答。ビット単位で不変）へそのまま委譲し
-/// （受入基準 2）、`Some` の場合のみ [`negotiate_startup_or_upgrade`] で
-/// `SSLRequest` を検出して `'S'` を返し TLS ハンドシェイクへ進む。
+/// （受入基準 2。TLS を CLI で構成していない構成に `--tls-mode` の意味は
+/// 無い）、`Some` の場合のみ [`negotiate_startup_or_upgrade`] へ `mode` を
+/// 渡し、`SSLRequest` を検出して `'S'` を返し TLS ハンドシェイクへ進める。
+/// `mode == TlsMode::Require` の下で平文 StartupMessage を受けた場合は
+/// startup パラメータを解釈せず `08P01` で拒否する（受入基準 3・D8）。
 fn handle_connection_inner_with_tls(
     mut stream: TcpStream,
     store: &UserStore,
     engine: Option<&engine::core::EngineCore>,
     tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+    mode: TlsMode,
 ) -> io::Result<()> {
     let Some(tls_config) = tls else {
         let username = match negotiate_startup(&mut stream) {
@@ -1529,11 +1573,16 @@ fn handle_connection_inner_with_tls(
         return run_authenticated_session(&mut stream, store, engine, username);
     };
 
-    match negotiate_startup_or_upgrade(&mut stream) {
+    match negotiate_startup_or_upgrade(&mut stream, mode) {
         Ok(PreTlsOutcome::Ready(username)) => {
             run_authenticated_session(&mut stream, store, engine, username)
         }
         Ok(PreTlsOutcome::UpgradeTls) => handle_tls_upgrade(stream, store, engine, tls_config),
+        Ok(PreTlsOutcome::PlaintextRejected) => respond_and_close(
+            &mut stream,
+            HandshakeError::Protocol("plaintext startup rejected (tls-mode=require)"),
+            "TLS is required by this server; plaintext connections are not accepted",
+        ),
         Err(e) => respond_and_close(&mut stream, e, "invalid startup packet"),
     }
 }

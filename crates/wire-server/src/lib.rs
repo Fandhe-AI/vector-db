@@ -132,4 +132,5 @@ pub mod server;
 pub mod simple_query;
 pub mod surface;
 pub mod tls;
+pub mod tls_opt;
 pub mod wire_stream;

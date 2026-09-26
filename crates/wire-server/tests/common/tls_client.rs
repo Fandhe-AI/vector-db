@@ -145,6 +145,80 @@ pub fn test_config_with_scram_channel_binding(enabled: bool) -> Arc<TlsServerCon
     Arc::new(config)
 }
 
+/// [`build_ed25519_leaf_certificate_der`] の validity（`notBefore`／
+/// `notAfter`。UTCTime 形式 `YYMMDDHHMMSSZ`）を指定できる版（Issue #967。
+/// `tests/wire_tls_cli.rs` が期限切れ証明書の fail-closed 拒否を検証するために
+/// 使う）。既存の [`test_config`]／`wire_tls_connection.rs` は本関数を経由せず
+/// 引き続き固定 validity（2016〜2040 年）のまま不変。
+pub fn build_ed25519_leaf_certificate_der_with_validity(
+    public_key: &[u8; 32],
+    not_before: &str,
+    not_after: &str,
+) -> Vec<u8> {
+    let signature_algorithm = ed25519_algorithm_identifier();
+    let mut spki_bits = vec![0x00u8];
+    spki_bits.extend_from_slice(public_key);
+    let spki = sequence(&[&ed25519_algorithm_identifier(), &tlv(0x03, &spki_bits)]);
+    let validity = sequence(&[&utc_time(not_before), &utc_time(not_after)]);
+    let tbs_certificate = sequence(&[
+        &version_v3(),
+        &tlv(0x02, &[0x01]),
+        &signature_algorithm,
+        &issuer_name(),
+        &validity,
+        &empty_name(),
+        &spki,
+    ]);
+    let mut signature_bits = vec![0x00u8];
+    signature_bits.extend_from_slice(&[0u8; 64]);
+    sequence(&[
+        &tbs_certificate,
+        &signature_algorithm,
+        &tlv(0x03, &signature_bits),
+    ])
+}
+
+/// `label`（`"CERTIFICATE"`／`"PRIVATE KEY"`）で `der` を PEM 形式（64 カラム
+/// 改行）へラップする（Issue #967。`wire_server::tls::pem` の受理形状に
+/// 合わせる。本番コードには PEM エンコーダを持たない ―― デコードのみ必要
+/// なため ―― テスト専用ヘルパー）。
+pub fn pem_wrap(label: &str, der: &[u8]) -> String {
+    let b64 = wire_server::auth::base64_std::encode(der);
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).expect("base64 output is ASCII"));
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out
+}
+
+/// RFC 8032 §7.1 TEST 1 seed（[`RFC8032_TEST1_SEED`]。生の 32 バイト）から
+/// Ed25519 PKCS#8 DER を組み立てる（Issue #967）。PKCS#8 の
+/// `OneAsymmetricKey`（RFC 5958）は固定プレフィクス
+/// `302e020100300506032b657004220420`（SEQUENCE〔version=0・
+/// AlgorithmIdentifier=id-Ed25519・OCTET STRING 長 0x22 の中に
+/// OCTET STRING 長 0x20〕）に続けて 32 バイトの seed を並べるだけの形
+/// （公開鍵属性・追加属性を持たない最小形）で、`wire_server::tls::pkcs8::
+/// parse_ed25519_pkcs8_der` が受理する形状と一致する。
+pub fn ed25519_pkcs8_der(seed: &[u8; 32]) -> Vec<u8> {
+    const PREFIX_HEX: &str = "302e020100300506032b657004220420";
+    let mut der = hex_decode(PREFIX_HEX);
+    der.extend_from_slice(seed);
+    der
+}
+
+/// [`ed25519_pkcs8_der`] を PEM 化したもの（Issue #967）。
+pub fn ed25519_pkcs8_pem(seed: &[u8; 32]) -> String {
+    pem_wrap("PRIVATE KEY", &ed25519_pkcs8_der(seed))
+}
+
+/// `text` を `path` へ書き込む（Issue #967。`tests/wire_tls_cli.rs` が
+/// 一時ディレクトリへ証明書・鍵の PEM を書き出すために使う）。
+pub fn write_pem_file(path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).expect("write PEM file");
+}
+
 fn plaintext_handshake_record(wire_bytes: Vec<u8>) -> Record {
     Record {
         content_type: ContentType::Handshake,
