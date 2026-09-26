@@ -196,7 +196,12 @@ pub fn resolve_relation_snapshots(
     relations: &[(TableRef, &TableSchema)],
     cache: Option<(&crate::storage::Storage, &RelationSnapshotCache)>,
 ) -> Result<MultiRelationSnapshot, SqlSurfaceError> {
-    if relations.is_empty() || relations.len() > MAX_TABLE_REFS {
+    if relations.is_empty() {
+        return Err(SqlSurfaceError::payload_too_large(
+            "at least one table reference is required",
+        ));
+    }
+    if relations.len() > MAX_TABLE_REFS {
         return Err(SqlSurfaceError::payload_too_large(format!(
             "too many table references: {} (max {MAX_TABLE_REFS})",
             relations.len()
@@ -211,21 +216,24 @@ pub fn resolve_relation_snapshots(
     let mut resolved: Vec<(String, Arc<RelationSnapshot>)> = Vec::new();
     let mut snapshots = Vec::with_capacity(relations.len());
     for (table_ref, schema) in relations {
-        if let Some((_, existing)) = resolved.iter().find(|(name, _)| name == table_ref.table()) {
-            snapshots.push(Arc::clone(existing));
-            continue;
-        }
-
         // 呼び出し元が `(TableRef, &TableSchema)` を取り違えて渡すと、世代キー
         // （`table_ref.table()` 由来）と実走査対象（`schema.name` 由来の行テーブル）
         // が食い違ったまま構築・キャッシュ登録されてしまう（誤ったテーブルの
         // `RelationSnapshot` が別テーブルの世代キーでキャッシュされ、以降の書き込みが
         // 無効化しない stale キャッシュとなり RLS 可視集合を汚染する）。fail-closed に
         // プログラム的検証を行う（`.claude/rules/security.md` テナント境界・fail-closed）。
+        // 直下の重複排除ショートカットより **前** に検証すること: 自己結合等で同一
+        // テーブル名を複数回参照する要素があると、ショートカットが先にあった場合
+        // 2 件目以降がこの検証を経ずに `Ok` になってしまう（レビュー指摘）。
         if table_ref.table() != schema.name {
             return Err(SqlSurfaceError::Internal {
                 detail: "relation snapshot table reference mismatch".to_string(),
             });
+        }
+
+        if let Some((_, existing)) = resolved.iter().find(|(name, _)| name == table_ref.table()) {
+            snapshots.push(Arc::clone(existing));
+            continue;
         }
 
         let single_key = TableGenerationKey::capture(read_txn, ctx.clone(), &[table_ref.table()])
@@ -400,5 +408,69 @@ mod tests {
             .map(|_| (TableRef::new("a"), &schema))
             .collect();
         assert!(resolve_relation_snapshots(&read_txn, &c, &relations, None).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_relations() {
+        let path = unique_db_path("relation-snapshot-empty-relations");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let c = ctx_with("tenant-a", vec![Visibility::Public]);
+        let read_txn = storage.db().begin_read().unwrap();
+        let relations: Vec<(TableRef, &TableSchema)> = Vec::new();
+        assert!(resolve_relation_snapshots(&read_txn, &c, &relations, None).is_err());
+    }
+
+    /// 取り違え検証は先頭要素でも検出する（レビュー指摘の回帰: 検証がショート
+    /// カットより後に置かれていた旧実装でも先頭要素では偶然検出できていたが、
+    /// 併せて固定する）。
+    #[test]
+    fn rejects_mismatched_schema_in_first_slot() {
+        let path = unique_db_path("relation-snapshot-mismatch-first");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema_a = create_table(&storage, "a");
+        let _schema_b = create_table(&storage, "b");
+        let c = ctx_with("tenant-a", vec![Visibility::Public]);
+        let read_txn = storage.db().begin_read().unwrap();
+        // `TableRef::new("a")` に対して意図的に `b` のスキーマを渡す（呼び出し元の
+        // 取り違えを模す）。
+        let relations = vec![(TableRef::new("a"), &_schema_b)];
+        let err = resolve_relation_snapshots(&read_txn, &c, &relations, None)
+            .err()
+            .expect("must reject");
+        assert!(
+            matches!(err, SqlSurfaceError::Internal { .. }),
+            "expected Internal, got {err:?}"
+        );
+        let _ = schema_a;
+    }
+
+    /// レビュー指摘の再現ケース: 同一テーブル名を複数回参照する要素（自己結合の
+    /// 別名違い）で、2 件目が重複排除ショートカットにより取り違え検証を素通り
+    /// して `Ok` になっていた回帰を固定する。`relations` は
+    /// `[(TableRef::with_alias("a","x"), &schema_a), (TableRef::with_alias("a","y"), &schema_b)]`
+    /// で、2 件目の `table_ref.table() == "a"` に対して `schema_b`（`name == "b"`）が
+    /// 渡されているため取り違えとして拒否されるべき。
+    #[test]
+    fn rejects_mismatched_schema_after_duplicate_table_name() {
+        let path = unique_db_path("relation-snapshot-mismatch-dup");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema_a = create_table(&storage, "a");
+        let schema_b = create_table(&storage, "b");
+        let c = ctx_with("tenant-a", vec![Visibility::Public]);
+        let read_txn = storage.db().begin_read().unwrap();
+        let relations = vec![
+            (TableRef::with_alias("a", "x"), &schema_a),
+            (TableRef::with_alias("a", "y"), &schema_b),
+        ];
+        let err = resolve_relation_snapshots(&read_txn, &c, &relations, None)
+            .err()
+            .expect("must reject");
+        assert!(
+            matches!(err, SqlSurfaceError::Internal { .. }),
+            "expected Internal, got {err:?}"
+        );
     }
 }

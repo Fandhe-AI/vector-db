@@ -60,7 +60,12 @@ impl TableGenerationKey {
         ctx: PolicyContext,
         tables: &[&str],
     ) -> crate::catalog::Result<Self> {
-        if tables.is_empty() || tables.len() > MAX_TABLE_REFS {
+        if tables.is_empty() {
+            return Err(crate::catalog::CatalogError::Invalid(
+                "at least one table is required in generation key".to_string(),
+            ));
+        }
+        if tables.len() > MAX_TABLE_REFS {
             return Err(crate::catalog::CatalogError::Invalid(format!(
                 "too many tables in generation key: {} (max {MAX_TABLE_REFS})",
                 tables.len()
@@ -173,6 +178,15 @@ impl<V: ApproxHeapBytes> GenerationKeyedCache<V> {
     /// `key` に一致し、`read_txn` のスナップショットにおける全テーブルの世代と
     /// 整合するエントリを探す。ロック毒化・世代読み取り失敗はいずれも「見つから
     /// なかった」として扱う（fail-closed。既存キャッシュ群と同じ契約）。
+    ///
+    /// `position` は `TableGenerationKey` の（世代を含む）完全一致で探すため、
+    /// `key` が呼び出し元が直前に同じ `read_txn` から `capture` した値であれば、
+    /// 見つかった時点で世代は既に一致しており、直後の `matches` 呼び出し・
+    /// 不一致時の `is_strictly_stale` 破棄分岐は実質到達しない（世代不一致の
+    /// エントリはそもそも `position` で見つからず、単に「ミスかつ破棄なし」で
+    /// 終わる）。これらは `key` が別スナップショットから渡された場合に備えた
+    /// 防御的チェックであり、通常経路の stale エントリ破棄は
+    /// [`GenerationKeyedCache::insert`] の限定 retain が担う。
     pub fn lookup(
         &self,
         storage: &Storage,
