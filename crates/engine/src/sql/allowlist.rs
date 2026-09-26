@@ -4105,8 +4105,11 @@ impl<'a> Parser<'a> {
             ctes.push(super::cte::CteDef { name, body });
             super::cte::check_definition_count(ctes.len())?;
             // `split_parenthesized` はスライスのみを返す（`Parser` の内部位置を
-            // 持たない）ため、残りトークン数から `self.pos` を復元する。
-            self.pos = self.tokens.len() - after.len();
+            // 持たない）ため、残りトークン数から `self.pos` を復元する。`after`
+            // は構造的に `self.tokens` の suffix であり `after.len()` は
+            // `self.tokens.len()` を超えないが、coding-rust.md の checked/
+            // saturating 演算方針に従い `saturating_sub` で明示する。
+            self.pos = self.tokens.len().saturating_sub(after.len());
             if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
                 continue;
@@ -5030,9 +5033,17 @@ pub(crate) fn validate_sql_tokens(
 
             // 参照されない CTE も含め、すべての定義本文の FROM を検証する
             // （決定性・fail-closed のため。構造検証・存在確認を省略しない）。
-            // 上限カウンタは文全体で共有する（DoS 対策。TASK-213）。
-            let mut budget = super::cte::ResolveBudget::new();
+            // 上限カウンタ（`ResolveBudget`）は「1 回のトップレベル呼び出し
+            // （1 つの CTE 定義の事前検証、または主クエリの解決）」ごとに
+            // 新規生成する（`cte::MAX_CTE_REFERENCES` のドキュメント参照。
+            // Issue #928 レビュー指摘）。文全体で 1 つのカウンタを使い回すと、
+            // このループが各定義のチェーンを再帰的に辿るたびに参照回数が
+            // 名前ごとではなく呼び出し回数分累積し、定義数・連鎖の深さの
+            // どちらも上限内の有効なクエリを誤って `54000` で拒否する。
+            // 連鎖の深さは `MAX_CTE_NESTING_DEPTH` で呼び出しごとに独立して
+            // 上限が掛かるため、リセットしても DoS 対策としての上限は失われない。
             for (idx, def) in ctes.iter().enumerate() {
+                let mut budget = super::cte::ResolveBudget::new();
                 super::cte::resolve_relation(
                     lookup,
                     &ctes,
@@ -5042,6 +5053,7 @@ pub(crate) fn validate_sql_tokens(
                     &mut budget,
                 )?;
             }
+            let mut budget = super::cte::ResolveBudget::new();
             let resolved = super::cte::resolve_relation(
                 lookup,
                 &ctes,
@@ -10466,6 +10478,32 @@ mod tests {
     }
 
     #[test]
+    fn accepts_many_definitions_referencing_a_shared_chain_within_documented_limits() {
+        // Issue #928 レビュー指摘の回帰テスト: 定義数（<= MAX_CTE_DEFINITIONS =
+        // 16）・連鎖の深さ（主クエリが参照する d11 の解決は d11→c2→c1→c0→
+        // documents の 4 回のリレー、すなわち MAX_CTE_NESTING_DEPTH = 4 の
+        // 境界ちょうど）のどちらも文書化された上限内に収まる有効なクエリが、
+        // 事前検証ループでの参照回数の誤積算により `54000`（"CTE reference
+        // count exceeds limit"）へ誤って拒否されないことを確認する。
+        // c0..c2 の 3 段連鎖に加え、末尾の c2 を直接参照する d0..d11 の
+        // 12 定義（計 15 定義）を用意する。事前検証ループは各 d_i の FROM を
+        // 独立に解決し（c2→c1→c0 の 3 回の CTE 名マッチ）、ResolveBudget が
+        // 文全体で 1 つに共有されていた旧実装では d_i 12 件分だけで 36 回
+        // （> MAX_CTE_REFERENCES = 32）を消費し誤って拒否されていた。
+        let lookup = catalog_with(&["documents"]);
+        let mut defs = vec!["c0 AS (SELECT id FROM documents)".to_string()];
+        for i in 1..3 {
+            defs.push(format!("c{i} AS (SELECT id FROM c{})", i - 1));
+        }
+        for i in 0..12 {
+            defs.push(format!("d{i} AS (SELECT id FROM c2)"));
+        }
+        assert_eq!(defs.len(), 15);
+        let sql = format!("WITH {} SELECT * FROM d11 LIMIT 10", defs.join(", "));
+        expect_scan(&sql, &lookup);
+    }
+
+    #[test]
     fn accepts_cte_nesting_depth_at_limit_rejects_over_limit() {
         let lookup = catalog_with(&["documents"]);
         // `MAX_CTE_NESTING_DEPTH` 件の CTE 連鎖（c0 は基底テーブルを直接参照し、
@@ -10594,7 +10632,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_param_placeholder_in_with_statement() {
+    fn accepts_with_statement_containing_literal_where_param_placeholder_check_is_deferred() {
         // TASK-213: `$n` を含む WITH 文は `sql::params::validate_param_positions`
         // が拒否する（本テストは構造検証自体〔`validate_sql`〕が受理し得ることを
         // 確認するのみで、`$n` 拒否は `sql::params` の単体テストが担う）。

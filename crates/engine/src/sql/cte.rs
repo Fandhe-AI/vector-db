@@ -30,9 +30,18 @@ pub(crate) const MAX_CTE_DEFINITIONS: usize = 16;
 /// 連鎖の先がビューに到達した後は既存の VIEW ネスト上限がそのまま効く）。
 pub(crate) const MAX_CTE_NESTING_DEPTH: u32 = 4;
 
-/// CTE 名の解決回数（畳み込み全体で名前が CTE として解決された回数）の上限。
-/// 単一リレーションの世界では構造的に「定義数 + 1」以下だが、将来 JOIN が
-/// 入ることに備えて明示的な上限として持つ。
+/// CTE 名の解決回数（1 回の [`resolve_relation`] 呼び出し系列の中で名前が
+/// CTE として解決された回数）の上限。単一リレーションの世界では構造的に
+/// 1 回の呼び出し系列あたり高々 `MAX_CTE_NESTING_DEPTH + 1` 段だが、将来
+/// JOIN が入ることに備えて明示的な上限として持つ。
+///
+/// [`ResolveBudget`] は「文全体」ではなく「1 回のトップレベル呼び出し（1 つの
+/// CTE 定義の事前検証、または主クエリの解決）」単位でリセットして使うこと
+/// （呼び出し元の規約。Issue #928 レビュー指摘）。1 つのカウンタを文全体で
+/// 使い回すと、事前検証ループが各定義のチェーンを再帰的に辿るたびに参照回数が
+/// 名前ごとではなく呼び出し回数分累積し、定義数（`MAX_CTE_DEFINITIONS`）・
+/// 連鎖の深さ（`MAX_CTE_NESTING_DEPTH`）のどちらも上限内の有効なクエリを
+/// 誤って `54000` で拒否してしまう。
 pub(crate) const MAX_CTE_REFERENCES: usize = 32;
 
 /// `WITH <name> AS (<body>)` 1 件分の定義（`sql::allowlist::parse_with_clause`
@@ -45,7 +54,9 @@ pub(crate) struct CteDef {
 
 /// CTE 名の解決回数を数え、上限超過を `54000` として検出するための可変カウンタ。
 /// `resolve_relation` の再帰呼び出しをまたいで共有する（呼び出し元が
-/// `&mut` で保持する）。
+/// `&mut` で保持する）。呼び出し元は「1 回のトップレベル呼び出し系列
+/// （1 つの CTE 定義の事前検証、または主クエリの解決）」ごとに新しい
+/// インスタンスを生成すること（[`MAX_CTE_REFERENCES`] のドキュメント参照）。
 pub(crate) struct ResolveBudget {
     references: usize,
 }
