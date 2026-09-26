@@ -4144,20 +4144,20 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
             // ここへ到達する `GroupKey` 項目は必ず `group_by_columns` のいずれか
             // 1 つと同名（構造上の前提）。`key_index` はその位置。
             AggregateSelectItem::GroupKey { column, alias } => {
-                let key_index = group_by_columns
-                    .iter()
-                    .position(|c| c == column)
-                    .unwrap_or_else(|| {
+                let key_index = match group_by_columns.iter().position(|c| c == column) {
+                    Some(index) => index,
+                    None => {
                         // 構文層が既に列名一致を検証済み（上記コメント参照）。
                         // 到達しないはずの分岐だが、行経路の `unwrap`/`expect`
-                        // 相当を避けるため internal エラーへ落とし panic
-                        // させない（`.claude/rules/coding-rust.md`）。
-                        debug_assert!(
-                            false,
-                            "GroupKey column must match a GROUP BY column at this point"
-                        );
-                        0
-                    });
+                        // 相当を避けるため internal エラーへ落とし panic も
+                        // fail-open な既定値継続もさせず、`Err` を返す
+                        // （`.claude/rules/coding-rust.md`・`security.md`
+                        // 「fail-open にする変更は P0」）。
+                        return Err(crate::sql::aggregate::accumulator_bug(
+                            "GroupKey column must match a GROUP BY column at this point",
+                        ));
+                    }
+                };
                 let name = alias.clone().unwrap_or_else(|| column.clone());
                 if let Some(alias) = alias.clone() {
                     group_key_aliases.push((key_index, alias));

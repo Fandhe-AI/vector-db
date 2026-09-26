@@ -1557,8 +1557,19 @@ pub(crate) fn execute_grouped_aggregate(
                     // `multi_groups` へ振り分ける。キーはタプル（`GroupKey`）
                     // として組み立て、各成分は単一キーと同じ規約
                     // （`TEXT` 限定・fail-closed で NULL 扱い）で解決する。
-                    let mut key_components: Vec<Option<String>> =
-                        Vec::with_capacity(group_by.column_indices.len());
+                    // 各成分の所有化は単一キー経路の `try_clone_str` と同じ
+                    // `try_reserve_exact` ベースの確保にする（`str::to_string`
+                    // 等の無条件のインフォリブルな確保は、untrusted な格納済み
+                    // TEXT 列値のサイズに対して確保失敗時に abort し得るため
+                    // 使わない。`.claude/rules/security.md`「不安全な設計」対応）。
+                    let mut key_components: Vec<Option<String>> = Vec::new();
+                    key_components
+                        .try_reserve_exact(group_by.column_indices.len())
+                        .map_err(|_| {
+                            SqlSurfaceError::payload_too_large(
+                                "GROUP BY key allocation exceeds available memory",
+                            )
+                        })?;
                     let mut key_len: usize = 0;
                     for &column_index in &group_by.column_indices {
                         let value = scanned
@@ -1571,7 +1582,10 @@ pub(crate) fn execute_grouped_aggregate(
                                 accumulator_bug("GROUP BY key length accounting overflowed")
                             })?;
                         }
-                        key_components.push(value.map(str::to_string));
+                        key_components.push(match value {
+                            Some(s) => Some(try_clone_str(s)?),
+                            None => None,
+                        });
                     }
                     let group_key = GroupKey(key_components);
                     let total_group_count = multi_groups.len();
