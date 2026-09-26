@@ -1210,6 +1210,47 @@ fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_rejected_under_c
     );
 }
 
+/// Issue #1088 の起動時拒否は SQL 表層限定であり、NoSQL 表層は SASL 往復
+/// 自体を持たないため `enable` を無条件で no-op として受理する契約
+/// （H5・Issue #968）を維持すること（codex-review PR #1089 P1 是正の回帰
+/// テスト）。`tls_scram_channel_binding_enable_with_ed25519_signed_leaf_
+/// is_rejected_under_cleartext_auth` と同じ Ed25519 葉証明書・
+/// `enable` の組合せでも、`--surface nosql` では起動を拒否せず listening
+/// まで到達すること・拒否理由（`RFC 5929`）が stderr に出ないことを確認する。
+#[test]
+fn tls_scram_channel_binding_enable_with_ed25519_signed_leaf_is_accepted_under_nosql_surface() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-ed25519-accepted-nosql");
+    write_user_store_with_alice(&fixture.path("users.txt"));
+    let (cert_path, key_path) = write_valid_tls_pair(&fixture);
+
+    let mut server = common::SpawnedServer::spawn(&[
+        "--users",
+        &fixture.path_str("users.txt"),
+        "--db",
+        &fixture.db_path_str(),
+        "--bind",
+        "127.0.0.1:0",
+        "--surface",
+        "nosql",
+        "--tls-cert",
+        cert_path.to_str().expect("utf-8 path"),
+        "--tls-key",
+        key_path.to_str().expect("utf-8 path"),
+        "--tls-scram-channel-binding",
+        "enable",
+    ]);
+    server
+        .wait_for_listening(Instant::now() + Duration::from_secs(10))
+        .expect("nosql surface must accept --tls-scram-channel-binding enable as a no-op");
+
+    let lines = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        !lines.iter().any(|l| l.contains("RFC 5929")),
+        "nosql surface must not run the SQL-only Ed25519 rejection check: {lines:?}"
+    );
+    assert_no_secret_leak(&lines, &fixture);
+}
+
 /// Issue #1088・R2: `disable` を明示しても機構リストは `SCRAM-SHA-256` の
 /// みで、`--tls-scram-channel-binding enable` 時にだけ出る注意行も出ない
 /// こと（未指定〔既定〕と同じ挙動）。

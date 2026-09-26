@@ -112,6 +112,14 @@ Ed25519 のみ）。
 必要があるため（`crates/wire-server/tests/common/tls_client.rs::
 test_config_with_scram_channel_binding`）。
 
+`main.rs` のこの起動時拒否は **SQL 表層（`--surface sql`。既定）限定**
+である。NoSQL 表層は後述の「スコープ外」節のとおりチャネルバインディング
+自体を適用しない（SASL 往復を持たないため `enable` は実際には何も提示
+しない no-op。H5・Issue #968）ので、`--surface nosql` では葉証明書の
+署名アルゴリズムに関わらず `enable` を無条件で受理する（codex-review
+PR #1089 P1 是正: 本判定が表層分岐より前に実行されており、nosql でも
+拒否されてしまう回帰が入っていた）。
+
 ## 受け入れ基準への対応
 
 - 署名アルゴリズム別のハッシュ選択（SHA-256／SHA-512。非対応は `None`）:

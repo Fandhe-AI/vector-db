@@ -144,7 +144,12 @@
 //! check_scram_channel_binding` により起動時に非 0 終了で拒否する
 //! （黙って PLUS 非提示へ縮退させない。fail-closed）。RSA／ECDSA の CA が
 //! 署名した葉証明書であれば `enable` は受理され、起動ログへ運用上の注意を
-//! 1 行追加で出す（後述）。
+//! 1 行追加で出す（後述）。**この拒否判定は SQL 表層（`--surface sql`。
+//! 既定）に限る**。NoSQL 表層は SASL 往復自体を持たないため、`enable` は
+//! 葉証明書の署名アルゴリズムに関わらず無条件で no-op として受理する
+//! （H5・Issue #968。Issue #1088 の実装が表層分岐より前にこの判定を
+//! 実行しており nosql まで拒否してしまっていた回帰を、codex-review
+//! PR #1089 P1 是正で表層限定へ修正した）。
 //!
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
@@ -802,12 +807,27 @@ fn run_server(args: &[String]) -> ExitCode {
                     // 持たない署名アルゴリズムの葉証明書（Ed25519 など）の
                     // 組合せは libpq と相互運用できないため、bind 検証・
                     // listen へ進む前にここで拒否する（fail-closed）。
-                    if let Err(e) = wire_server::tls_opt::check_scram_channel_binding(
-                        &cfg,
-                        *scram_channel_binding,
-                    ) {
-                        eprintln!("wire-server: {e}");
-                        return ExitCode::FAILURE;
+                    // ただし本チェックは SQL 表層の SASL（SCRAM-SHA-256-PLUS）
+                    // 提示可否に対する落とし穴の是正であり、NoSQL 表層は
+                    // SASL 往復自体を持たないため `enable` は無条件で no-op
+                    // として受理する契約（H5・Issue #968。
+                    // docs/design/implementation-status.md「NoSQL 表層…H5」）。
+                    // ここで surface を分岐しないと、Ed25519 葉証明書を使う
+                    // 既存の nosql 構成が `enable` 指定だけで起動不能になり、
+                    // H5 の契約を破る（codex-review PR #1089 P1 是正）。
+                    // fail-closed の既定は「チェックを実行する」側とし、
+                    // SASL 往復を持たないと分かっている nosql の場合のみ
+                    // 明示的に除外する（`!= Nosql` であって `== Sql` ではない。
+                    // 将来 `Surface` に variant が増えても黙って未検査へ
+                    // 倒さないため）。
+                    if surface != wire_server::surface::Surface::Nosql {
+                        if let Err(e) = wire_server::tls_opt::check_scram_channel_binding(
+                            &cfg,
+                            *scram_channel_binding,
+                        ) {
+                            eprintln!("wire-server: {e}");
+                            return ExitCode::FAILURE;
+                        }
                     }
                     Some(cfg)
                 }
@@ -1070,10 +1090,14 @@ fn run_server(args: &[String]) -> ExitCode {
         eprintln!("wire-server: TLS enabled (mode={})", mode.token());
         // Issue #970・#1088: `--tls-scram-channel-binding enable` を選んだ
         // 場合のみ注意を 1 行追加する（既定 `disable` では従来どおりこの行を
-        // 出さず stderr をビット同一のまま保つ）。この行に到達している時点で
-        // `check_scram_channel_binding` は通過済み（葉証明書は RFC 5929 が
-        // 定義するハッシュを持つ）なので、Ed25519 特有の失敗を警告する必要は
-        // もう無い。
+        // 出さず stderr をビット同一のまま保つ）。SQL 表層でこの行に到達して
+        // いる時点で `check_scram_channel_binding` は通過済み（葉証明書は
+        // RFC 5929 が定義するハッシュを持つ）なので、Ed25519 特有の失敗を
+        // 警告する必要はもう無い。NoSQL 表層は同チェックを適用しない
+        // （H5・上の `check_scram_channel_binding` 呼び出し箇所のコメント
+        // 参照）ため Ed25519 葉証明書のままここへ到達しうるが、SASL 往復を
+        // 持たず本文言の対象外（「only takes effect for scram-sha-256
+        // authentication」）なので実害はない。
         if *scram_channel_binding {
             // codex-review PR #1087 P2 是正: この行は `--tls-scram-channel-binding
             // enable` 指定の事実のみを示す（「実際に提示された」という確定的な

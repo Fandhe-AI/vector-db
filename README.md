@@ -242,7 +242,10 @@ cleartext password 認証のまま不変です。`scram-sha-256` を指定する
   機構リストへの提示は `--tls-scram-channel-binding enable`（下記参照。
   既定 `disable`）を明示指定した場合のみです（Issue #941・#970）。`enable`
   かつ葉証明書の署名アルゴリズムに RFC 5929 が定義するハッシュが無い
-  （Ed25519 など）場合は起動時に拒否されます（Issue #1088）。
+  （Ed25519 など）場合は、SQL 表層（`--surface sql`。既定）に限り起動時に
+  拒否されます（Issue #1088）。NoSQL 表層（`--surface nosql`）は本項冒頭の
+  とおり SCRAM 自体を併用しないため、この判定は適用されず `enable` は
+  無条件で no-op として受理されます（Issue #968）。
 - **`--scram-mock-key-file <path>` が必須です**（`scram-sha-256` 選択時のみ。
   未指定・`cleartext` との組合せ・32 バイト未満のファイルはいずれも
   fail-closed で起動拒否）。未知ユーザー向けモック検証子（列挙攻撃対策）の
@@ -315,8 +318,12 @@ opt-in CLI 引数です。`--tls-mode` と同じく `--tls-cert`／`--tls-key` �
 
 `enable` を選び、かつ葉証明書の署名アルゴリズムに RFC 5929 が定義する
 ハッシュが無い場合（本サーバーが受理する唯一の葉鍵種別である Ed25519 鍵を、
-Ed25519 で自己署名した証明書を含む）は、**起動時に非 0 終了で拒否されます**
-（Issue #1088）。libpq（psql 18.6・OpenSSL 3.5.5 で実測）の既定設定
+Ed25519 で自己署名した証明書を含む）は、**SQL 表層（`--surface sql`。既定）
+に限り起動時に非 0 終了で拒否されます**（Issue #1088）。NoSQL 表層
+（`--surface nosql`）は SASL 往復自体を持たないためこの判定を適用せず、
+同じ Ed25519 葉証明書のままでも `enable` は無条件で no-op として起動を
+継続します（Issue #968・上記「NoSQL 表層とは併用できません」項参照）。
+libpq（psql 18.6・OpenSSL 3.5.5 で実測）の既定設定
 `channel_binding=prefer`・`channel_binding=require` はそのような葉証明書に
 対し TLS 確立後の SCRAM 交換で失敗する（`could not find digest for NID
 UNDEF`。TLS ハンドシェイク自体は成立します）ため、黙って PLUS を非提示へ
