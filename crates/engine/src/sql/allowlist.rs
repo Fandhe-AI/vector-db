@@ -1252,14 +1252,15 @@ pub enum Statement {
     /// 集計関数のみを結果列とする `GROUP BY` なし・単一行結果の `SELECT`
     /// （TASK-166・SQL-13。C6a）。`FROM` 単一テーブルのカタログ存在確認を通過済み。
     Aggregate(ValidatedAggregate),
-    /// `EXPLAIN SELECT ... USING PLAN('<query>') ...`（TASK-78・SQL-6）。`USING PLAN`
-    /// を伴う検索 SELECT の前置のみを受理し（`using_plan()` が必ず `Some`）、
-    /// `FROM` 単一テーブルのカタログ存在確認を通過済み。`EXPLAIN` は検索本体を
-    /// 実行しない（LLM クエリ展開・モード解決結果を可視化する応答を構築するのみ。
-    /// `core.rs::EngineCore::execute_sql_in_session` の管轄）。`USING PLAN` を伴わない
-    /// 通常 SELECT・集計・`SET`・`CREATE FUNCTION` への `EXPLAIN` 前置は許可リスト外
-    /// として `42601` で拒否する。
-    Explain(ValidatedStatement),
+    /// `EXPLAIN <target>`（TASK-78・SQL-6、Issue #922・SQL-27）。対象文
+    /// （[`ExplainTarget`]）は検索 SELECT（`USING PLAN` の有無いずれも）・集計
+    /// （`GROUP BY`・`DISTINCT` の脱糖形いずれも）・広域取得のいずれかで、
+    /// `FROM` 単一テーブルのカタログ存在確認を通過済み。`EXPLAIN` は検索本体・
+    /// 集計走査・広域取得走査のいずれも実行しない（LLM クエリ展開・モード解決・
+    /// 静的な走査方式判定を可視化する応答を構築するのみ。`core.rs::EngineCore::
+    /// execute_sql_in_session` の管轄）。`SET`・`CREATE FUNCTION` への `EXPLAIN`
+    /// 前置は許可リスト外として `42601` で拒否する。
+    Explain(ExplainTarget),
     /// `SELECT <投影> FROM <table> [WHERE ...] LIMIT n`（`ORDER BY`・`USING PLAN`
     /// のいずれも伴わない、ソートなしのフィルタ取得。Issue #454。本 DB の
     /// 「正解を含むデータ群を広く返す」設計思想を SQL 表層で直接表現する経路で、
@@ -1272,6 +1273,45 @@ pub enum Statement {
     /// `match` はワイルドカードアームの追加が必要（`Aggregate`・`Explain` 追加時と
     /// 同じ運用）。
     Scan(ValidatedScan),
+}
+
+/// `EXPLAIN` の対象文（Issue #922・SQL-27。TASK-78・SQL-6 の `USING PLAN` 付き
+/// 検索 SELECT 限定から、通常検索・集計・広域取得へ対象を拡大した際に
+/// [`Statement::Explain`] のペイロードへ導入した）。いずれの variant も
+/// 検索本体・集計走査・広域取得走査を実行しない契約は共通で、`core.rs::
+/// EngineCore::execute_sql_in_session` の `Statement::Explain` アームが
+/// variant ごとに異なる静的分類・応答整形（[`crate::sql::explain`]）へ振り分ける。
+///
+/// **本 enum の追加および [`Statement::Explain`] のペイロード変更（`ValidatedStatement`
+/// → `ExplainTarget`）は破壊的変更（BREAKING CHANGE）**: `Statement::Explain(v)` を
+/// 分解して `ValidatedStatement` のメソッドを直接呼んでいた既存コードは
+/// `ExplainTarget::Search(v)` へのパターンマッチを経由するよう修正が必要。
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ExplainTarget {
+    /// 検索 SELECT（`USING PLAN` の有無いずれも受理。TASK-78・SQL-6／Issue #922・
+    /// SQL-27）。`using_plan()` が `Some` なら既存の `USING PLAN` 経路（LLM クエリ
+    /// 展開・モード解決の可視化。行の形式は不変）、`None` なら `ORDER BY <=>`・
+    /// `HYBRID` 検索の静的判定のみを可視化する新経路（`core.rs::EngineCore::
+    /// run_search_explain`）を通る。
+    Search(ValidatedStatement),
+    /// 集計 SELECT（`GROUP BY` の有無・`SELECT DISTINCT` の脱糖形のいずれも。
+    /// Issue #922・SQL-27）。
+    Aggregate(ValidatedAggregate),
+    /// 広域取得（ソートなしのフィルタ取得。ビュー展開後の形・`OFFSET` を含む。
+    /// Issue #922・SQL-27）。
+    Scan(ValidatedScan),
+}
+
+impl ExplainTarget {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub fn table_name(&self) -> &str {
+        match self {
+            ExplainTarget::Search(v) => v.table_name(),
+            ExplainTarget::Aggregate(v) => v.table_name(),
+            ExplainTarget::Scan(v) => v.table_name(),
+        }
+    }
 }
 
 /// 集計関数の種別（TASK-166・SQL-13）。関数名は [`is_aggregate_function_name`] で
@@ -5137,96 +5177,8 @@ pub(crate) fn validate_sql_tokens(
     // statement 先頭という文脈でのみ大文字小文字を区別せず判定する。TASK-78・SQL-6）。
     let is_explain_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("EXPLAIN"));
-    // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
-    // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
-    // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
-    // トラックせず先読みだけで確定させる（`Parser::pos` の巻き戻しに依存しない）。
-    // TASK-167（SQL-14）: トークン列中に文脈キーワード `GROUP` → `BY` の並びが
-    // あれば、集計項目が SELECT リストの先頭に来ない形（`SELECT <col>, <agg>(...)
-    // FROM t GROUP BY <col>`）も集計 SELECT 形状へ振り分ける。`GROUP`/`BY` は
-    // どちらも他の文脈で通常の識別子・既存の `ORDER BY` の一部として現れうるが、
-    // 「`Ident("GROUP")` の直後に `Keyword::By`」という並びは既存の許可形状には
-    // 存在しないため、フォールス・ポジティブなく集計形状の目印として使える。
-    let contains_group_by = tokens.windows(2).any(|w| {
-        matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
-            && matches!(w[1], Token::Keyword(Keyword::By))
-    });
-    let is_aggregate_select = matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
-        && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-            && matches!(tokens.get(2), Some(Token::Punct('('))))
-            || contains_group_by);
-    // SQL-25 (c)・TASK-209: `SELECT` の直後（2 番目のトークン）が
-    // [`is_distinct_modifier`] の判定する `DISTINCT` 修飾子なら `SELECT DISTINCT`
-    // 形状（[`parse_distinct_shape`]）へ振り分ける。`is_aggregate_select`
-    // （`GROUP BY` を含む形）より前に判定する（`SELECT DISTINCT lang, COUNT(*)
-    // FROM t GROUP BY lang` のような両方に一致しうる入力は存在しない——
-    // `parse_distinct_shape` は単一の裸列参照のみを受理するため、集計項目や
-    // 複数列を伴う形は自然に `42601` へ落ちる）。
-    let is_distinct_select = matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
-        && is_distinct_modifier(tokens, 1);
     match tokens.first() {
-        Some(Token::Keyword(Keyword::Select)) if is_distinct_select => {
-            let shape = parse_distinct_shape(tokens)?;
-            let exists = lookup.table_exists(&shape.table_name)?;
-            if !exists {
-                return Err(SqlSurfaceError::undefined_table(shape.table_name));
-            }
-            Ok(Statement::Aggregate(ValidatedAggregate {
-                table_name: shape.table_name,
-                items: shape.items,
-                where_predicates: shape.where_predicates,
-                group_by: shape.group_by,
-            }))
-        }
-        Some(Token::Keyword(Keyword::Select)) if is_aggregate_select => {
-            let shape = parse_aggregate_shape(tokens)?;
-            let exists = lookup.table_exists(&shape.table_name)?;
-            if !exists {
-                return Err(SqlSurfaceError::undefined_table(shape.table_name));
-            }
-            Ok(Statement::Aggregate(ValidatedAggregate {
-                table_name: shape.table_name,
-                items: shape.items,
-                where_predicates: shape.where_predicates,
-                group_by: shape.group_by,
-            }))
-        }
-        Some(Token::Keyword(Keyword::Select)) => match parse_select_shape(tokens)? {
-            ParsedSelect::Search(shape) => {
-                let exists = lookup.table_exists(&shape.table_name)?;
-                if !exists {
-                    return Err(SqlSurfaceError::undefined_table(shape.table_name));
-                }
-                Ok(Statement::Select(ValidatedStatement {
-                    table_name: shape.table_name,
-                    projection: shape.projection,
-                    order_by: shape.order_by,
-                    where_predicates: shape.where_predicates,
-                    limit: shape.limit,
-                    search_mode: shape.search_mode,
-                    evaluation_order: shape.evaluation_order,
-                    using_plan: shape.using_plan,
-                }))
-            }
-            // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
-            // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。TABLE-18・SQL-23・
-            // TASK-205（Issue #909）: FROM がビュー（`CREATE VIEW`）を指す場合、
-            // `sql::view::resolve_from` が連鎖を畳み込んで基底テーブル名＋
-            // 合成済み `WHERE` 述語へ書き換える。書き換え後は通常のテーブル
-            // 参照と完全に同じ `ValidatedScan` になり、束縛・実行・RLS 適用は
-            // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
-            ParsedSelect::Scan(shape) => {
-                let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
-                Ok(Statement::Scan(build_scan_from_resolved(
-                    shape.table_name,
-                    resolved,
-                    shape.projection,
-                    shape.where_predicates,
-                    shape.limit,
-                    shape.offset,
-                )?))
-            }
-        },
+        Some(Token::Keyword(Keyword::Select)) => validate_select_statement(tokens, lookup),
         // TASK-213・SQL-29 (b)・RLS-10 (b)（Issue #928）: 非再帰 CTE。CTE は
         // 「クエリの中だけで有効な名前なしビュー」として、`sql::cte::
         // resolve_relation` を経由し `sql::view::resolve_from` と同じ
@@ -5234,7 +5186,10 @@ pub(crate) fn validate_sql_tokens(
         // 主クエリは広域取得（`ParsedSelect::Scan`）のみを受理し、順位付き
         // （`ORDER BY`／`USING PLAN`）・集計は明示的に拒否する（`WITH` 句を
         // 剥がして後段へ流すと同名の実テーブルを黙って読む危険があるため、
-        // 絶対に行わない）。
+        // 絶対に行わない）。CTE と `EXPLAIN`・集計 SELECT との併用は
+        // `is_explain_statement`／`validate_select_statement` 側の先読みが
+        // 先頭トークンで振り分けるため、本アームには到達しない
+        // （out-of-scope。Issue #928 対象外事項）。
         _ if is_with_statement => {
             let mut p = Parser::new(tokens);
             let ctes = p.parse_with_clause()?;
@@ -5354,75 +5309,130 @@ pub(crate) fn validate_sql_tokens(
             let (name, params, body) = parse_create_function(tokens)?;
             Ok(Statement::CreateFunction { name, params, body })
         }
-        // TASK-78（SQL-6）: `EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置
-        // のみを受理する（fail-closed。将来の拡張は別タスクの管轄）。先頭の
-        // `EXPLAIN` トークンを消費した残りを既存の検索 SELECT 形状パーサー
-        // （[`parse_select_shape`]）へそのまま渡し、`USING PLAN` を含まない形
-        // （通常 SELECT・`ORDER BY` 経路）は `shape.using_plan` が `None` になる
-        // ことを利用して一律 `42601` へ落とす（`SET`・`CREATE FUNCTION` への
-        // 前置は残り先頭が `SELECT` キーワードでないため、同じ `42601` へ自然に
-        // 落ちる）。
-        //
-        // 集計 SELECT（TASK-166・SQL-13／TASK-167・SQL-14）は非 EXPLAIN 経路では
-        // `is_aggregate_select` の先読みで `parse_aggregate_shape` へ振り分けられ
-        // `parse_select_shape` には到達しないが、この分岐は残りトークンを無条件に
-        // `parse_select_shape` へ渡すため、同じ先読みを適用しないと内側の
-        // `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` が集計ではなく UDF 呼び出しの検索射影
-        // として誤って受理されうる（Issue #267 Bugbot 指摘）。`EXPLAIN` に集計
-        // SELECT の対応契約は無い（`ValidatedAggregate` に `using_plan` は無く
-        // `USING PLAN` と両立しない）ため、`is_aggregate_select` と同じ先読みを
-        // 残りトークンに適用し、集計形状に見える場合は fail-closed で拒否する。
+        // Issue #922（SQL-27）: `EXPLAIN` の対象を通常検索・集計・広域取得へ
+        // 拡大した。先頭の `EXPLAIN` トークンを消費した残りを、非 EXPLAIN の
+        // `SELECT` と完全に同じ振り分け・パース・カタログ存在確認
+        // （[`validate_select_statement`]）へそのまま渡すことで、42601 → 42P01 →
+        // 束縛エラーという判定順序が EXPLAIN の有無で変わらないことを構造的に
+        // 保証する（第 2 の実装を持たない）。残り先頭が `SELECT` でない場合
+        // （`EXPLAIN EXPLAIN`／`EXPLAIN SET`／`EXPLAIN CREATE FUNCTION`／
+        // `EXPLAIN INSERT`／`EXPLAIN WITH` 等の DML・DDL・CTE）は許可リスト外
+        // として一律 `42601`（`EXPLAIN` と CTE の併用は Issue #928 の対象外
+        // 事項であり、`validate_select_statement` は `WITH` 句を扱わないため
+        // 自然にここへ落ちる）。untrusted 入力経路のため添字アクセスではなく
+        // `get` でスライスする（`.claude/rules/coding-rust.md`）。
         _ if is_explain_statement => {
-            let rest = &tokens[1..];
+            let rest = tokens.get(1..).unwrap_or(&[]);
             if !matches!(rest.first(), Some(Token::Keyword(Keyword::Select))) {
                 return Err(SqlSurfaceError::unsupported(
-                    "EXPLAIN requires a SELECT ... USING PLAN(...) statement",
+                    "EXPLAIN requires a SELECT statement",
                 ));
             }
-            let rest_contains_group_by = rest.windows(2).any(|w| {
-                matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
-                    && matches!(w[1], Token::Keyword(Keyword::By))
-            });
-            let rest_is_aggregate_select = (matches!(rest.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-                && matches!(rest.get(2), Some(Token::Punct('('))))
-                || rest_contains_group_by;
-            if rest_is_aggregate_select {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXPLAIN is not supported for aggregate SELECT statements",
-                ));
-            }
-            // SQL-25 (c)・TASK-209: `EXPLAIN SELECT DISTINCT ...` も同じ理由
-            // （`ValidatedAggregate` に `using_plan` が無く両立しない）で明示的に
-            // 拒否する。`EXPLAIN` の対象拡大は SQL-27 の管轄で本 Issue の対象外。
-            if is_distinct_modifier(rest, 1) {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXPLAIN is not supported for SELECT DISTINCT statements",
-                ));
-            }
-            // Issue #454: 広域取得（`ParsedSelect::Scan`）は `USING PLAN` を
-            // 持てない形（ランキング段自体を持たない）ため、既存の
-            // `shape.using_plan.is_none()` 判定と同じ理由で一律 `42601` に
-            // 落とす（`EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置のみを
-            // 受理する契約。本モジュールドキュメントの `Statement::Explain`
-            // 参照）。
-            let shape = match parse_select_shape(rest)? {
-                ParsedSelect::Search(shape) => shape,
-                ParsedSelect::Scan(_) => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "EXPLAIN is only supported for SELECT ... USING PLAN(...) statements",
-                    ));
+            let target = match validate_select_statement(rest, lookup)? {
+                Statement::Select(v) => ExplainTarget::Search(v),
+                Statement::Aggregate(v) => ExplainTarget::Aggregate(v),
+                Statement::Scan(v) => ExplainTarget::Scan(v),
+                // `validate_select_statement` は `SELECT` 先頭のトークン列に
+                // 対して常に `Select`／`Aggregate`／`Scan` のいずれかを返す
+                // （関数ドキュメント参照）。到達は同関数の契約違反時のみの
+                // 防御的経路として fail-closed に拒否する（`unreachable!` の
+                // panic ではなくエラー応答にする。ライブラリコードは panic
+                // させない方針。`.claude/rules/coding-rust.md`）。
+                Statement::SetSearchMode { .. }
+                | Statement::CreateFunction { .. }
+                | Statement::Explain(_) => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "validate_select_statement returned a non-SELECT statement"
+                            .to_string(),
+                    });
                 }
             };
-            if shape.using_plan.is_none() {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXPLAIN is only supported for SELECT ... USING PLAN(...) statements",
-                ));
-            }
+            Ok(Statement::Explain(target))
+        }
+        other => Err(SqlSurfaceError::unsupported(format!(
+            "expected SELECT, SET, CREATE FUNCTION, or EXPLAIN, got {other:?}"
+        ))),
+    }
+}
+
+/// 通常 SELECT・集計 SELECT（`GROUP BY` の有無いずれも）・`SELECT DISTINCT`
+/// の脱糖形・広域取得（ビュー展開後の形を含む）の共有振り分け（TASK-166・
+/// SQL-13／TASK-167・SQL-14／SQL-25 (c)・TASK-209／Issue #454 の先読み判定と
+/// パースを 1 箇所へ集約したもの。Issue #922・SQL-27）。`tokens` の先頭は
+/// `SELECT` キーワードであることが前提（呼び出し元が
+/// `matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))` を
+/// 確認済みであること。違反時の挙動は各内部パーサーの構文エラーに委ねる）。
+/// 戻り値は常に [`Statement::Select`]・[`Statement::Aggregate`]・
+/// [`Statement::Scan`] のいずれか（[`Statement::SetSearchMode`]・
+/// [`Statement::CreateFunction`]・[`Statement::Explain`] を返すことはない）。
+///
+/// [`validate_sql_tokens`] の非 EXPLAIN 経路と `EXPLAIN`（[`ExplainTarget`]）
+/// の両方がこの関数を呼ぶことで、`EXPLAIN` の対象拡大が既存の判定順序
+/// （`42601` → `42P01` → 束縛エラー）を変えないことを構造的に保証する
+/// （第 2 の実装を持たない）。
+fn validate_select_statement(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<Statement, SqlSurfaceError> {
+    // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
+    // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
+    // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
+    // トラックせず先読みだけで確定させる（`Parser::pos` の巻き戻しに依存しない）。
+    // TASK-167（SQL-14）: トークン列中に文脈キーワード `GROUP` → `BY` の並びが
+    // あれば、集計項目が SELECT リストの先頭に来ない形（`SELECT <col>, <agg>(...)
+    // FROM t GROUP BY <col>`）も集計 SELECT 形状へ振り分ける。`GROUP`/`BY` は
+    // どちらも他の文脈で通常の識別子・既存の `ORDER BY` の一部として現れうるが、
+    // 「`Ident("GROUP")` の直後に `Keyword::By`」という並びは既存の許可形状には
+    // 存在しないため、フォールス・ポジティブなく集計形状の目印として使える。
+    let contains_group_by = tokens.windows(2).any(|w| {
+        matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+            && matches!(w[1], Token::Keyword(Keyword::By))
+    });
+    let is_aggregate_select = (matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+        && matches!(tokens.get(2), Some(Token::Punct('('))))
+        || contains_group_by;
+    // SQL-25 (c)・TASK-209: `SELECT` の直後（2 番目のトークン）が
+    // [`is_distinct_modifier`] の判定する `DISTINCT` 修飾子なら `SELECT DISTINCT`
+    // 形状（[`parse_distinct_shape`]）へ振り分ける。`is_aggregate_select`
+    // （`GROUP BY` を含む形）より前に判定する（`SELECT DISTINCT lang, COUNT(*)
+    // FROM t GROUP BY lang` のような両方に一致しうる入力は存在しない——
+    // `parse_distinct_shape` は単一の裸列参照のみを受理するため、集計項目や
+    // 複数列を伴う形は自然に `42601` へ落ちる）。
+    let is_distinct_select = is_distinct_modifier(tokens, 1);
+
+    if is_distinct_select {
+        let shape = parse_distinct_shape(tokens)?;
+        let exists = lookup.table_exists(&shape.table_name)?;
+        if !exists {
+            return Err(SqlSurfaceError::undefined_table(shape.table_name));
+        }
+        return Ok(Statement::Aggregate(ValidatedAggregate {
+            table_name: shape.table_name,
+            items: shape.items,
+            where_predicates: shape.where_predicates,
+            group_by: shape.group_by,
+        }));
+    }
+    if is_aggregate_select {
+        let shape = parse_aggregate_shape(tokens)?;
+        let exists = lookup.table_exists(&shape.table_name)?;
+        if !exists {
+            return Err(SqlSurfaceError::undefined_table(shape.table_name));
+        }
+        return Ok(Statement::Aggregate(ValidatedAggregate {
+            table_name: shape.table_name,
+            items: shape.items,
+            where_predicates: shape.where_predicates,
+            group_by: shape.group_by,
+        }));
+    }
+    match parse_select_shape(tokens)? {
+        ParsedSelect::Search(shape) => {
             let exists = lookup.table_exists(&shape.table_name)?;
             if !exists {
                 return Err(SqlSurfaceError::undefined_table(shape.table_name));
             }
-            Ok(Statement::Explain(ValidatedStatement {
+            Ok(Statement::Select(ValidatedStatement {
                 table_name: shape.table_name,
                 projection: shape.projection,
                 order_by: shape.order_by,
@@ -5433,9 +5443,46 @@ pub(crate) fn validate_sql_tokens(
                 using_plan: shape.using_plan,
             }))
         }
-        other => Err(SqlSurfaceError::unsupported(format!(
-            "expected SELECT, SET, CREATE FUNCTION, or EXPLAIN, got {other:?}"
-        ))),
+        // Issue #454: `ORDER BY`・`USING PLAN` のいずれも伴わない
+        // `SELECT ... [WHERE ...] LIMIT n`（広域取得）。TABLE-18・SQL-23・
+        // TASK-205（Issue #909）: FROM がビュー（`CREATE VIEW`）を指す場合、
+        // `sql::view::resolve_from` が連鎖を畳み込んで基底テーブル名＋
+        // 合成済み `WHERE` 述語へ書き換える。書き換え後は通常のテーブル
+        // 参照と完全に同じ `ValidatedScan` になり、束縛・実行・RLS 適用は
+        // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
+        ParsedSelect::Scan(shape) => match super::view::resolve_from(lookup, &shape.table_name)? {
+            super::view::Resolved::Table => Ok(Statement::Scan(ValidatedScan {
+                table_name: shape.table_name,
+                projection: shape.projection,
+                where_predicates: shape.where_predicates,
+                limit: shape.limit,
+                offset: shape.offset,
+            })),
+            super::view::Resolved::View {
+                base_table,
+                view_predicates,
+                view_columns,
+            } => {
+                super::view::check_columns_within_view(
+                    view_columns.as_deref(),
+                    &shape.projection,
+                    &shape.where_predicates,
+                )?;
+                let projection = match (&shape.projection, &view_columns) {
+                    (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
+                    (other, _) => other.clone(),
+                };
+                let mut where_predicates = view_predicates;
+                where_predicates.extend(shape.where_predicates);
+                Ok(Statement::Scan(ValidatedScan {
+                    table_name: base_table,
+                    projection,
+                    where_predicates,
+                    limit: shape.limit,
+                    offset: shape.offset,
+                }))
+            }
+        },
     }
 }
 
@@ -9953,11 +10000,19 @@ mod tests {
     }
 
     #[test]
-    fn explain_rejects_scan_shape() {
+    fn explain_accepts_scan_shape() {
+        // Issue #922（SQL-27）: `EXPLAIN` の対象を広域取得へ拡大したため、
+        // bare LIMIT scan の前置はもはや拒否されず `ExplainTarget::Scan` として
+        // 受理される（受理テストへ反転）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("EXPLAIN SELECT * FROM documents LIMIT 10", &lookup)
-            .expect_err("EXPLAIN must reject a bare LIMIT scan (no USING PLAN)");
-        assert_eq!(err.wire_code(), "42601");
+        let stmt = validate_sql("EXPLAIN SELECT * FROM documents LIMIT 10", &lookup)
+            .expect("EXPLAIN over a bare LIMIT scan must be accepted");
+        match stmt {
+            Statement::Explain(ExplainTarget::Scan(scan)) => {
+                assert_eq!(scan.table_name(), "documents");
+            }
+            other => panic!("expected ExplainTarget::Scan, got {other:?}"),
+        }
     }
 
     #[test]
