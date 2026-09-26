@@ -529,6 +529,11 @@ pub enum SqlSurfaceError {
     /// Issue #907。[`crate::catalog::CatalogError::InvalidForeignKey`] の写像。
     /// ERR-6: `42830`）。`detail` はカタログ情報（列名・テーブル名）のみ。
     InvalidForeignKey { detail: String },
+    /// 集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`EXCEPT`。SQL-29 (c)・
+    /// RLS-10 (b)・TASK-213）の両辺で列数または列型が一致しない
+    /// （[`crate::sql::set_op`] が束縛時に検証する。ERR-6: `42804`）。`detail`
+    /// には列番号のみを含め、テーブル名・行の値は含めない（security.md P0）。
+    DatatypeMismatch { detail: String },
     /// 複数テーブル参照スコープ（`sql::relation::BindingScope`、SQL-28・RLS-10・
     /// Issue #924）で、非修飾列参照が 2 つ以上の参照テーブルに一致した
     /// （候補が曖昧で一意に解決できない）。ERR-6: `42702`。文言には列名のみを
@@ -700,6 +705,14 @@ impl SqlSurfaceError {
         }
     }
 
+    /// `pub(crate)`: `sql::set_op`（SQL-29 (c)・RLS-10 (b)・TASK-213）が集合演算の
+    /// 両辺の列数・列型不一致を報告するために使う。
+    pub(crate) fn datatype_mismatch(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::DatatypeMismatch {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
     /// `pub(crate)`: `sql::relation::BindingScope::resolve`（SQL-28・RLS-10、
     /// Issue #924）が非修飾列参照の曖昧な解決を報告するために使う。列名は
     /// untrusted な字句解析結果のため他 variant と同じ切り詰め規約を経由する。
@@ -755,6 +768,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
+            SqlSurfaceError::DatatypeMismatch { .. } => ErrorClass::DatatypeMismatch,
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
         }
     }
@@ -889,6 +903,14 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::InvalidForeignKey { detail } => {
                 write!(f, "invalid foreign key declaration: {detail}")
+            }
+            // 列番号のみを含める固定形式。テーブル名・行の値は含めない
+            // （security.md P0。`SqlSurfaceError::DatatypeMismatch` ドキュメント参照）。
+            SqlSurfaceError::DatatypeMismatch { detail } => {
+                write!(
+                    f,
+                    "datatype mismatch between set operation branches: {detail}"
+                )
             }
             SqlSurfaceError::AmbiguousColumn { name } => {
                 write!(f, "column reference {name:?} is ambiguous")
@@ -1292,6 +1314,50 @@ pub enum Statement {
     /// `match` はワイルドカードアームの追加が必要（`Aggregate`・`Explain` 追加時と
     /// 同じ運用）。
     Scan(ValidatedScan),
+    /// `UNION`／`UNION ALL`／`INTERSECT`／`EXCEPT`（SQL-29 (c)・RLS-10 (b)・
+    /// TASK-213）。各枝は `Scan`（[`ValidatedScan`]。SQL-15 の広域取得経路）に
+    /// 限定する——複数テーブル実行計画の基盤（`JOIN`。TASK-212）を前提としない
+    /// 設計判断（`sql::set_op` モジュールドキュメント参照）。束縛・実行本体は
+    /// `sql::set_op` が担う。
+    ///
+    /// **本 variant の追加は破壊的変更（BREAKING CHANGE）**: 既存の網羅的
+    /// `match` はワイルドカードアームの追加が必要（`Scan` 追加時と同じ運用）。
+    SetOperation(ValidatedSetOperation),
+}
+
+/// 集合演算の演算子（SQL-29 (c)・TASK-213）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetOperator {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+/// 集合演算の構文木。葉は単一テーブルの広域取得（[`ValidatedScan`]）に限定する
+/// （TASK-213 の設計判断: `JOIN` 基盤〔TASK-212〕を前提にしない。`sql::set_op`
+/// モジュールドキュメント参照）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SetTree {
+    Branch(Box<ValidatedScan>),
+    Op {
+        op: SetOperator,
+        left: Box<SetTree>,
+        right: Box<SetTree>,
+    },
+}
+
+/// 許可形状の構造判定を通過した集合演算文（SQL-29 (c)・RLS-10 (b)・TASK-213）。
+/// 束縛（枝ごとの `bind_scan`）・実行（合成・重複除去・RLS 独立適用）は
+/// `sql::set_op` の責務（本モジュールは構造情報のみを保証する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedSetOperation {
+    pub(crate) tree: SetTree,
+    /// 全体 `LIMIT n`（任意）。範囲検証（`1..=core::MAX_SEARCH_K`）は
+    /// `sql::set_op::execute` が全枝の走査より前に、`sql::set_op::
+    /// describe_columns` が Describe 経路で同じ検証を行う（PR #1105 レビュー
+    /// 指摘対応。Execute／Describe の受理・拒否を一致させる）。
+    pub(crate) limit: Option<u32>,
 }
 
 /// `EXPLAIN` の対象文（Issue #922・SQL-27。TASK-78・SQL-6 の `USING PLAN` 付き
@@ -4750,6 +4816,320 @@ enum ParsedSelect {
     Scan(ParsedScanShape),
 }
 
+/// 集合演算（SQL-29 (c)・TASK-213）の括弧入れ子上限（実装既定値）。超過は `54000`。
+const MAX_SET_OP_PAREN_DEPTH: u32 = 4;
+
+/// 集合演算 1 文が持てる枝数の上限（実装既定値）。`Vec` へ積む前に判定し、
+/// 無制限 `Vec` 確保を避ける（security.md「不安全な設計」対応）。超過は `54000`。
+const MAX_SET_OP_BRANCHES: usize = 16;
+
+/// `UNION`／`INTERSECT`/`EXCEPT` は [`Keyword`] 化しない（`lexer` モジュール
+/// ドキュメントと同じ理由。既存の列名・テーブル名としての用法を壊さないため）。
+/// 大文字小文字を区別せず [`Token::Ident`] を照合する。
+fn is_set_operator_ident(name: &str) -> bool {
+    name.eq_ignore_ascii_case("UNION")
+        || name.eq_ignore_ascii_case("INTERSECT")
+        || name.eq_ignore_ascii_case("EXCEPT")
+}
+
+/// `tokens[op_idx]` が集合演算子であるという前提で、その直後（`ALL`／
+/// `DISTINCT` を 1 個挟んでもよい）に次の枝（`SELECT`、または `(` の連なりの先
+/// に `SELECT` が続く形）が続くかを判定する（誤検出防止: 列名・テーブル名として
+/// の `union`/`intersect`/`except` の通常の用法ではこの並びにならない）。
+///
+/// `(` は「そこから括弧を読み飛ばした先が `SELECT` かどうか」まで確認する
+/// （[`starts_with_select_after_parens`] を後続スライスへ適用）。単に次が `(`
+/// であることのみを条件にすると、`union(score)`（宣言的 UDF・組み込み関数の
+/// 呼び出し）の呼び出し括弧まで集合演算の枝開始と誤検出し、UDF 呼び出しが
+/// 集合演算枝の解析経路（`Computed` 投影項目を拒否する）に誤って回されてしまう
+/// （Issue #929 最終レビュー指摘の回帰）。
+fn set_operator_is_followed_by_branch(tokens: &[Token], op_idx: usize) -> bool {
+    let branch_starts_at = |idx: usize| -> bool {
+        match tokens.get(idx) {
+            Some(Token::Keyword(Keyword::Select)) => true,
+            Some(Token::Punct('(')) => tokens
+                .get(idx..)
+                .is_some_and(starts_with_select_after_parens),
+            _ => false,
+        }
+    };
+    match tokens.get(op_idx + 1) {
+        Some(Token::Ident(w))
+            if w.eq_ignore_ascii_case("ALL") || w.eq_ignore_ascii_case("DISTINCT") =>
+        {
+            branch_starts_at(op_idx + 2)
+        }
+        _ => branch_starts_at(op_idx + 1),
+    }
+}
+
+/// 文頭の `(` の連なり（集合演算の括弧入れ子。上限は構文解析側で別途検証する）を
+/// 読み飛ばした先が `SELECT` キーワードかどうかを判定する。
+fn starts_with_select_after_parens(tokens: &[Token]) -> bool {
+    let mut i = 0usize;
+    // 検出専用の先読みのため、実際の構文解析（括弧の入れ子上限検証）とは別に
+    // 小さい固定上限で打ち切る（無制限走査を避ける）。
+    while i <= MAX_SET_OP_PAREN_DEPTH as usize + 1
+        && matches!(tokens.get(i), Some(Token::Punct('(')))
+    {
+        i += 1;
+    }
+    matches!(tokens.get(i), Some(Token::Keyword(Keyword::Select)))
+}
+
+/// 集合演算文かどうかをバックトラックせず先読みだけで判定する（Issue #929・
+/// SQL-29 (c)）。`validate_sql_tokens` の `is_aggregate_select`／
+/// `contains_group_by` による振り分けより前に呼ぶ（これらはトークン列全体を
+/// 走査するため、`SELECT ... UNION SELECT ...` の 2 つ目の `SELECT` 以降に
+/// 集計形が現れる場合の誤判定を避ける）。
+fn looks_like_set_operation(tokens: &[Token]) -> bool {
+    if !starts_with_select_after_parens(tokens) {
+        return false;
+    }
+    tokens.iter().enumerate().any(|(i, t)| {
+        matches!(t, Token::Ident(name) if is_set_operator_ident(name))
+            && set_operator_is_followed_by_branch(tokens, i)
+    })
+}
+
+/// 集合演算の枝（`SELECT <list> FROM <table> [WHERE ...]`）を解析する。検索
+/// SELECT・広域取得が持つランキング段・`LIMIT`・`OFFSET`・`DISTINCT`・集計
+/// （`GROUP BY` を含む）はいずれも受理しない（fail-closed。SQL-29 (c) の対象外
+/// 事項）。`Computed` 投影項目（宣言的 UDF・組み込み関数呼び出し）も、束縛時に
+/// 型を確定できないため受理しない。
+fn parse_set_branch(
+    p: &mut Parser<'_>,
+    lookup: &impl TableLookup,
+) -> Result<SetTree, SqlSurfaceError> {
+    p.expect_keyword(Keyword::Select)?;
+
+    // Issue #267 の EXPLAIN アーム先読みと同じ判定を枝に適用する（集計形の枝は
+    // 対象外）。
+    if let Some(Token::Ident(name)) = p.peek() {
+        if is_aggregate_function_name(name)
+            && matches!(p.tokens.get(p.pos + 1), Some(Token::Punct('(')))
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "aggregate SELECT is not allowed inside a set operation branch",
+            ));
+        }
+    }
+
+    let projection = p.parse_select_list()?;
+    if let Projection::Items(items) = &projection {
+        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })) {
+            return Err(SqlSurfaceError::unsupported(
+                "computed projection items are not allowed inside a set operation branch",
+            ));
+        }
+    }
+
+    p.expect_keyword(Keyword::From)?;
+    let table_name = p.expect_ident()?;
+
+    let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        p.parse_where()?
+    } else {
+        Vec::new()
+    };
+
+    // `LIMIT` は枝の中では拒否しない: 全体 `LIMIT n`（任意。`parse_set_operation`
+    // が消費する）が構文上「最後の枝の直後」に置かれるため、最後の枝を解析した
+    // 直後の位置に `LIMIT` が残っていることは正当な形である。ここで拒否すると
+    // 正当な全体 `LIMIT` まで `42601` にしてしまう。枝の中の `LIMIT`（例:
+    // `SELECT ... LIMIT 1 UNION SELECT ...`）は、この位置で消費されずに残った
+    // トークン列が後続の演算子照合（`UNION`／`INTERSECT`／`EXCEPT`）にも
+    // `parse_set_operation` の末尾 `expect_end_of_statement` にも一致しないため、
+    // 結局は同じ `42601` へ自然に落ちる（`limit_inside_branch_is_rejected` で固定）。
+    //
+    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`OFFSET`／`DISTINCT` はいずれも
+    // 集合演算の文法上どの位置にも現れ得ないため、ここで拒否しなくても
+    // 同じ理由で最終的に `expect_end_of_statement` が `42601` に落とす。
+    // ただし早期に拒否した方が構造的に読みやすいため、明示的に残す。
+    let has_group_by = matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"))
+        && matches!(p.tokens.get(p.pos + 1), Some(Token::Keyword(Keyword::By)));
+    if has_group_by
+        || matches!(p.peek(), Some(Token::Keyword(Keyword::Order)))
+        || p.peek_ident_matches("USING")
+        || p.peek_ident_matches("OFFSET")
+        || p.peek_ident_matches("DISTINCT")
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "GROUP BY/ORDER BY/OFFSET/USING PLAN/DISTINCT are not allowed inside a set operation branch",
+        ));
+    }
+
+    // Issue #909（TABLE-18・SQL-23・TASK-205）: FROM がビューを指す場合は
+    // `Statement::Scan` アームと同じ畳み込みを適用する（第 2 の実行器を作らない）。
+    let validated_scan = match super::view::resolve_from(lookup, &table_name)? {
+        super::view::Resolved::Table => ValidatedScan {
+            table_name,
+            projection,
+            where_predicates,
+            limit: crate::core::MAX_SEARCH_K as u32,
+            offset: 0,
+        },
+        super::view::Resolved::View {
+            base_table,
+            view_predicates,
+            view_columns,
+        } => {
+            super::view::check_columns_within_view(
+                view_columns.as_deref(),
+                &projection,
+                &where_predicates,
+            )?;
+            let projection = match (&projection, &view_columns) {
+                (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
+                (other, _) => other.clone(),
+            };
+            let mut merged_where = view_predicates;
+            merged_where.extend(where_predicates);
+            ValidatedScan {
+                table_name: base_table,
+                projection,
+                where_predicates: merged_where,
+                limit: crate::core::MAX_SEARCH_K as u32,
+                offset: 0,
+            }
+        }
+    };
+    Ok(SetTree::Branch(Box::new(validated_scan)))
+}
+
+/// `primary := branch | '(' set_expr ')'`（`set_expr` より高い優先順位）。
+fn parse_set_primary(
+    p: &mut Parser<'_>,
+    lookup: &impl TableLookup,
+    depth: u32,
+    branch_count: &mut usize,
+) -> Result<SetTree, SqlSurfaceError> {
+    if matches!(p.peek(), Some(Token::Punct('('))) {
+        p.advance();
+        let next_depth = depth.checked_add(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("set operation nesting depth exceeds limit")
+        })?;
+        if next_depth > MAX_SET_OP_PAREN_DEPTH {
+            return Err(SqlSurfaceError::payload_too_large(
+                "set operation nesting depth exceeds limit",
+            ));
+        }
+        let inner = parse_set_expr(p, lookup, next_depth, branch_count)?;
+        p.expect_punct(')')?;
+        return Ok(inner);
+    }
+    *branch_count = branch_count
+        .checked_add(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("too many set operation branches"))?;
+    if *branch_count > MAX_SET_OP_BRANCHES {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many set operation branches",
+        ));
+    }
+    parse_set_branch(p, lookup)
+}
+
+/// `set_term := primary { INTERSECT primary }`（`INTERSECT` は `UNION`／`EXCEPT`
+/// より高い優先順位で左結合。PostgreSQL と同じ優先順位規則）。
+fn parse_set_term(
+    p: &mut Parser<'_>,
+    lookup: &impl TableLookup,
+    depth: u32,
+    branch_count: &mut usize,
+) -> Result<SetTree, SqlSurfaceError> {
+    let mut left = parse_set_primary(p, lookup, depth, branch_count)?;
+    while p.peek_ident_matches("INTERSECT") {
+        p.advance();
+        if p.peek_ident_matches("ALL") || p.peek_ident_matches("DISTINCT") {
+            return Err(SqlSurfaceError::unsupported(
+                "INTERSECT ALL/DISTINCT is not supported",
+            ));
+        }
+        let right = parse_set_primary(p, lookup, depth, branch_count)?;
+        left = SetTree::Op {
+            op: SetOperator::Intersect,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+/// `set_expr := set_term { (UNION [ALL] | EXCEPT) set_term }`（左結合）。
+fn parse_set_expr(
+    p: &mut Parser<'_>,
+    lookup: &impl TableLookup,
+    depth: u32,
+    branch_count: &mut usize,
+) -> Result<SetTree, SqlSurfaceError> {
+    let mut left = parse_set_term(p, lookup, depth, branch_count)?;
+    loop {
+        if p.peek_ident_matches("UNION") {
+            p.advance();
+            let all = if p.peek_ident_matches("ALL") {
+                p.advance();
+                true
+            } else if p.peek_ident_matches("DISTINCT") {
+                return Err(SqlSurfaceError::unsupported(
+                    "UNION DISTINCT is not supported",
+                ));
+            } else {
+                false
+            };
+            let right = parse_set_term(p, lookup, depth, branch_count)?;
+            left = SetTree::Op {
+                op: if all {
+                    SetOperator::UnionAll
+                } else {
+                    SetOperator::Union
+                },
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        } else if p.peek_ident_matches("EXCEPT") {
+            p.advance();
+            if p.peek_ident_matches("ALL") || p.peek_ident_matches("DISTINCT") {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXCEPT ALL/DISTINCT is not supported",
+                ));
+            }
+            let right = parse_set_term(p, lookup, depth, branch_count)?;
+            left = SetTree::Op {
+                op: SetOperator::Except,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        } else {
+            break;
+        }
+    }
+    Ok(left)
+}
+
+/// 集合演算文の全体（`set_expr [LIMIT <n>]`）を解析する（`looks_like_set_operation`
+/// で先読み済みの前提で呼ぶ）。
+fn parse_set_operation(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+) -> Result<ValidatedSetOperation, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    let mut branch_count = 0usize;
+    let tree = parse_set_expr(&mut p, lookup, 0, &mut branch_count)?;
+    let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+        p.advance();
+        let limit_str = p.expect_number()?;
+        let limit: u32 = limit_str.parse().map_err(|_| {
+            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
+        })?;
+        Some(limit)
+    } else {
+        None
+    };
+    p.expect_end_of_statement()?;
+    Ok(ValidatedSetOperation { tree, limit })
+}
+
 /// 許可した `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-74 由来。
 /// TASK-161 で `LIMIT` 直後の `USING MODE` 句判定を追加した。TASK-77・SQL-5 で
 /// `WHERE`（省略可）直後の `USING PLAN(...)` 分岐を追加した。Issue #454 で
@@ -5196,6 +5576,17 @@ pub(crate) fn validate_sql_tokens(
     // statement 先頭という文脈でのみ大文字小文字を区別せず判定する。TASK-78・SQL-6）。
     let is_explain_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("EXPLAIN"));
+    // Issue #929（SQL-29 (c)・RLS-10 (b)・TASK-213）: 集合演算の検出は、
+    // `validate_select_statement` 内の集計形状判定（`is_aggregate_select`・
+    // `contains_group_by`）より前に行う。先頭が `SELECT`／`(` で、かつ集合演算子
+    // トークンが枝の先頭に正しく続く場合のみ集合演算文として扱い、それ以外の
+    // 通常の SELECT・広域取得の受理形状には一切影響しない。`ExplainTarget` は
+    // 集合演算を持たない（[`validate_select_statement`] のドキュメンテーション
+    // コメント参照）ため、`EXPLAIN` 経路より前のこの位置で確定させる。
+    if looks_like_set_operation(tokens) {
+        let validated = parse_set_operation(tokens, lookup)?;
+        return Ok(Statement::SetOperation(validated));
+    }
     match tokens.first() {
         Some(Token::Keyword(Keyword::Select)) => validate_select_statement(tokens, lookup),
         // TASK-213・SQL-29 (b)・RLS-10 (b)（Issue #928）: 非再帰 CTE。CTE は
@@ -5359,7 +5750,13 @@ pub(crate) fn validate_sql_tokens(
                 // させない方針。`.claude/rules/coding-rust.md`）。
                 Statement::SetSearchMode { .. }
                 | Statement::CreateFunction { .. }
-                | Statement::Explain(_) => {
+                | Statement::Explain(_)
+                // Issue #929（SQL-29 (c)）: `validate_select_statement` は集合演算
+                // （`SetOperation`）を返さない（同関数のドキュメンテーション
+                // コメント参照。集合演算の検出・分岐は `validate_sql_tokens` が
+                // `validate_select_statement` を呼ぶより前に完結させる設計）。
+                // 網羅性のためのみここに列挙する防御的経路。
+                | Statement::SetOperation(_) => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "validate_select_statement returned a non-SELECT statement"
                             .to_string(),
@@ -5541,6 +5938,12 @@ pub fn validate_statement(
         // （一律 `42601`）。
         Statement::Scan(_) => Err(SqlSurfaceError::unsupported(
             "wide-retrieval scan is not a search query statement (use a session-aware entry point)",
+        )),
+        // Issue #929（SQL-29 (c)・TASK-213）: 集合演算も `ValidatedStatement` を
+        // 持たないため、`Scan`・`Aggregate` と同じくこのエントリポイントでは
+        // 受理しない（一律 `42601`）。
+        Statement::SetOperation(_) => Err(SqlSurfaceError::unsupported(
+            "set operation is not a search query statement (use a session-aware entry point)",
         )),
     }
 }
@@ -10921,6 +11324,51 @@ mod tests {
         let v = parse_create_table_ok(&sql);
         assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
         assert_eq!(v.checks.len(), 2);
+    }
+
+    // ---------- 集合演算検出の誤検出防止（Issue #929 最終レビュー指摘の回帰） ----------
+
+    /// `looks_like_set_operation` は `union`/`intersect`/`except` を
+    /// 宣言的 UDF・組み込み関数の呼び出し（`union(score)` のように呼び出し括弧が
+    /// 直後に続く形）としては検出しない。呼び出し括弧の先が `SELECT` に到達
+    /// しない限り集合演算の枝開始とみなさない（`set_operator_is_followed_by_branch`
+    /// のドキュメンテーションコメント参照）。
+    fn looks_like_set_operation_of(sql: &str) -> bool {
+        let tokens = lexer::tokenize(sql).expect("valid tokens");
+        looks_like_set_operation(&tokens)
+    }
+
+    #[test]
+    fn udf_call_in_select_list_is_not_detected_as_set_operation() {
+        assert!(!looks_like_set_operation_of("SELECT union(score) FROM t"));
+        assert!(!looks_like_set_operation_of(
+            "SELECT a, intersect(x) FROM t"
+        ));
+        assert!(!looks_like_set_operation_of("SELECT except(x) FROM t"));
+    }
+
+    #[test]
+    fn udf_call_in_where_clause_is_not_detected_as_set_operation() {
+        assert!(!looks_like_set_operation_of(
+            "SELECT a FROM t WHERE except(x) > 1"
+        ));
+    }
+
+    #[test]
+    fn genuine_set_operation_with_select_branch_is_detected() {
+        assert!(looks_like_set_operation_of(
+            "SELECT a FROM t UNION SELECT b FROM u"
+        ));
+    }
+
+    #[test]
+    fn genuine_set_operation_with_parenthesized_branch_is_detected() {
+        assert!(looks_like_set_operation_of(
+            "SELECT a FROM t UNION (SELECT b FROM u)"
+        ));
+        assert!(looks_like_set_operation_of(
+            "(SELECT a FROM t) UNION ALL ((SELECT b FROM u))"
+        ));
     }
 
     // --- 非再帰 CTE（`WITH` 句。SQL-29 (b)・RLS-10 (b)、TASK-213、Issue #928） ---
