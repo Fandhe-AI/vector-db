@@ -763,6 +763,11 @@ impl Accumulator {
                 };
                 match program.eval(id, embedding, scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
+                    // NULL は集計対象から除外する（対象ビヘイビア: SQL-26。
+                    // Issue #921。`SUM`/`AVG`/`MIN`/`MAX` は無視、
+                    // `COUNT(expr)` は `observe_float` が共有する `Count` 腕が
+                    // 非 NULL のみを数える契約に自然に合流する）。
+                    ExprValue::Null => Ok(()),
                     // `resolve_aggregate_input` が `ExprType::Scalar` のみを
                     // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
                     // 評価結果の型が食い違う実装バグの検出用）。
@@ -1700,7 +1705,9 @@ pub(crate) fn execute_aggregate_with_cache(
                 };
                 match program.eval(id, embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    ExprValue::Bool(false) => continue 'rows,
+                    // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                    // Issue #921）。
+                    ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
                     // 述語の型を `Bool` に限定済みのため到達しない。
                     _ => {
@@ -2122,7 +2129,9 @@ pub(crate) fn observe_candidate_slots(
             };
             match program.eval(id, embedding, &mut expr_scratch)? {
                 ExprValue::Bool(true) => {}
-                ExprValue::Bool(false) => continue 'candidates,
+                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                // Issue #921）。
+                ExprValue::Bool(false) | ExprValue::Null => continue 'candidates,
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",

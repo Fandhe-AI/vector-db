@@ -139,7 +139,9 @@ impl BoundConjunction {
             let row_embedding: &[f32] = if references_embedding { embedding } else { &[] };
             match program.eval(id, row_embedding, scratch)? {
                 ExprValue::Bool(true) => {}
-                ExprValue::Bool(false) => return Ok(false),
+                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                // Issue #921。PostgreSQL の 3 値論理と同じ扱い）。
+                ExprValue::Bool(false) | ExprValue::Null => return Ok(false),
                 // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式述語の
                 // 型を `Bool` に限定済みのため到達しない。
                 _ => {

@@ -481,7 +481,9 @@ pub(crate) fn execute_scan_with_budget(
                 };
                 match program.eval(id, embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
-                    ExprValue::Bool(false) => continue 'rows,
+                    // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                    // Issue #921）。
+                    ExprValue::Bool(false) | ExprValue::Null => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
                     // 述語の型を `Bool` に限定済みのため到達しない。
                     _ => {
@@ -777,6 +779,8 @@ pub(crate) fn execute_scan_with_budget(
                             };
                             match program.eval(id, embedding_for_eval, &mut expr_scratch)? {
                                 ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                                // 対象ビヘイビア: SQL-26（Issue #921）。
+                                ExprValue::Null => cells.push(Cell::Null),
                                 ExprValue::Vector(v) => {
                                     // codex-review P1 指摘対応: `Computed` 列のベクトル
                                     // 結果も `VECTOR` 列直接投影と同じ累計予算

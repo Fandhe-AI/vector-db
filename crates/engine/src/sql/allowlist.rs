@@ -16,7 +16,8 @@ use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::udf_call::{
-    BinOp, Expr, MAX_CALL_ARGS, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
+    BinOp, Expr, MAX_CALL_ARGS, MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH,
+    MAX_EXPR_NODES, MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
 
@@ -458,6 +459,12 @@ pub enum SqlSurfaceError {
     /// Issue #907。[`crate::catalog::CatalogError::InvalidForeignKey`] の写像。
     /// ERR-6: `42830`）。`detail` はカタログ情報（列名・テーブル名）のみ。
     InvalidForeignKey { detail: String },
+    /// 式の型不一致（`CASE`/`COALESCE`/`NULLIF`。対象ビヘイビア: SQL-26、
+    /// Issue #921）: `CASE WHEN` の条件が Bool でない、`CASE`/`COALESCE` の
+    /// 各枝の型が食い違う、`NULLIF` の引数が非 Scalar。既存の `bind_binary`／
+    /// `bind_call` の型不一致（`22000`。SQL-9 の既存契約）とは独立した分類。
+    /// ERR-6 拡張: `42804`。
+    DatatypeMismatch { detail: String },
 }
 
 impl SqlSurfaceError {
@@ -669,6 +676,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::CheckViolation { .. } => ErrorClass::CheckViolation,
             SqlSurfaceError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             SqlSurfaceError::InvalidForeignKey { .. } => ErrorClass::InvalidForeignKey,
+            SqlSurfaceError::DatatypeMismatch { .. } => ErrorClass::DatatypeMismatch,
         }
     }
 
@@ -802,6 +810,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::InvalidForeignKey { detail } => {
                 write!(f, "invalid foreign key declaration: {detail}")
+            }
+            SqlSurfaceError::DatatypeMismatch { detail } => {
+                write!(f, "datatype mismatch: {detail}")
             }
         }
     }
@@ -1898,6 +1909,11 @@ struct Parser<'a> {
     /// スタック消費も定数に抑える（security.md「不安全な設計｜無制限リソース確保
     /// （DoS）」対応。1 文（`Parser` 1 インスタンス）につき共有）。
     expr_node_budget: usize,
+    /// `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）の現在の
+    /// 入れ子段数。[`enter_case_nesting`]／[`Self::exit_case_nesting`] が
+    /// 対で管理する（構文段の計測。束縛段の独立検査は `udf_call::BindEnv::
+    /// case_nesting` 参照）。
+    case_nesting: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -1906,6 +1922,7 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             expr_node_budget: MAX_EXPR_NODES,
+            case_nesting: 0,
         }
     }
 
@@ -2084,9 +2101,19 @@ impl<'a> Parser<'a> {
     fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
         if let Some(Token::Ident(name)) = self.peek() {
             let name = name.clone();
-            if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
-                self.advance();
-                let expr = self.parse_call_expr(name, 0)?;
+            // `CASE`／`NULL`（対象ビヘイビア: SQL-26。Issue #921）は `ident '('`
+            // 形ではなく頂点に来るため、既存の「次が `'('` か」判定に加えて
+            // 大小無視で照合する。
+            let starts_case_or_null =
+                name.eq_ignore_ascii_case("CASE") || name.eq_ignore_ascii_case("NULL");
+            let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+            if starts_case_or_null || starts_call {
+                let expr = if starts_case_or_null {
+                    self.parse_value_expr(0)?
+                } else {
+                    self.advance();
+                    self.parse_call_expr(name, 0)?
+                };
                 let alias = if self.peek_ident_matches("AS") {
                     self.advance();
                     Some(self.expect_ident()?)
@@ -2591,10 +2618,22 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// `primary := number | ident | ident '(' [expr {',' expr}] ')' | '(' expr ')'`。
+    /// `primary := number | NULL | CASE-expr | ident | ident '(' [expr {',' expr}] ')'
+    /// | '(' expr ')'`。`NULL`／`CASE` は [`lexer::Keyword`] に含めない文脈的
+    /// キーワードとして扱う（対象ビヘイビア: SQL-26。Issue #921。既存の `AS`／
+    /// `WHEN`（`sql::allowlist` 内の他の文脈的キーワード）と同じ判断）。
     fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.check_expr_depth(depth)?;
         match self.peek().cloned() {
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("NULL") => {
+                self.advance();
+                self.consume_expr_node()?;
+                Ok(Expr::Null)
+            }
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CASE") => {
+                self.advance();
+                self.parse_case_expr(depth)
+            }
             Some(Token::Number(n)) => {
                 self.advance();
                 self.consume_expr_node()?;
@@ -2621,6 +2660,127 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// [`Self::case_nesting`] を 1 段進め、[`MAX_CASE_NESTING`] を超えないか検査
+    /// する（`parse_case_expr`／`parse_coalesce_expr`／`parse_nullif_expr` が共有。
+    /// 対象ビヘイビア: SQL-26。Issue #921）。
+    fn enter_case_nesting(&mut self) -> Result<(), SqlSurfaceError> {
+        let next = self.case_nesting.checked_add(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large(
+                "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+            )
+        })?;
+        if next > MAX_CASE_NESTING {
+            return Err(SqlSurfaceError::payload_too_large(
+                "CASE/COALESCE/NULLIF nesting exceeds the allowed depth",
+            ));
+        }
+        self.case_nesting = next;
+        Ok(())
+    }
+
+    fn exit_case_nesting(&mut self) {
+        self.case_nesting = self.case_nesting.saturating_sub(1);
+    }
+
+    /// 検索形 `CASE WHEN <lhs> <cmp> <rhs> THEN <value_expr> {WHEN ...}
+    /// [ELSE <value_expr>] END` を解析する（対象ビヘイビア: SQL-26）。呼び出し元は
+    /// `CASE` トークンを消費済み。単純 CASE（`CASE x WHEN v ...`）・WHEN 条件中の
+    /// `AND`/`OR`/`IS NULL` 等の論理演算は本 Issue の対象外として `42601` で拒否
+    /// する（`cond` は常に `<value_expr> <cmp_op> <value_expr>` のみを受理する）。
+    fn parse_case_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.check_expr_depth(depth)?;
+        self.enter_case_nesting()?;
+        let result = self.parse_case_expr_inner(depth);
+        self.exit_case_nesting();
+        result
+    }
+
+    fn parse_case_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        // 直後が `WHEN` でなければ単純 CASE 形（`CASE x WHEN v ...`）であり、
+        // 本 Issue の対象外として拒否する（`42601`）。
+        self.expect_ident_matching("WHEN")?;
+        let mut whens = Vec::new();
+        loop {
+            let lhs = self.parse_value_expr(depth + 1)?;
+            let op = self.expect_cmp_op()?;
+            let rhs = self.parse_value_expr(depth + 1)?;
+            let cond = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+            self.expect_ident_matching("THEN")?;
+            let result = self.parse_value_expr(depth + 1)?;
+            whens.push((cond, result));
+            if whens.len() > MAX_CASE_BRANCHES {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "CASE has too many WHEN branches",
+                ));
+            }
+            if self.peek_ident_matches("WHEN") {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let else_result = if self.peek_ident_matches("ELSE") {
+            self.advance();
+            Some(Box::new(self.parse_value_expr(depth + 1)?))
+        } else {
+            None
+        };
+        self.expect_ident_matching("END")?;
+        self.consume_expr_node()?;
+        Ok(Expr::Case { whens, else_result })
+    }
+
+    /// `COALESCE '(' <value_expr> {',' <value_expr>} ')'`（対象ビヘイビア:
+    /// SQL-26）。呼び出し元は関数名を消費済みで、次のトークンが `'('` である
+    /// 前提。0 引数（`COALESCE()`）は最初の引数の構文解析が失敗する形で自然に
+    /// `42601` へ落ちる。
+    fn parse_coalesce_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.enter_case_nesting()?;
+        let result = self.parse_coalesce_expr_inner(depth);
+        self.exit_case_nesting();
+        result
+    }
+
+    fn parse_coalesce_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let mut args = vec![self.parse_value_expr(depth + 1)?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if args.len() >= MAX_CALL_ARGS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many call arguments",
+                ));
+            }
+            args.push(self.parse_value_expr(depth + 1)?);
+        }
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::Coalesce(args))
+    }
+
+    /// `NULLIF '(' <value_expr> ',' <value_expr> ')'`（対象ビヘイビア: SQL-26）。
+    /// 引数がちょうど 2 個であることを構造上強制する（過不足は `42601`）。
+    fn parse_nullif_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.enter_case_nesting()?;
+        let result = self.parse_nullif_expr_inner(depth);
+        self.exit_case_nesting();
+        result
+    }
+
+    fn parse_nullif_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let lhs = self.parse_value_expr(depth + 1)?;
+        self.expect_punct(',')?;
+        let rhs = self.parse_value_expr(depth + 1)?;
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::NullIf(Box::new(lhs), Box::new(rhs)))
+    }
+
     /// 関数呼び出し式 `<name> '(' [expr {',' expr}] ')'` を解析する。呼び出し元は
     /// 直前に `name` を消費済みで、次のトークンが `'('` である前提（`peek` 済み）。
     ///
@@ -2631,6 +2791,17 @@ impl<'a> Parser<'a> {
     /// WHERE 式述語・`CREATE FUNCTION` 本体・集計引数のネスト呼び出し）での出現であり、
     /// いずれも許可形状外（`GROUP BY` を持たない集計のみを SQL-13 の受理形とする）。
     fn parse_call_expr(&mut self, name: String, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        // `COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は遅延評価の
+        // 意味論を持つ専用 AST ノードのため、通常の `Expr::Call`（引数を先に
+        // 評価する関数呼び出し）とは別に、名前を大小無視で照合して専用の構文へ
+        // 振り分ける（`udf_call::Expr::Call` で兼用しない理由は `udf_call.rs`
+        // モジュール doc 参照）。
+        if name.eq_ignore_ascii_case("coalesce") {
+            return self.parse_coalesce_expr(depth);
+        }
+        if name.eq_ignore_ascii_case("nullif") {
+            return self.parse_nullif_expr(depth);
+        }
         if is_aggregate_function_name(&name) {
             return Err(SqlSurfaceError::unsupported(format!(
                 "aggregate function {name} is only allowed as a top-level SELECT item"
@@ -10156,5 +10327,156 @@ mod tests {
         let v = parse_create_table_ok(&sql);
         assert_eq!(v.columns.len(), MAX_CREATE_TABLE_COLUMNS);
         assert_eq!(v.checks.len(), 2);
+    }
+
+    // --- CASE／COALESCE／NULLIF 構文（対象ビヘイビア: SQL-26。Issue #921） -----
+
+    fn select_expr_items(stmt: &ValidatedStatement) -> Vec<SelectItem> {
+        match &stmt.projection {
+            Projection::Items(items) => items.clone(),
+            other => panic!("expected Projection::Items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_search_case_expr_as_select_item() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE WHEN id > 1 THEN 1 ELSE 0 END AS c FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("CASE select item should be accepted");
+        let items = select_expr_items(&stmt);
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            SelectItem::Expr { expr, alias } => {
+                assert_eq!(alias.as_deref(), Some("c"));
+                assert!(matches!(expr, Expr::Case { .. }));
+            }
+            other => panic!("expected SelectItem::Expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_coalesce_and_nullif_as_select_items() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT COALESCE(id, 0), NULLIF(id, 2) FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("COALESCE/NULLIF select items should be accepted");
+        let items = select_expr_items(&stmt);
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            &items[0],
+            SelectItem::Expr {
+                expr: Expr::Coalesce(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &items[1],
+            SelectItem::Expr {
+                expr: Expr::NullIf(..),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn where_case_expr_falls_back_to_expression_predicate() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT id FROM documents WHERE CASE WHEN id > 1 THEN 1 ELSE 0 END = 1 \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("WHERE with CASE lhs should fall back to the expression predicate");
+        assert_eq!(stmt.where_predicates.len(), 1);
+        match &stmt.where_predicates[0] {
+            WherePredicate::Expression(Expr::Binary { lhs, op, .. }) => {
+                assert_eq!(*op, BinOp::Eq);
+                assert!(matches!(**lhs, Expr::Case { .. }));
+            }
+            other => {
+                panic!("expected WherePredicate::Expression(Binary(Case, ...)), got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_simple_case_form() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT CASE id WHEN 1 THEN 2 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_logical_operator_inside_when_condition() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT CASE WHEN id > 1 AND id < 5 THEN 1 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_coalesce_with_zero_arguments() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT COALESCE() FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_nullif_with_three_arguments() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT NULLIF(id, 1, 2) FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_case_exceeding_max_branches() {
+        let lookup = catalog_with(&["documents"]);
+        let whens: String = (0..=MAX_CASE_BRANCHES)
+            .map(|i| format!("WHEN id > {i} THEN {i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sql = format!(
+            "SELECT CASE {whens} ELSE 0 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+        );
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn rejects_case_coalesce_nullif_nesting_beyond_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let mut expr = "0".to_string();
+        for _ in 0..=MAX_CASE_NESTING {
+            expr = format!("COALESCE({expr}, 1)");
+        }
+        let sql =
+            format!("SELECT {expr} FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10");
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 }

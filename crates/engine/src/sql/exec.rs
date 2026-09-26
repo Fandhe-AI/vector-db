@@ -825,7 +825,11 @@ pub(crate) fn execute_statement_with_cache(
                     .map_err(expr_eval_error_to_arena)?
                 {
                     udf_call::ExprValue::Bool(true) => {}
-                    udf_call::ExprValue::Bool(false) => return Ok(false),
+                    // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                    // Issue #921）。
+                    udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => {
+                        return Ok(false)
+                    }
                     // 束縛段（`sql::parser::bind_in_session`）が `WHERE` 式述語の型を
                     // `Bool` に限定済みのため到達しない（`ExprType::Bool` 検査参照）。
                     _ => {
@@ -1999,7 +2003,9 @@ pub(crate) fn execute_statement_with_cache(
                 for program in &bound.expr_filter_programs {
                     match program.eval(row_id, embedding, &mut expr_scratch)? {
                         udf_call::ExprValue::Bool(true) => {}
-                        udf_call::ExprValue::Bool(false) => {
+                        // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア:
+                        // SQL-26。Issue #921）。
+                        udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => {
                             expr_ok = false;
                             break;
                         }
@@ -2917,6 +2923,8 @@ fn project_rows(
                         })?;
                     match program.eval(id, embedding, &mut expr_scratch)? {
                         udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                        // 対象ビヘイビア: SQL-26（Issue #921）。
+                        udf_call::ExprValue::Null => cells.push(Cell::Null),
                         udf_call::ExprValue::Vector(v) => {
                             // Issue #352: `VectorRef` 単体評価は行データを借用する
                             // だけになった（確保ゼロ）ため、応答行として行データより
@@ -3548,7 +3556,9 @@ pub(crate) fn execute_predicate_delete(
             };
             match program.eval(candidate.id, embedding, &mut scratch)? {
                 udf_call::ExprValue::Bool(true) => {}
-                udf_call::ExprValue::Bool(false) => return Ok(false),
+                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                // Issue #921）。
+                udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => return Ok(false),
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",
@@ -3654,7 +3664,9 @@ pub(crate) fn execute_predicate_update(
             };
             match program.eval(candidate.id, embedding, &mut scratch)? {
                 udf_call::ExprValue::Bool(true) => {}
-                udf_call::ExprValue::Bool(false) => return Ok(false),
+                // NULL（UNKNOWN）は非該当として扱う（対象ビヘイビア: SQL-26。
+                // Issue #921）。
+                udf_call::ExprValue::Bool(false) | udf_call::ExprValue::Null => return Ok(false),
                 _ => {
                     return Err(SqlSurfaceError::invalid_input(
                         "WHERE expression did not evaluate to a boolean",

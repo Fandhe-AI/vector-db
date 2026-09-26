@@ -223,7 +223,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 33] = [
+const EXPECTED_STATUS: [(&str, u16); 34] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -275,6 +275,9 @@ const EXPECTED_STATUS: [(&str, u16); 33] = [
     // SQL 表層専用の DDL の分類で 400。
     ("23503", 409),
     ("42830", 400),
+    // `CASE`/`COALESCE`/`NULLIF` の型不一致（`42804`。SQL-26・Issue #921）は
+    // SQL 表層専用の式レーンの分類で 400。
+    ("42804", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -333,7 +336,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 34);
+const _: () = assert!(ErrorClass::ALL.len() == 35);
 
 /// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
@@ -772,6 +775,10 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `ForeignKeyViolation`（`23503`）は宣言済みテーブルへの書き込み op から
         // 到達可能なため含めない（`err4_f_foreign_key_violation_reachable_via_*`）。
         ErrorClass::InvalidForeignKey,
+        // `DatatypeMismatch`（`42804`。SQL-26・Issue #921）は `CASE`/`COALESCE`/
+        // `NULLIF` の型不一致。NoSQL 表層には式レーンの入口（`plan`/`filter`）に
+        // これらの構文が無いため到達不能。
+        ErrorClass::DatatypeMismatch,
     ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());
