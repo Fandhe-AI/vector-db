@@ -289,6 +289,27 @@ pub fn check_having_predicate_count(count: usize) -> Result<(), SqlSurfaceError>
     Ok(())
 }
 
+/// `GROUP BY` 句が持てるグループキー列数の上限（TASK-167・SQL-25 (d) の実装既定値）。
+/// [`check_group_by_column_count`] が確保前検査に使う（`.claude/rules/security.md`
+/// 「不安全な設計｜無制限リソース確保（DoS）」対応）。
+///
+/// `pub`（TASK-186 と同じ設計判断）: `wire-server::http::query::aggregate` が
+/// NoSQL 表層の `group_by` 配列形（NOSQL-16 (b)）を写像する前に、SQL 表層と同じ
+/// 上限を検査するために参照できるようにする。
+pub const MAX_GROUP_BY_COLUMNS: usize = 8;
+
+/// `count` 件の `GROUP BY` 列が [`MAX_GROUP_BY_COLUMNS`] を超えないことを検証する
+/// （`54000`）。[`Parser::parse_group_by_clause`] が列を `push` する**前**に呼ぶ
+/// （[`check_having_predicate_count`] と同じ「確保前検査」の設計判断）。
+pub fn check_group_by_column_count(count: usize) -> Result<(), SqlSurfaceError> {
+    if count > MAX_GROUP_BY_COLUMNS {
+        return Err(SqlSurfaceError::payload_too_large(format!(
+            "GROUP BY column count {count} exceeds limit {MAX_GROUP_BY_COLUMNS}"
+        )));
+    }
+    Ok(())
+}
+
 /// `USING PLAN('<query>')`（TASK-77・SQL-5）に渡せる自然言語クエリ本文のバイト長
 /// 上限。アロケーション（字句解析・LLM プロンプトへの組み込み）に入る前に拒否する
 /// （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」対応）。
@@ -1365,12 +1386,13 @@ pub struct AggregateOrderBy {
     pub(crate) descending: bool,
 }
 
-/// `GROUP BY <column> [HAVING ...] [ORDER BY ...] [LIMIT ...]`（TASK-167・SQL-14）の
-/// 許可形状。`column` はカタログ照会前の識別子のまま保持し（`TEXT` 列限定等の
+/// `GROUP BY <column> (',' <column>)* [HAVING ...] [ORDER BY ...] [LIMIT ...]`
+/// （TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張）の許可形状。`columns` は宣言順
+/// を保持したカタログ照会前の識別子のまま保持し（`TEXT` 列限定・重複検査済み等の
 /// 意味論的検査は束縛段）、`having`/`order_by`/`limit` はいずれも省略可能。
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupByClause {
-    pub(crate) column: String,
+    pub(crate) columns: Vec<String>,
     pub(crate) having: Vec<HavingPredicate>,
     pub(crate) order_by: Option<AggregateOrderBy>,
     pub(crate) limit: Option<u32>,
@@ -2283,14 +2305,33 @@ impl<'a> Parser<'a> {
         Ok(AggregateSelectItem::GroupKey { column, alias })
     }
 
-    /// `GROUP BY <column>`（TASK-167・SQL-14）。`GROUP BY` は単一の裸識別子のみ
-    /// 受理する（式・関数・複数列・位置番号はいずれも `expect_ident`／後続の
-    /// `expect_end_of_statement` 系の失敗で `42601`）。`GROUP` は予約語化せず
+    /// `GROUP BY <column> (',' <column>)*`（TASK-167・SQL-14。SQL-25 (d) で複数列へ
+    /// 拡張）。裸識別子のカンマ区切り列のみ受理する（式・関数・位置番号・`$n` は
+    /// いずれも `expect_ident` の失敗で `42601`）。`GROUP` は予約語化せず
     /// [`Parser::expect_contextual_keyword`] で文脈的に照合する（PR #189 の方針）。
-    fn parse_group_by_clause(&mut self) -> Result<String, SqlSurfaceError> {
+    /// 列数は [`check_group_by_column_count`] で `push` 前に検査し（`54000`。
+    /// [`Parser::parse_having`] と同じ「確保前検査」）、重複する列名は `42601` で
+    /// 拒否する（spec に規定が無いため fail-closed に倒す）。
+    fn parse_group_by_clause(&mut self) -> Result<Vec<String>, SqlSurfaceError> {
         self.expect_contextual_keyword("GROUP")?;
         self.expect_keyword(Keyword::By)?;
-        self.expect_ident()
+        let mut columns = Vec::new();
+        loop {
+            let column = self.expect_ident()?;
+            if columns.contains(&column) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "duplicate GROUP BY column {column:?}"
+                )));
+            }
+            check_group_by_column_count(columns.len() + 1)?;
+            columns.push(column);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(columns)
     }
 
     /// `HAVING <having_pred> [AND <having_pred>]*`（TASK-167・SQL-14）。
@@ -4760,15 +4801,16 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
     let has_group_by =
         matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"));
     let group_by = if has_group_by {
-        let column = p.parse_group_by_clause()?;
-        // SELECT リストの `GroupKey` 項目は `GROUP BY` 列と同名でなければならない
-        // （§計画 3.1）。不一致・`GROUP BY` 句を持たない `GroupKey` 項目（下の
-        // `else` 分岐）はいずれも許可リスト外として `42601` に落とす。
+        let columns = p.parse_group_by_clause()?;
+        // SELECT リストの `GroupKey` 項目は、いずれかの `GROUP BY` 列と同名で
+        // なければならない（§計画 3.1）。不一致・`GROUP BY` 句を持たない
+        // `GroupKey` 項目（下の `else` 分岐）はいずれも許可リスト外として
+        // `42601` に落とす。
         for item in &items {
             if let AggregateSelectItem::GroupKey { column: c, .. } = item {
-                if c != &column {
+                if !columns.contains(c) {
                     return Err(SqlSurfaceError::unsupported(format!(
-                        "SELECT list bare identifier {c:?} does not match GROUP BY column {column:?}"
+                        "SELECT list bare identifier {c:?} does not match any GROUP BY column {columns:?}"
                     )));
                 }
             }
@@ -4795,7 +4837,7 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
             (None, 0)
         };
         Some(GroupByClause {
-            column,
+            columns,
             having,
             order_by,
             limit,
@@ -4881,7 +4923,7 @@ fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSur
         }],
         where_predicates,
         group_by: Some(GroupByClause {
-            column,
+            columns: vec![column],
             having: Vec::new(),
             order_by,
             limit,
@@ -9029,7 +9071,7 @@ mod tests {
             &lookup,
         );
         let group_by = agg.group_by().expect("GROUP BY clause must be accepted");
-        assert_eq!(group_by.column, "lang");
+        assert_eq!(group_by.columns, vec!["lang".to_string()]);
         assert_eq!(group_by.having.len(), 1);
         assert_eq!(group_by.having[0].item_name, "n");
         assert_eq!(group_by.having[0].literal, 1.0);
@@ -9091,14 +9133,72 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_group_by_columns() {
+    fn accepts_multiple_group_by_columns_at_syntax_layer() {
+        // SQL-25 (d): 複数列 `GROUP BY` は構文層を通過する（列数上限・重複検査は
+        // 別テストで確認する）。`id` 列は非 TEXT のため束縛段（`sql::parser`）で
+        // `22000` になるが、それは構文層の関知するところではない
+        // （`bind_group_by_column_type_mismatch_is_rejected` 相当。本モジュールは
+        // 構造の受理までを担う）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql(
+        let statement = validate_sql(
             "SELECT lang, COUNT(*) FROM documents GROUP BY lang, id",
             &lookup,
         )
-        .expect_err("multi-column GROUP BY must be rejected");
+        .expect("multi-column GROUP BY must be accepted at the syntax layer");
+        let Statement::Aggregate(aggregate) = statement else {
+            panic!("expected Aggregate statement");
+        };
+        assert_eq!(
+            aggregate.group_by().expect("GROUP BY clause").columns,
+            vec!["lang".to_string(), "id".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_group_by_columns() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang, lang",
+            &lookup,
+        )
+        .expect_err("duplicate GROUP BY column must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn accepts_group_by_column_count_at_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let columns: Vec<String> = (0..MAX_GROUP_BY_COLUMNS).map(|i| format!("c{i}")).collect();
+        let sql = format!(
+            "SELECT {}, COUNT(*) FROM documents GROUP BY {}",
+            columns[0],
+            columns.join(", ")
+        );
+        let statement =
+            validate_sql(&sql, &lookup).expect("GROUP BY column count at limit must be accepted");
+        let Statement::Aggregate(aggregate) = statement else {
+            panic!("expected Aggregate statement");
+        };
+        assert_eq!(
+            aggregate.group_by().expect("GROUP BY clause").columns.len(),
+            MAX_GROUP_BY_COLUMNS
+        );
+    }
+
+    #[test]
+    fn rejects_group_by_column_count_over_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let columns: Vec<String> = (0..=MAX_GROUP_BY_COLUMNS)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let sql = format!(
+            "SELECT {}, COUNT(*) FROM documents GROUP BY {}",
+            columns[0],
+            columns.join(", ")
+        );
+        let err = validate_sql(&sql, &lookup)
+            .expect_err("GROUP BY column count over limit must be rejected");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]
@@ -9301,7 +9401,9 @@ mod tests {
         match statement {
             Statement::Aggregate(agg) => {
                 assert_eq!(
-                    agg.group_by.as_ref().map(|g| g.column.as_str()),
+                    agg.group_by
+                        .as_ref()
+                        .and_then(|g| g.columns.first().map(String::as_str)),
                     Some("distinct")
                 );
             }
@@ -9323,7 +9425,12 @@ mod tests {
             .expect("SELECT DISTINCT <column named 'as'> must be accepted");
         match statement {
             Statement::Aggregate(agg) => {
-                assert_eq!(agg.group_by.as_ref().map(|g| g.column.as_str()), Some("as"));
+                assert_eq!(
+                    agg.group_by
+                        .as_ref()
+                        .and_then(|g| g.columns.first().map(String::as_str)),
+                    Some("as")
+                );
             }
             other => panic!("expected Aggregate statement, got {other:?}"),
         }
@@ -9354,7 +9461,12 @@ mod tests {
             .expect("SELECT DISTINCT <column named 'as'> AS <alias> must be accepted");
         match statement {
             Statement::Aggregate(agg) => {
-                assert_eq!(agg.group_by.as_ref().map(|g| g.column.as_str()), Some("as"));
+                assert_eq!(
+                    agg.group_by
+                        .as_ref()
+                        .and_then(|g| g.columns.first().map(String::as_str)),
+                    Some("as")
+                );
                 match agg.items.as_slice() {
                     [AggregateSelectItem::GroupKey { column, alias }] => {
                         assert_eq!(column, "as");

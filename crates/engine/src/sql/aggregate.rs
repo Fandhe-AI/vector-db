@@ -233,15 +233,16 @@ pub(crate) struct ReferencedColumns {
 
 impl ReferencedColumns {
     /// `items`・`metadata_filters`・`expr_filters` に加え、`GROUP BY` キー列
-    /// （`extra_scalar_index`。`GROUP BY` なしの単一行集計では `None`）から
-    /// 参照列集合を導出する。
+    /// （`extra_scalar_indices`。SQL-25 (d) で複数列 `GROUP BY` に対応するため
+    /// `Option<usize>` からスライスへ拡張した。`GROUP BY` なしの単一行集計では
+    /// 空スライス）から参照列集合を導出する。
     pub(crate) fn derive(
         schema: &TableSchema,
         items: &[crate::sql::parser::BoundAggregateItem],
         metadata_filters: &[declarative_filter::MetadataFilter],
         expr_filters: &[BoundExpr],
         or_filters: &[crate::sql::where_tree::BoundOrGroup],
-        extra_scalar_index: Option<usize>,
+        extra_scalar_indices: &[usize],
     ) -> Self {
         let mut scalar_mask = vec![false; schema.columns.len()];
         let mut needs_embedding = false;
@@ -296,8 +297,10 @@ impl ReferencedColumns {
                 needs_embedding = true;
             }
         }
-        if let Some(index) = extra_scalar_index {
+        if !extra_scalar_indices.is_empty() {
             has_scalar_reference = true;
+        }
+        for &index in extra_scalar_indices {
             if let Some(slot) = scalar_mask.get_mut(index) {
                 *slot = true;
             }
@@ -1825,7 +1828,7 @@ pub(crate) fn execute_aggregate_with_cache(
         &bound.metadata_filters,
         &bound.expr_filters,
         &bound.or_filters,
-        None,
+        &[],
     );
     let tier = select_decode_tier(
         &referenced,
@@ -3882,7 +3885,7 @@ mod tests {
                 name: "result".to_string(),
                 distinct: false,
             }];
-            let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], None);
+            let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
             assert!(
                 !referenced.needs_embedding(),
                 "COUNT({label}) must not require embedding decode"
@@ -3923,7 +3926,7 @@ mod tests {
             name: "result".to_string(),
             distinct: false,
         }];
-        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], None);
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
         assert_eq!(select_decode_tier(&referenced, false), DecodeTier::Fast);
     }
 
@@ -3938,7 +3941,7 @@ mod tests {
             name: "result".to_string(),
             distinct: false,
         }];
-        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], None);
+        let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
         assert!(!referenced.needs_embedding());
         assert_eq!(
             select_decode_tier(&referenced, false),
