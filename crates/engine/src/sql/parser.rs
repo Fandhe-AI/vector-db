@@ -1286,8 +1286,12 @@ fn bind_where_predicates_recursive(
                 filter_skip_enum_validation.push(false);
             }
             WherePredicate::Prefix { column, pattern } => {
-                let prefix = declarative_filter::parse_prefix_pattern(pattern)?;
-                declarative_filters.push(DeclarativeFilter::starts_with(column.clone(), prefix));
+                // SQL-24／TASK-208、Issue #914: `WherePredicate::Prefix`
+                // （名前は互換性のため据え置き）は LIKE の生パターン全般を
+                // 保持する。意味論・振り分け（Equals／StartsWith／Like）は
+                // `declarative_filter::DeclarativeFilter::like`（内部で
+                // `parse_like_pattern` を呼ぶ）に委ねる。
+                declarative_filters.push(DeclarativeFilter::like(column.clone(), pattern.clone()));
                 // `LIKE` パターン右辺には `$n` を束縛できない（`sql::params`
                 // モジュールドキュメント。パターン 4 は `Ident '=' $n` のみ）ため
                 // 常に「実値」として扱う。

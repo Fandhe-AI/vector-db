@@ -893,16 +893,22 @@ pub enum OrderByForm {
 /// `<expr> <cmp> <expr>`。式の意味論検証は `sql::parser::bind_in_session` の責務）。
 ///
 /// **TASK-147（EXT-3）で追加した破壊的変更（BREAKING CHANGE）**: `Prefix` variant
-/// を追加した（`<col> LIKE '<prefix>%'` の前方一致条件。網羅的 `match` を持つ
-/// 外部コードは要対応）。パターン文字列は無加工で保持し、意味論的な検証
-/// （末尾 `%` のみ許可・空 prefix 拒否等）は `declarative_filter::parse_prefix_pattern`
-/// （`sql::parser::bind_in_session` から呼ばれる）の責務とする。
+/// を追加した（`<col> LIKE '<pattern>'` の LIKE 条件。網羅的 `match` を持つ
+/// 外部コードは要対応）。パターン文字列は無加工で保持し、意味論的な検証・
+/// 振り分け（等価・前方一致・SQL-24・TASK-208・Issue #914 で追加した中間一致・
+/// 後方一致・`_` を含む一般形）は `declarative_filter::DeclarativeFilter::like`
+/// （内部で `parse_like_pattern` を呼ぶ。`sql::parser::bind_in_session` から
+/// 呼ばれる）の責務とする。`ESCAPE` 句は本構文層で受理しない（後続トークンが
+/// 境界と一致せず `42601` になる）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WherePredicate {
     /// 列と文字列リテラルの等価条件（TASK-75: リテラル値を保持する）。
     Equality { column: String, value: String },
-    /// 前方一致条件（TASK-147・EXT-3）。`LIKE` は [`Keyword`] へ追加せず、TASK-80 と
-    /// 同じ「`Token::Ident` をパーサー位置でのみ文脈照合」方式にして `like` という
+    /// `LIKE` 条件（TASK-147・EXT-3。SQL-24・TASK-208・Issue #914 で前方一致
+    /// 限定から中間一致・後方一致・`_` を含む一般形へ拡張）。`pattern` は
+    /// 生パターン（無加工）を保持する。名前は互換性のため `Prefix` のまま
+    /// 据え置く。`LIKE` は [`Keyword`] へ追加せず、TASK-80 と同じ
+    /// 「`Token::Ident` をパーサー位置でのみ文脈照合」方式にして `like` という
     /// 列名を壊さない（[`Parser::parse_where`] 参照）。
     Prefix { column: String, pattern: String },
     /// 許可された名前の述語呼び出し形（空引数）。
@@ -4119,9 +4125,11 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         WherePredicate::Equality { column, value } => {
             format!("{column} = '{}'", escape_string_literal(value))
         }
-        // `pattern` は末尾の `%` を含む文字列リテラルの生値をそのまま保持する
-        // （`Parser::parse_where` の LIKE 分岐参照。呼び出し元が既に `%` 込みで
-        // 検証済みのため、ここで追加の `%` を付与しない）。
+        // `pattern` は LIKE の生パターン全般（SQL-24・TASK-208、Issue #914 で
+        // 前方一致限定から拡張）をそのまま無加工で保持する（`Parser::
+        // parse_where` の LIKE 分岐参照）。意味論的な検証・振り分けは
+        // `declarative_filter::DeclarativeFilter::like` の責務で、ここでは
+        // 追加のワイルドカードを付与しない。
         WherePredicate::Prefix { column, pattern } => {
             format!("{column} LIKE '{}'", escape_string_literal(pattern))
         }

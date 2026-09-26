@@ -185,6 +185,20 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     }) {
         return ScalarPlan::PlainScan;
     }
+    // `LIKE` の一般形（中間一致・後方一致・`_`。SQL-24／TASK-208、Issue #914）は
+    // 二次索引が対応しない（`sql::scalar_index::ScalarIndex::candidates_for` が
+    // `None` を返す）。純粋な前方一致・完全一致は束縛時に `StartsWith`／
+    // `Equals` へ既に振り分け済みのため、ここへ到達する `Like` は必ず
+    // 一般形——`BoolEquals`／`TypedCompare(Bytes)` と同じ理由で、複合述語に
+    // 紛れて誤って索引被覆済みと判定されるのを防ぐ単一情報源として先頭で
+    // plain scan へ倒す。
+    if input
+        .metadata_filters
+        .iter()
+        .any(|f| matches!(f.op(), crate::declarative_filter::FilterOp::Like(_)))
+    {
+        return ScalarPlan::PlainScan;
+    }
     let mut id_predicate_count = 0usize;
     for expr in input.expr_filters {
         if id_predicate_from_expr(expr).is_none() {
@@ -221,6 +235,13 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
             // 現れない契約だが網羅性のため plain scan へ倒す（fail-closed
             // の保険腕）。
             crate::declarative_filter::FilterOp::Compare { .. } => ScalarPlan::PlainScan,
+            // `Like` は上の事前判定で既に `PlainScan` を返し済みのため
+            // ここへは到達しないが、網羅性のため保険腕として同じ結果を返す
+            // （SQL-24／TASK-208、Issue #914）。`LikeUnbound`（未束縛）は
+            // `bind` 済み `MetadataFilter` には現れない契約（`Compare` と同じ
+            // fail-closed の保険腕）。
+            crate::declarative_filter::FilterOp::Like(_)
+            | crate::declarative_filter::FilterOp::LikeUnbound(_) => ScalarPlan::PlainScan,
         }
     }
 }
@@ -375,6 +396,23 @@ mod tests {
         bound.into_iter().next().expect("one filter")
     }
 
+    /// SQL-24・TASK-208、Issue #914: `LIKE` の一般形（中間一致・後方一致・`_`）
+    /// 述語。純粋な前方一致・完全一致は `bind` 時に `StartsWith`／`Equals` へ
+    /// 振り分けられるため、`FilterOp::Like` を得るには `%` を中間・先頭に
+    /// 置くか `_` を含める必要がある。
+    fn like_filter(column_index: usize) -> MetadataFilter {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::like(
+                schema.columns[column_index].name.clone(),
+                "%mid%".to_string(),
+            )],
+            &schema,
+        )
+        .expect("bind like filter");
+        bound.into_iter().next().expect("one filter")
+    }
+
     fn typed_compare_filter(column_index: usize) -> MetadataFilter {
         let schema = test_schema();
         let bound = crate::declarative_filter::bind_all(
@@ -463,6 +501,54 @@ mod tests {
     /// しないため。`mask_trusted_defer`／`count_star_only`／
     /// `observe_group_count_only` が BOOLEAN 述語を「索引で完全被覆済み」と
     /// 誤って信頼しないことの単一情報源での固定）。
+    /// SQL-24・TASK-208、Issue #914: `LIKE` の一般形は単独でも索引を使わず
+    /// `PlainScan` に分類される（`sql::scalar_index::ScalarIndex::
+    /// candidates_for` が対応しないため。索引の有無で結果が変わらない
+    /// 契約を守る単一情報源での固定）。
+    #[test]
+    fn plain_scan_for_single_like_predicate() {
+        let filters = vec![like_filter(1)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    #[test]
+    fn plain_scan_when_like_predicate_mixed_with_text_equality() {
+        let filters = vec![eq_filter(1), like_filter(2)];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    /// 純粋な前方一致（末尾 `%` のみ）は `bind` 時に `StartsWith` へ振り分け
+    /// られ、従来どおり `IndexPrefix` を維持する（索引縮退の対象外）。
+    #[test]
+    fn index_prefix_kept_for_pure_prefix_like_pattern() {
+        let schema = test_schema();
+        let bound = crate::declarative_filter::bind_all(
+            &[DeclarativeFilter::like(
+                schema.columns[1].name.clone(),
+                "src/%".to_string(),
+            )],
+            &schema,
+        )
+        .expect("bind like filter");
+        let filters = bound;
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexPrefix);
+    }
+
     #[test]
     fn plain_scan_for_single_bool_predicate() {
         let filters = vec![bool_filter(3, true)];

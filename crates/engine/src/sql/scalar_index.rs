@@ -1260,6 +1260,16 @@ impl ScalarIndex {
             // （フィルタ事前/事後適用）へフォールバックする（fail-closed。
             // 索引未対応が誤って「一致 0 件」に化けない）。
             FilterOp::Compare { .. } => return None,
+            // `LIKE` の一般形（中間一致・後方一致・`_`。SQL-24／TASK-208、
+            // Issue #914）は二次索引が対応しない（`OrderedColumnIndex`／
+            // `column.equality`・`prefix_slots` のいずれの表現にも一般形の
+            // 照会手段が無い）。`None` を返し、呼び出し元
+            // （`sql::exec::resolve_candidates`）を全行走査へ縮退させる
+            // （fail-closed。索引の有無で結果が変わらない契約を守る）。
+            FilterOp::Like(_) => return None,
+            // 未束縛は `bind` を経た `MetadataFilter` には現れない契約
+            // （`Compare` と同じ網羅性のための保険腕）。
+            FilterOp::LikeUnbound(_) => return None,
         };
         result.sort_unstable();
         Some(result)
@@ -2385,6 +2395,34 @@ mod tests {
         let missing = index.candidates_for(&MetadataFilter_equals(&schema, "kind", "gamma"));
         assert_eq!(missing, Some(Vec::new()));
         let _ = path_col;
+    }
+
+    /// SQL-24・TASK-208、Issue #914: `LIKE` の一般形（中間一致・後方一致・`_`）は
+    /// 二次索引が対応せず `candidates_for` が `None` を返す（「一致 0 件」
+    /// `Some(vec![])` と区別する。呼び出し元は全行走査へ縮退する）。
+    #[test]
+    fn candidates_for_like_general_form_is_none() {
+        let path = unique_db_path("scalar-index-like-not-indexed");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(
+            &storage,
+            &ctx_a,
+            1,
+            Some("alpha"),
+            Some("src/a.rs"),
+            Visibility::Public,
+        );
+
+        let (snapshot, schema) = snapshot_from(&storage, &ctx_a);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+
+        let like_filter = crate::declarative_filter::DeclarativeFilter::like("path", "%a%")
+            .bind(&schema)
+            .expect("bind like filter");
+        assert_eq!(index.candidates_for(&like_filter), None);
     }
 
     #[test]

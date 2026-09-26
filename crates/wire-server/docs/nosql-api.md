@@ -47,10 +47,19 @@ RLS-7・RLS-9・TABLE-12。
 
 ## 転送路の共通規則
 
-`wire-server --users <path> --db <path> --surface nosql [--bind <addr:port>]` で
-起動する。`--users`・`--db` は必須（fail-closed。省略時は起動しない）。`--bind`
-の既定値は `127.0.0.1:5432`。TLS 未構成時は非ループバックアドレスへの bind を
-起動時に拒否する（loopback 限定）。
+`wire-server --users <path> --db <path> --surface nosql [--bind <addr:port>]
+[--tls-cert <pem> --tls-key <pem> [--tls-mode require|allow]]` で起動する。
+`--users`・`--db` は必須（fail-closed。省略時は起動しない）。`--bind` の既定値は
+`127.0.0.1:5432`。TLS 未構成時は非ループバックアドレスへの bind を起動時に
+拒否する（loopback 限定）。
+
+`--tls-cert`／`--tls-key`／`--tls-mode` は SQL 表層（pg wire）と同じ意味で
+NoSQL 表層にも適用される（Issue #968）。HTTP には `SSLRequest` のような明示
+ネゴシエーションが無いため、接続受理直後の先頭バイトで TLS レコード
+（`0x16`）か平文 HTTP かを判定し、TLS と判定した接続だけをハンドシェイクへ
+進める。`--tls-mode require`（既定）の下では平文 HTTP 接続へ要求を解釈せず
+応答なしで切断し、`allow` の下では平文・TLS の双方を受理する。TLS 構成時は
+非ループバックアドレスへの bind が許可される（WIRE-9）。
 
 要求の受理条件（いずれも接続ハンドラ層で判定し、違反はすべて `08P01`）:
 
@@ -635,7 +644,9 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 - 定数のみの `SELECT`
 - `ORDER BY` 形／集計／広域取得への `EXPLAIN` 前置（`USING PLAN` 付き検索
   `SELECT` への `EXPLAIN` のみ受理）
-- `LIKE` の前方一致（`prefix`）以外の一致方式
+- `LIKE` の前方一致（`prefix`）以外の一致方式（SQL 表層は Issue #914・SQL-24 で
+  中間一致・後方一致・`_` を受理するが、NoSQL `filter` 側は未対応のまま。
+  NoSQL 側の対応は NOSQL-14 の担当）
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
 - `GROUP BY` への `ORDER BY`／`LIMIT` の付与
 - `ALTER TABLE ... DROP COLUMN`（SQL 表層が未結線。`alter_table.drop_column` は `0A000`）
