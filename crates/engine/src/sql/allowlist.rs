@@ -5456,7 +5456,11 @@ fn validate_sql_tokens_impl(
                     "WITH does not support an aggregate main query",
                 ));
             }
-            let shape = match parse_select_shape(main_tokens)? {
+            // Issue #927（サブクエリ）との併用は対象外（`docs/design/cte.md`
+            // 対象外節）。`WITH` 主クエリは常に `subquery_ctx: None` で解析し、
+            // 主クエリ内の `IN (SELECT ...)`／`EXISTS (...)` は既存の
+            // `Parser::require_subquery_depth` 経路で一律 `42601` に落とす。
+            let shape = match parse_select_shape(main_tokens, None)? {
                 ParsedSelect::Scan(shape) => shape,
                 ParsedSelect::Search(_) => {
                     return Err(SqlSurfaceError::unsupported(
