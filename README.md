@@ -296,8 +296,9 @@ TLS 有効時は起動ログへ `TLS enabled (mode=require|allow)` の 1 行の�
 先頭バイトで TLS レコード（`0x16`）か平文 HTTP かを判定します。`require`
 の下では平文 HTTP 接続へ要求を解釈せず応答なしで切断し、`allow` の下では
 平文・TLS の双方を受理します。TLS 構成時に同時接続数上限を超えた接続は、
-平文の 503 応答を書かずに切断します（TLS 未確立の接続へ平文バイト列を
-送らないため）。実クライアント（psql・openssl s_client・curl 等）での
+`allow` では平文と判定した接続に限り既存の平文 503 応答を維持し、TLS
+レコードと判定した接続はハンドシェイクをせず無応答で切断します。`require`
+では平文・TLS いずれの接続も要求を解釈せず無応答で切断します。実クライアント（psql・openssl s_client・curl 等）での
 接続試験は Issue #969・#968 の担当です。詳細は
 `docs/design/tls-wire-connection.md` を参照してください。
 

@@ -1091,9 +1091,10 @@ fn run_server(args: &[String]) -> ExitCode {
     match surface {
         wire_server::surface::Surface::Sql => {
             // Issue #967: TLS 有効時は `accept_loop_with_tls_mode` へ切り替える
-            // （`tls_options` は D5 により `Surface::Nosql` と同時に `Some` へは
-            // ならない）。無効時は従来どおり `accept_loop_with_engine` を呼び、
-            // 既存経路とビット同一のまま維持する。
+            // （`Surface::Sql` 分岐。`Surface::Nosql` は Issue #968 で TLS 併用が
+            // 許可されており独自の accept ループへ分岐する。旧 D5 の
+            // 併用拒否は撤廃済み）。無効時は従来どおり `accept_loop_with_engine`
+            // を呼び、既存経路とビット同一のまま維持する。
             match (&tls_config, &tls_options) {
                 (Some(cfg), Some((_, _, mode, _))) => {
                     server::accept_loop_with_tls_mode(
