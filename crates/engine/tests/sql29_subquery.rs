@@ -51,6 +51,11 @@ fn docs_schema(mood_def: Arc<EnumTypeDef>) -> TableSchema {
             // 場合の回帰テスト用。`insert_doc` は指定しないため NULL 許容
             // にする）。
             ColumnDef::new("mood", ColumnType::Enum(mood_def), true),
+            // BOOLEAN 列を対象にした `IN (SELECT ...)`（PR #1103 再々レビュー
+            // codex-review P1 指摘対応: 対象列・内側投影列の型組合せ検証の
+            // 正当な組合せ側〔BOOLEAN↔BOOLEAN〕の回帰テスト用。`insert_doc`
+            // は指定しないため NULL 許容にする）。
+            ColumnDef::new("active", ColumnType::Boolean, true),
         ],
     )
 }
@@ -74,7 +79,13 @@ fn priorities_schema() -> TableSchema {
 fn visits_schema() -> TableSchema {
     TableSchema::new(
         VISITS,
-        vec![ColumnDef::new("note", ColumnType::Text, false)],
+        vec![
+            ColumnDef::new("note", ColumnType::Text, false),
+            // BOOLEAN↔BOOLEAN の正当な組合せ検証用（PR #1103 再々レビュー
+            // codex-review P1 指摘対応）。`insert_visit` は指定しないため
+            // NULL 許容にする。
+            ColumnDef::new("flag", ColumnType::Boolean, true),
+        ],
     )
 }
 
@@ -182,6 +193,36 @@ fn insert_visit(core: &EngineCore, ctx: &PolicyContext, id: u64, note: &str) {
         ),
     )
     .unwrap_or_else(|e| panic!("insert visit id={id} should succeed: {e:?}"));
+}
+
+fn insert_visit_with_flag(core: &EngineCore, ctx: &PolicyContext, id: u64, note: &str, flag: bool) {
+    core.execute_sql_in_session(
+        ctx,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {VISITS} (id, note, flag) VALUES ({id}, '{note}', {flag}) \
+             USING OPERATION_ID 'visit-{id}'"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("insert visit id={id} should succeed: {e:?}"));
+}
+
+fn insert_doc_with_active(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    id: u64,
+    lang: &str,
+    active: bool,
+) {
+    core.execute_sql_in_session(
+        ctx,
+        &mut SessionState::default(),
+        &format!(
+            "INSERT INTO {DOCS} (id, embedding, lang, active) VALUES \
+             ({id}, '[0.{id},0.1]', '{lang}', {active}) USING OPERATION_ID 'doc-{id}'"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("insert doc id={id} should succeed: {e:?}"));
 }
 
 fn seed_docs(core: &EngineCore, ctx: &PolicyContext) {
@@ -538,6 +579,82 @@ fn in_subquery_enum_target_within_vocabulary_matches_independent_oracle() {
         &ctx,
         &format!(
             "SELECT id FROM {DOCS} WHERE mood IN (SELECT note FROM {VISITS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert_eq!(ids, vec![1, 3]);
+}
+
+// PR #1103 再々レビュー codex-review P1 指摘の回帰テスト: `<TEXT 列> IN
+// (SELECT id FROM ...)`（内側投影が疑似列 `id`＝`Cell::Integer`）は、以前は
+// `Cell::Integer` を無条件に文字列化して `WherePredicate::Equality` へ
+// 変換していたため、外側 TEXT 列の値が `id` の文字列表現と偶然一致する
+// 行が誤って一致してしまっていた（型の異なる値の暗黙同一視）。内側の
+// 結果行数に関わらず、対象列・内側投影列の型組合せを検証し `22000` で
+// 拒否することを固定する。
+
+#[test]
+fn in_subquery_text_target_against_id_projection_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    // 型混同の再現条件: 外側 TEXT 列 `lang` の値が疑似列 `id` の文字列表現
+    // （"1"）と偶然一致する行を用意する。
+    insert_doc(&core, &ctx, 1, "1");
+    insert_allowed_lang(&core, &ctx, 1, "ja");
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN (SELECT id FROM {ALLOWED_LANGS} LIMIT 1) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("subquery projection type is not compatible")
+    ));
+}
+
+#[test]
+fn in_subquery_text_target_against_id_projection_with_empty_inner_result_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc(&core, &ctx, 1, "ja");
+    // allowed_langs は空のまま（内側の結果が 0 行）。組合せ検証は内側の
+    // 結果行数に依存しないため、0 行でも拒否される。
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN (SELECT id FROM {ALLOWED_LANGS} LIMIT 1) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("subquery projection type is not compatible")
+    ));
+}
+
+#[test]
+fn in_subquery_boolean_target_matches_independent_oracle() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_active(&core, &ctx, 1, "ja", true);
+    insert_doc_with_active(&core, &ctx, 2, "en", false);
+    insert_doc_with_active(&core, &ctx, 3, "fr", true);
+    // 内側投影は BOOLEAN 列（正当な組合せ: BOOLEAN↔BOOLEAN）。
+    insert_visit_with_flag(&core, &ctx, 1, "hit", true);
+
+    let ids = select_ids(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE active IN (SELECT flag FROM {VISITS} LIMIT 100) LIMIT 100"
         ),
     );
     assert_eq!(ids, vec![1, 3]);

@@ -43,7 +43,7 @@
 //!   より 2 桁以上大きい評価コストを 1 文から発生させられた）。
 
 use super::allowlist::{Statement, TableLookup, WherePredicate};
-use super::exec::Cell;
+use super::exec::{Cell, ColumnMeta};
 use super::lexer::Token;
 use super::udf_call::UdfRegistry;
 use crate::catalog::{ColumnType, TableSchema};
@@ -274,11 +274,66 @@ fn validate_in_target_column<'a>(
     }
 }
 
+/// `IN` の対象列（外側）・内側の単一投影列が、同じ「値族」（`TEXT`／`ENUM`
+/// はいずれも文字列ラベルとして比較するため同族、`BOOLEAN` は別族）に
+/// 属するかどうかを表す（PR #1103 追加 codex-review P1 指摘対応）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubqueryValueFamily {
+    /// `TEXT`／`ENUM` 列（ラベルを文字列として比較する）。
+    Text,
+    /// `BOOLEAN` 列。
+    Boolean,
+}
+
+/// `outer_ty`（[`validate_in_target_column`] が返す対象列の型。常に
+/// `TEXT`／`ENUM`／`BOOLEAN` のいずれか）の値族を返す。
+fn outer_value_family(outer_ty: &ColumnType) -> SubqueryValueFamily {
+    match outer_ty {
+        ColumnType::Text | ColumnType::Enum(_) => SubqueryValueFamily::Text,
+        ColumnType::Boolean => SubqueryValueFamily::Boolean,
+        // `validate_in_target_column` が事前にこの 3 種類だけを許可するため、
+        // ここへは到達しない（防御的に fail-closed 側＝`None` 扱いへ倒す）。
+        _ => SubqueryValueFamily::Text,
+    }
+}
+
+/// 内側の単一投影列の静的メタデータ（[`ColumnMeta`]）から値族を判定する。
+/// `None` は「対応外（値族が不明、または `TEXT`／`ENUM`／`BOOLEAN` のいずれ
+/// でもない）」を表し、呼び出し元は `22000` で拒否する。
+///
+/// 疑似列 `id`（[`ColumnMeta::Id`]。実行結果は常に `Cell::Integer`）は
+/// `None` を返す（PR #1103 追加 codex-review P1 指摘対応の回帰対象:
+/// 以前は `Cell::Integer` を素通しで文字列化して `WherePredicate::Equality`
+/// へ変換していたため、`<TEXT 列> IN (SELECT id FROM ...)` で `id` の文字列
+/// 表現と偶然一致する `TEXT` 値が誤って一致してしまっていた——型の異なる
+/// 値の暗黙同一視。内側の結果行数に関わらず、この静的メタデータの時点で
+/// 判定を確定させる）。式項目（[`ColumnMeta::Computed`]）も静的な型情報を
+/// 持たないため同様に `None`（実装既定値のスコープ外。`docs/design/
+/// sql-subquery.md` 参照）。
+fn inner_value_family(meta: &ColumnMeta) -> Option<SubqueryValueFamily> {
+    match meta {
+        ColumnMeta::Scalar {
+            ty: ColumnType::Text | ColumnType::Enum(_),
+            ..
+        } => Some(SubqueryValueFamily::Text),
+        ColumnMeta::Scalar {
+            ty: ColumnType::Boolean,
+            ..
+        } => Some(SubqueryValueFamily::Boolean),
+        ColumnMeta::Id | ColumnMeta::Scalar { .. } | ColumnMeta::Computed { .. } => None,
+    }
+}
+
 /// `<column> IN (SELECT ...)` を解決する。内側は投影列がちょうど 1 列である
 /// ことを要求し（`22000`）、[`validate_in_target_column`] で対象列
-/// `column`（外側スキーマ）を検証した上で、各行のセルを
-/// [`cell_to_equality_predicate`] で `<column> = <値>` 相当の葉へ変換し
-/// `WherePredicate::Or` として束ねる（0 行なら空の `Or` ＝常に偽）。
+/// `column`（外側スキーマ）を検証した上で、内側の投影列の値族
+/// （[`inner_value_family`]）が対象列の値族（[`outer_value_family`]）と
+/// 一致することを検証する（内側の結果行数・値に一切依存しない静的な検証。
+/// PR #1103 追加 codex-review P1 指摘対応: `TEXT`↔`TEXT`・`ENUM`↔`TEXT`・
+/// `BOOLEAN`↔`BOOLEAN` 等、既存の等価述語の型規則と同じ組合せのみを展開
+/// 対象にし、それ以外は `22000` で拒否する）。適合を確認した上で、各行の
+/// セルを [`cell_to_equality_predicate`] で `<column> = <値>` 相当の葉へ
+/// 変換し `WherePredicate::Or` として束ねる（0 行なら空の `Or` ＝常に偽）。
 ///
 /// `in_leaf_budget` は文全体で共有する残り葉数予算（[`MAX_SUBQUERY_IN_LEAVES`]
 /// 参照）。生成する葉ごとに 1 消費し、枯渇したら `54000` で拒否する
@@ -317,6 +372,28 @@ fn resolve_in_subquery(
     }
     // 内側の結果行数（0 行を含む）に関わらず、対象列の存在・型を必ず検証する。
     let target_ty = validate_in_target_column(column, outer_schema)?;
+
+    // 内側の結果行数・値に一切依存しない静的な組合せ検証（PR #1103 追加
+    // codex-review P1 指摘対応）。`result.columns` は上で長さ 1 を確認済みの
+    // ため `first()` は必ず `Some`（untrusted 入力経路のため `[0]` ではなく
+    // `ok_or_else` で明示的に扱う）。
+    let inner_meta = result
+        .columns
+        .first()
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "subquery result missing projected column metadata".to_string(),
+        })?;
+    let outer_family = outer_value_family(target_ty);
+    match inner_value_family(inner_meta) {
+        Some(inner_family) if inner_family == outer_family => {}
+        _ => {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "subquery projection type is not compatible with IN target column {column:?} \
+                 (supported combinations: TEXT/ENUM subquery projection with TEXT/ENUM target, \
+                 BOOLEAN subquery projection with BOOLEAN target)"
+            )));
+        }
+    }
 
     let mut branches = Vec::with_capacity(result.rows.len());
     for row in &result.rows {
