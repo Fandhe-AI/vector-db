@@ -261,6 +261,11 @@ pub(crate) fn is_distinct_modifier(tokens: &[Token], pos: usize) -> bool {
 /// MAX_METADATA_FILTERS`／`check_filter_count` と同じ設計判断）。
 pub const MAX_AGGREGATE_ITEMS: usize = 32;
 
+/// ウィンドウ項目（SQL-30・TASK-214）の `PARTITION BY`・`ORDER BY` 句が持てる
+/// 列数の上限。SQL-25 (d) の列数上限と同じ実装既定値を流用する（無制限 `Vec`
+/// 確保を避ける方針。security.md「不安全な設計」対応）。
+pub(crate) const MAX_WINDOW_KEYS: usize = 8;
+
 /// `count` 件の集計項目が [`MAX_AGGREGATE_ITEMS`] を超えないことを検証する
 /// （`54000`）。`Vec` 確保・要素の複製より**前**に呼べる形にする
 /// （[`crate::declarative_filter::check_filter_count`] と同じ設計判断。
@@ -1288,6 +1293,86 @@ pub struct AggregateItem {
     pub(crate) distinct: bool,
 }
 
+/// ウィンドウ関数（SQL-30・TASK-214、Issue #930）の種別。順位関数
+/// （`RowNumber`/`Rank`/`DenseRank`）は引数を取らず、集計関数
+/// （`Count`/`Sum`/`Avg`/`Min`/`Max`）は [`AggregateFunc`] と同じ名前を共有するが、
+/// `OVER (...)` 句を伴う点・`GROUP BY` と併用できない点が異なるため独立の enum に
+/// する（`allowlist::validate_sql_tokens` の振り分け・`sql::parser::bind_window_item`
+/// が本 enum の variant で分岐する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl WindowFunc {
+    /// ウィンドウ関数名の許可リスト照合（大文字小文字を区別しない）。未知の
+    /// 名前は `None`（呼び出し元が `42601` へ変換する）。
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "ROW_NUMBER" => Some(WindowFunc::RowNumber),
+            "RANK" => Some(WindowFunc::Rank),
+            "DENSE_RANK" => Some(WindowFunc::DenseRank),
+            "COUNT" => Some(WindowFunc::Count),
+            "SUM" => Some(WindowFunc::Sum),
+            "AVG" => Some(WindowFunc::Avg),
+            "MIN" => Some(WindowFunc::Min),
+            "MAX" => Some(WindowFunc::Max),
+            _ => None,
+        }
+    }
+
+    /// 順位関数（引数を取らない。[`Parser::parse_window_item`] が引数の有無を
+    /// この判定で分岐する）。
+    pub(crate) fn is_ranking(self) -> bool {
+        matches!(
+            self,
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
+        )
+    }
+
+    /// `alias` 省略時の既定列名（[`AggregateFunc::default_alias`] と同じ命名規則）。
+    pub(crate) fn default_alias(self) -> &'static str {
+        match self {
+            WindowFunc::RowNumber => "row_number",
+            WindowFunc::Rank => "rank",
+            WindowFunc::DenseRank => "dense_rank",
+            WindowFunc::Count => "count",
+            WindowFunc::Sum => "sum",
+            WindowFunc::Avg => "avg",
+            WindowFunc::Min => "min",
+            WindowFunc::Max => "max",
+        }
+    }
+}
+
+/// SELECT リストのウィンドウ項目 1 つ（SQL-30・TASK-214、Issue #930）。`position`
+/// は SELECT リスト全体（通常項目・ウィンドウ項目を通した 0 始まりの通し番号）
+/// における出現位置で、実行時（`sql::window::execute_window_scan`）が通常の
+/// 投影列と組み合わせて元の並び順を復元するために使う
+/// （[`Projection`] はウィンドウ項目を保持しないため、位置情報を別途持たせる
+/// 必要がある）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowSelectItem {
+    pub(crate) position: usize,
+    pub(crate) func: WindowFunc,
+    /// 順位関数は常に `None`。集計関数は [`AggregateArg`]（`*`・裸の列名のみ。
+    /// 複合式は対象外——TASK-214 のスコープ縮小、`docs/design/window-functions.md`
+    /// 参照）。
+    pub(crate) arg: Option<AggregateArg>,
+    /// `PARTITION BY` の列名一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
+    pub(crate) partition_by: Vec<String>,
+    /// `ORDER BY` の (列名, 降順か) 一覧（順序保持。最大 [`MAX_WINDOW_KEYS`]）。
+    pub(crate) order_by: Vec<(String, bool)>,
+    pub(crate) alias: Option<String>,
+}
+
 /// 集計 `SELECT` リストの 1 項目（TASK-167・SQL-14 で `AggregateItem` 単独から拡張）。
 /// `GroupKey` は `GROUP BY` 句がある場合にのみ現れ、`GROUP BY` 列と同名の裸の
 /// 識別子（任意で `AS <alias>`）だけを構造上受理する（`allowlist::Parser::parse_select_item`
@@ -1409,6 +1494,11 @@ pub struct ValidatedScan {
     /// 適用する（`sql::scan::execute_scan_with_budget`）。範囲検証は
     /// `sql::parser::bind_scan_with_dummy_flags` が束縛時に行う。
     pub(crate) offset: u32,
+    /// ウィンドウ項目（SQL-30・TASK-214、Issue #930）。空なら通常の広域取得
+    /// （既存契約を完全に維持）。`Vec<SelectItem>` を返す `projection` とは別に
+    /// 保持し、実行時（`sql::window::execute_window_scan`）が
+    /// [`WindowSelectItem::position`] で元の並び順へ合流する。
+    pub(crate) window_items: Vec<WindowSelectItem>,
 }
 
 impl ValidatedScan {
@@ -2151,6 +2241,208 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(SelectItem::Column(self.expect_ident()?))
+    }
+
+    /// SQL-30・TASK-214（Issue #930）: 広域取得（`ParsedSelect::Scan`）専用の SELECT
+    /// リスト解析。[`Self::parse_select_list`] と異なり、ウィンドウ項目
+    /// （`<func>(...) OVER (...)`）を通常項目（[`SelectItem`]）とは別に
+    /// [`WindowSelectItem`] へ振り分けて返す（[`Projection`] 自体はウィンドウ項目を
+    /// 保持できないため）。呼び出し元（[`parse_select_shape`]）は、ウィンドウ項目が
+    /// 1 つでもあれば広域取得（`LIMIT` 直接。ランキング段を持たない）のみを許可し、
+    /// `ORDER BY`／`USING PLAN` を伴う検索 SELECT 形状とは併用させない
+    /// （§計画 2「対象外」）。
+    ///
+    /// `*` とウィンドウ項目の混在（`SELECT *, ROW_NUMBER() OVER () ...`）は
+    /// 受理しない: 先頭が `*` 単独なら [`Self::parse_select_list`] と同じく即座に
+    /// `Projection::All` を返す（後続のカンマ区切り項目を読まない）ため、
+    /// `SELECT *, ...` の残りトークンが `expect_end_of_statement` で `42601` に
+    /// 落ちる。
+    fn parse_select_list_with_windows(
+        &mut self,
+    ) -> Result<(Projection, Vec<WindowSelectItem>), SqlSurfaceError> {
+        if matches!(self.peek(), Some(Token::Punct('*'))) {
+            self.advance();
+            return Ok((Projection::All, Vec::new()));
+        }
+        let mut plain_items: Vec<SelectItem> = Vec::new();
+        let mut window_items: Vec<WindowSelectItem> = Vec::new();
+        let mut position: usize = 0;
+        loop {
+            if self.peek_is_window_item_start() {
+                if window_items.len() >= MAX_AGGREGATE_ITEMS {
+                    return Err(SqlSurfaceError::payload_too_large("too many window items"));
+                }
+                let mut item = self.parse_window_item()?;
+                item.position = position;
+                window_items.push(item);
+            } else {
+                plain_items.push(self.parse_select_item()?);
+            }
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| SqlSurfaceError::payload_too_large("too many SELECT list items"))?;
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let projection = if plain_items
+            .iter()
+            .all(|it| matches!(it, SelectItem::Column(_)))
+        {
+            Projection::Columns(
+                plain_items
+                    .into_iter()
+                    .map(|it| match it {
+                        SelectItem::Column(name) => name,
+                        SelectItem::Expr { .. } => unreachable!("filtered above"),
+                    })
+                    .collect(),
+            )
+        } else {
+            Projection::Items(plain_items)
+        };
+        Ok((projection, window_items))
+    }
+
+    /// 現在位置が「`<ident> '(' ... ')' OVER '('`」の並びで始まるかを、消費せず
+    /// 判定する（[`Self::find_matching_close_paren`] で対応する `')'` を探し、その
+    /// 直後が文脈識別子 `OVER`・その次が `'('` かを見る）。対応する `')'` が
+    /// 見つからない場合は通常項目として扱う（`parse_select_item`／
+    /// `parse_call_expr` 側の既存エラー処理に委ねる）。
+    fn peek_is_window_item_start(&self) -> bool {
+        let Some(Token::Ident(_)) = self.peek() else {
+            return false;
+        };
+        if !matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
+            return false;
+        }
+        let Some(close_idx) = self.find_matching_close_paren(self.pos + 1) else {
+            return false;
+        };
+        matches!(
+            self.tokens.get(close_idx + 1),
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("OVER")
+        ) && matches!(self.tokens.get(close_idx + 2), Some(Token::Punct('(')))
+    }
+
+    /// ウィンドウ項目 1 つ（SQL-30・TASK-214、Issue #930）:
+    /// `<func>(<args>) OVER ( [PARTITION BY <ident>[, ...]] [ORDER BY <ident>
+    /// [ASC|DESC][, ...]] ) [AS <alias>]`。呼び出し元
+    /// （[`Self::parse_select_list_with_windows`]）が [`Self::peek_is_window_item_start`]
+    /// で先読み確定済みの前提で呼ぶ。`position` は呼び出し元が後から設定する
+    /// （ここでは常に `0`）。
+    ///
+    /// スコープ縮小（`docs/design/window-functions.md` 参照。§計画 2「対象外」）:
+    /// フレーム句（`ROWS`/`RANGE`/`GROUPS`）・`NULLS FIRST/LAST`・名前付き
+    /// ウィンドウ（`WINDOW w AS (...)`/`OVER w`）・`FILTER (...)`・関数内
+    /// `DISTINCT`・複合式の引数はいずれも許可リスト外として `42601` に落ちる
+    /// （該当する構文を消費する分岐を意図的に持たない）。
+    fn parse_window_item(&mut self) -> Result<WindowSelectItem, SqlSurfaceError> {
+        let name = self.expect_ident()?;
+        let func = WindowFunc::from_name(&name).ok_or_else(|| {
+            SqlSurfaceError::unsupported(format!("unsupported window function: {name}"))
+        })?;
+        self.expect_punct('(')?;
+        let arg = if func.is_ranking() {
+            None
+        } else {
+            // `DISTINCT` は本 Issue のスコープ外（`COUNT(DISTINCT ...) OVER (...)`
+            // は非対応。§計画 2「対象外」）。
+            if is_distinct_modifier(self.tokens, self.pos) {
+                return Err(SqlSurfaceError::unsupported(
+                    "DISTINCT is not supported inside a window aggregate function",
+                ));
+            }
+            if matches!(self.peek(), Some(Token::Punct('*'))) {
+                if func != WindowFunc::Count {
+                    return Err(SqlSurfaceError::unsupported(
+                        "'*' is only allowed inside COUNT(*)",
+                    ));
+                }
+                self.advance();
+                Some(AggregateArg::Star)
+            } else {
+                match self.peek() {
+                    // 引数は裸の列名のみを受理する（複合式・UDF 呼び出しは
+                    // §計画 2「対象外」）。
+                    Some(Token::Ident(_)) => {
+                        let column = self.expect_ident()?;
+                        Some(AggregateArg::Expr(Expr::Ident(column)))
+                    }
+                    Some(Token::Punct(')')) => {
+                        return Err(SqlSurfaceError::unsupported(
+                            "window aggregate function requires exactly one argument",
+                        ));
+                    }
+                    other => {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "window aggregate function argument must be a bare column reference, got {other:?}"
+                        )));
+                    }
+                }
+            }
+        };
+        self.expect_punct(')')?;
+        self.expect_ident_matching("OVER")?;
+        self.expect_punct('(')?;
+        let mut partition_by = Vec::new();
+        if self.peek_contextual_keyword("PARTITION") {
+            self.advance();
+            self.expect_keyword(Keyword::By)?;
+            partition_by.push(self.expect_ident()?);
+            while matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                if partition_by.len() >= MAX_WINDOW_KEYS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many PARTITION BY columns",
+                    ));
+                }
+                partition_by.push(self.expect_ident()?);
+            }
+        }
+        let mut order_by = Vec::new();
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
+            self.advance();
+            self.expect_keyword(Keyword::By)?;
+            loop {
+                if order_by.len() >= MAX_WINDOW_KEYS {
+                    return Err(SqlSurfaceError::payload_too_large("too many ORDER BY keys"));
+                }
+                let column = self.expect_ident()?;
+                let descending = if self.peek_ident_matches("DESC") {
+                    self.advance();
+                    true
+                } else if self.peek_ident_matches("ASC") {
+                    self.advance();
+                    false
+                } else {
+                    false
+                };
+                order_by.push((column, descending));
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_punct(')')?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(WindowSelectItem {
+            position: 0,
+            func,
+            arg,
+            partition_by,
+            order_by,
+            alias,
+        })
     }
 
     /// 集計 SELECT リストの 1 項目（TASK-166・SQL-13。SQL-25 (c)・TASK-209 で
@@ -4541,13 +4833,16 @@ struct ParsedShape {
     using_plan: Option<String>,
 }
 
-/// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454）。
+/// 構文木（[`ValidatedScan`] の元）。カタログ存在確認前の中間結果（Issue #454。
+/// SQL-30・TASK-214、Issue #930 で `window_items` を追加）。
 struct ParsedScanShape {
     table_name: String,
     projection: Projection,
     where_predicates: Vec<WherePredicate>,
     limit: u32,
     offset: u32,
+    /// ウィンドウ項目（SELECT リスト全体での出現位置つき）。空なら通常の広域取得。
+    window_items: Vec<WindowSelectItem>,
 }
 
 /// [`parse_select_shape`] の戻り値。`WHERE`（省略可）の直後に現れる分岐トークン
@@ -4568,7 +4863,11 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
-    let projection = p.parse_select_list()?;
+    // SQL-30・TASK-214（Issue #930）: ウィンドウ項目は SELECT リストの一部として
+    // 通常項目と混在しうるため、`ORDER BY`／`USING PLAN` を伴う検索 SELECT 経路か
+    // ランキング段を持たない広域取得かを判定する**前**にリストを読み終える必要が
+    // ある（既存の `parse_select_list` 呼び出しをそのまま置き換える）。
+    let (projection, window_items) = p.parse_select_list_with_windows()?;
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
 
@@ -4579,10 +4878,23 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
         Vec::new()
     };
 
+    // SQL-30・TASK-214: ウィンドウ項目は WHERE の中で自分自身の別名を参照できない
+    // （実在列と同名なら列として解釈する。§計画 3.4「WHERE がウィンドウ別名を
+    // 参照する場合」）。ここでは束縛前の構造検証段のため列の実在確認はできず、
+    // 意味論的な判定は `sql::parser::bind_scan_with_dummy_flags` へ委譲する
+    // （構造検証段は `window_items` を `ParsedScanShape` へそのまま伝播するのみ）。
+
     // TASK-77・SQL-5: `USING PLAN(...)` は `ORDER BY` の代替経路（相互排他）。
     // `ORDER BY` 経路は必ずキーワード `ORDER` から始まるため、この位置で文脈的
     // 識別子 `USING` が現れるかどうかだけで両者を衝突なく判定できる。
     if p.peek_ident_matches("USING") {
+        // SQL-30・TASK-214: `USING PLAN` はランキング段を持つ検索 SELECT 専用の
+        // 経路で、ウィンドウ項目とは構造上両立しない（§計画 2「対象外」）。
+        if !window_items.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "window functions cannot be combined with USING PLAN",
+            ));
+        }
         let using_plan = p.parse_using_plan_clause()?;
 
         p.expect_keyword(Keyword::Limit)?;
@@ -4637,7 +4949,18 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedSelect, SqlSurfaceError>
             where_predicates,
             limit,
             offset,
+            window_items,
         }));
+    }
+
+    // SQL-30・TASK-214: 残る経路は文全体のスカラー `ORDER BY` を伴う検索 SELECT
+    // （`docs/spec/04-behavior/sql-surface.md` SQL-25 の管轄。本 Issue のスコープ外
+    // ——TASK-209〔#915〕未マージのため §計画 2「対象外」）で、ウィンドウ項目とは
+    // 併用しない。
+    if !window_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "window functions cannot be combined with ORDER BY",
+        ));
     }
 
     p.expect_keyword(Keyword::Order)?;
@@ -4964,10 +5287,34 @@ pub(crate) fn validate_sql_tokens(
         matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
             && matches!(w[1], Token::Keyword(Keyword::By))
     });
+    // SQL-30・TASK-214（Issue #930）: `SELECT COUNT(*) OVER (...) ...` のような
+    // ウィンドウ項目は、先頭の集計関数名 `'('` という同じ字面を持つため
+    // `is_aggregate_select` の先読みだけでは集計 SELECT と誤判定される
+    // （`COUNT` の直後の `'('` を見るだけでは `OVER` の有無が分からない）。
+    // トークン列全体に「`')'` の直後に文脈識別子 `OVER`、その直後に `'('`」という
+    // 並びがあるかを走査して判定する。この並びは既存の許可形状（式・集計・
+    // WHERE のいずれも）には現れないため、フォールス・ポジティブなくウィンドウ
+    // 項目の目印として使える。
+    let contains_window_over = tokens.windows(3).any(|w| {
+        matches!(w[0], Token::Punct(')'))
+            && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
+            && matches!(w[2], Token::Punct('('))
+    });
     let is_aggregate_select = matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
+        && !contains_window_over
         && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
             && matches!(tokens.get(2), Some(Token::Punct('('))))
             || contains_group_by);
+    // SQL-30・TASK-214: ウィンドウ項目は `GROUP BY`・集計 SELECT・`SELECT DISTINCT`
+    // のいずれとも併用しない（§計画 2「対象外」）。`is_aggregate_select` の判定
+    // から除外しただけでは `contains_group_by` 単独の形（`SELECT ... OVER (...)
+    // ... GROUP BY ...`）が `parse_select_shape`（広域取得）へ素通りしてしまうため、
+    // ここで明示的に `42601` へ倒す。
+    if contains_window_over && contains_group_by {
+        return Err(SqlSurfaceError::unsupported(
+            "window functions cannot be combined with GROUP BY",
+        ));
+    }
     // SQL-25 (c)・TASK-209: `SELECT` の直後（2 番目のトークン）が
     // [`is_distinct_modifier`] の判定する `DISTINCT` 修飾子なら `SELECT DISTINCT`
     // 形状（[`parse_distinct_shape`]）へ振り分ける。`is_aggregate_select`
@@ -5036,6 +5383,7 @@ pub(crate) fn validate_sql_tokens(
                         where_predicates: shape.where_predicates,
                         limit: shape.limit,
                         offset: shape.offset,
+                        window_items: shape.window_items,
                     })),
                     super::view::Resolved::View {
                         base_table,
@@ -5046,6 +5394,14 @@ pub(crate) fn validate_sql_tokens(
                             view_columns.as_deref(),
                             &shape.projection,
                             &shape.where_predicates,
+                        )?;
+                        // SQL-30・TASK-214（Issue #930）・RLS-10 (b): ウィンドウ項目
+                        // が参照する列（PARTITION BY／ORDER BY／集計引数）も、
+                        // 通常の投影・WHERE と同じくビューの公開列集合の範囲内で
+                        // あることを検査する。
+                        super::view::check_window_columns_within_view(
+                            view_columns.as_deref(),
+                            &shape.window_items,
                         )?;
                         let projection = match (&shape.projection, &view_columns) {
                             (Projection::All, Some(cols)) => Projection::Columns(cols.clone()),
@@ -5059,6 +5415,7 @@ pub(crate) fn validate_sql_tokens(
                             where_predicates,
                             limit: shape.limit,
                             offset: shape.offset,
+                            window_items: shape.window_items,
                         }))
                     }
                 }
@@ -5101,9 +5458,21 @@ pub(crate) fn validate_sql_tokens(
                 matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
                     && matches!(w[1], Token::Keyword(Keyword::By))
             });
-            let rest_is_aggregate_select = (matches!(rest.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-                && matches!(rest.get(2), Some(Token::Punct('('))))
-                || rest_contains_group_by;
+            // SQL-30・TASK-214（Issue #930）: 非 EXPLAIN 経路の `contains_window_over`
+            // と同じ理由で、`EXPLAIN SELECT COUNT(*) OVER (...) ...` が集計 SELECT
+            // と誤判定されないようにする。ウィンドウ項目は後続の
+            // `parse_select_shape(rest)` が `ParsedSelect::Scan` へ振り分け、
+            // 直後の `ParsedSelect::Scan(_) => Err` 分岐で一律 `42601` に落ちる
+            // （`EXPLAIN` はウィンドウ関数に未対応。§計画 2「対象外」）。
+            let rest_contains_window_over = rest.windows(3).any(|w| {
+                matches!(w[0], Token::Punct(')'))
+                    && matches!(&w[1], Token::Ident(name) if name.eq_ignore_ascii_case("OVER"))
+                    && matches!(w[2], Token::Punct('('))
+            });
+            let rest_is_aggregate_select = !rest_contains_window_over
+                && ((matches!(rest.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+                    && matches!(rest.get(2), Some(Token::Punct('('))))
+                    || rest_contains_group_by);
             if rest_is_aggregate_select {
                 return Err(SqlSurfaceError::unsupported(
                     "EXPLAIN is not supported for aggregate SELECT statements",
