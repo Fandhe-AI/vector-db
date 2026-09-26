@@ -296,7 +296,9 @@ fn create_table_rejects_unknown_type() {
     let alice = ctx("alice");
     let mut session = granted_session();
     let err = core
-        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a INTEGER)")
+        // `INTEGER`／`BIGINT` は `FOREIGN KEY` の参照元列用に受理する（TABLE-17・
+        // TASK-205、Issue #907）ため、未対応型の代表として `BOOLEAN` を使う。
+        .execute_sql_in_session(&alice, &mut session, "CREATE TABLE docs (a BOOLEAN)")
         .expect_err("unsupported type must be rejected");
     assert_eq!(err.wire_code(), "42601");
 }

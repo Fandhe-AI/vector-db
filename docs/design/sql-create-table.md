@@ -14,9 +14,13 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 ```
 
-- `<type>` は `TEXT` または `VECTOR ( <N> )` のみ（TABLE-13／14 の追加型は別 Issue の
-  管轄。`IF NOT EXISTS`・`REFERENCES`・`USING OPERATION_ID` の付与は
-  いずれも許可リスト外（構造的に受理しない・`42601`）。`CONSTRAINT <name>` は
+- `<type>` は `TEXT`・`VECTOR ( <N> )`・`INTEGER`・`BIGINT` のみ（`INTEGER`／`BIGINT`
+  は `id` を参照する `FOREIGN KEY` の参照元列用に TABLE-17・Issue #907 が追加した。
+  TABLE-13／14 のその他の追加型は別 Issue の管轄）。`IF NOT EXISTS`・
+  `USING OPERATION_ID` の付与はいずれも許可リスト外（構造的に受理しない・
+  `42601`）。列制約 `REFERENCES <table> [(<col>[, ...])]`・表制約
+  `FOREIGN KEY (<col>[, ...]) REFERENCES ...`（Issue #907。
+  `docs/design/foreign-key.md`）も制約構文として受理する。`CONSTRAINT <name>` は
   `CHECK` の前置にのみ受理する。列制約 `PRIMARY KEY`・表制約 `PRIMARY KEY (<col>[, ...])`（複合キーを
   含む。TABLE-16・TASK-204、Issue #903。`docs/design/sql-primary-key.md`）と、
   列制約 `UNIQUE`・表制約 `UNIQUE (<col>[, ...])`（Issue #905。
@@ -35,7 +39,7 @@ CREATE TABLE <table> (<col> <type>[, <col> <type>]*) [;]
 
 - `VECTOR(N)` 列は常に `nullable = false`（TABLE-1。全フィクスチャ・
   `validate_embedding_dim` が vector の存在を前提とする既存設計と整合）。
-- `TEXT` 列は PostgreSQL に倣い `nullable = true`。
+- `TEXT`・`INTEGER`・`BIGINT` 列は PostgreSQL に倣い `nullable = true`。
 - `VECTOR` 列は 0 本または 1 本（catalog の既存 `validate_schema` 規則。2 本以上の
   宣言は `catalog::CatalogError::Invalid` → `42601`）。
 - 予約列名 `id`／`tenant_id`／`visibility`（ASCII 大文字小文字を無視して照合）は
@@ -179,7 +183,7 @@ PostgreSQL 互換の `CREATE TABLE`（件数なし）。
 ## スコープ外・後続 Issue
 
 - `ALTER TABLE ADD COLUMN`／DROP／MODIFY COLUMN・各種制約
-  （`REFERENCES`。`PRIMARY KEY`・`UNIQUE`・`CHECK` は Issue #903・#905・#906 で
+  （`PRIMARY KEY`・`UNIQUE`・`CHECK`・`REFERENCES` は Issue #903・#905・#906・#907 で
   実装済み）・
   `CREATE INDEX`・`VIEW`・NoSQL 表層の DDL op はいずれも別 Issue の担当（本 Issue の
   権限ゲート（`require_ddl_permission`・`--ddl-allowed-users`）・
