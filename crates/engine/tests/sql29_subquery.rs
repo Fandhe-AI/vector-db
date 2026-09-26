@@ -300,6 +300,145 @@ fn in_subquery_multi_column_projection_is_rejected() {
     ));
 }
 
+// PR #1103 codex-review P1 指摘の回帰テスト（2 スレッド・同一趣旨）:
+// `<col> IN (SELECT ...)` の対象列 `<col>` が存在しない・非対応型の場合でも、
+// 内側サブクエリの結果が 0 行または NULL のみだと、以前は列名・型検証を
+// 一切通らずに空の `Or`（常に偽）へ静かに書き換わり「空結果で成功」して
+// いた（列名・型検証は内側の結果行から変換された葉が実際に束縛される時点
+// でしか働かなかったため）。内側の結果行数・NULL 有無に関わらず必ず
+// `22000` で拒否されることを固定する。
+
+#[test]
+fn in_subquery_unknown_column_with_empty_inner_result_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    seed_docs(&core, &ctx);
+    // allowed_langs は空のまま（内側の結果が 0 行）。
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE nonexistent_col IN \
+             (SELECT lang FROM {ALLOWED_LANGS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("unknown column")
+    ));
+}
+
+#[test]
+fn in_subquery_unknown_column_with_null_only_inner_result_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    // `priority` は NULL 許容の BIGINT 列（`docs_schema` 参照）。ここでは
+    // 明示せず NULL のままにする（内側の結果は NULL のみ）。
+    insert_doc(&core, &ctx, 1, "ja");
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE nonexistent_col IN \
+             (SELECT priority FROM {DOCS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("unknown column")
+    ));
+}
+
+#[test]
+fn in_subquery_unsupported_type_column_with_empty_inner_result_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc_with_priority(&core, &ctx, 1, "ja", 10);
+    // priorities は空のまま（内側の結果が 0 行）。修正前はここで `priority`
+    // （`BIGINT`）が対象列として一切検証されず、空結果で成功していた。
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE priority IN \
+             (SELECT priority FROM {PRIORITIES} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("is not a TEXT/ENUM/BOOLEAN column")
+    ));
+}
+
+#[test]
+fn in_subquery_unsupported_type_column_with_null_only_inner_result_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    // `priority` は明示せず NULL のままにする（内側の結果は NULL のみ）。
+    insert_doc(&core, &ctx, 1, "ja");
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE priority IN \
+             (SELECT priority FROM {DOCS} LIMIT 100) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        &err,
+        engine::sql::allowlist::SqlSurfaceError::InvalidInput { detail }
+            if detail.contains("is not a TEXT/ENUM/BOOLEAN column")
+    ));
+}
+
+// --- 上限（`IN` 展開の葉数） --------------------------------------------------
+
+// PR #1103 codex-review P1 指摘の回帰テスト（3 スレッド目）: 内側の各行を
+// `WherePredicate::Equality` 葉へ展開して `Or` に束ねる件数は、構文解析段の
+// `MAX_WHERE_LEAVES`（通常の `WHERE` 述語の葉数上限）とは独立の経路で
+// 生成されるため、内側最大可視行数×内側実行回数上限の組合せだけでは通常の
+// `WHERE` 述語数上限より大きい評価コストを 1 文から発生させられた
+// （DoS。`docs/design/sql-subquery.md` 参照）。
+// `sql::subquery::MAX_SUBQUERY_IN_LEAVES` で頭打ちにされることを固定する。
+#[test]
+fn in_subquery_expansion_leaf_count_exceeds_limit_is_rejected() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    insert_doc(&core, &ctx, 1, "en");
+    // `sql::subquery::MAX_SUBQUERY_IN_LEAVES`（256）を超える件数の異なる
+    // `lang` 値を用意し、`IN` の展開がそれをすべて葉へ変換しようとした時点で
+    // 資源上限エラーになることを確認する。
+    let leaf_count = 300u64;
+    for i in 0..leaf_count {
+        insert_allowed_lang(&core, &ctx, i, &format!("lang{i}"));
+    }
+
+    let err = expect_error_code(
+        &core,
+        &ctx,
+        &format!(
+            "SELECT id FROM {DOCS} WHERE lang IN \
+             (SELECT lang FROM {ALLOWED_LANGS} LIMIT {leaf_count}) LIMIT 100"
+        ),
+    );
+    assert!(matches!(
+        err,
+        engine::sql::allowlist::SqlSurfaceError::PayloadTooLarge { .. }
+    ));
+}
+
 // --- EXISTS (SELECT ...) ----------------------------------------------------
 
 #[test]
