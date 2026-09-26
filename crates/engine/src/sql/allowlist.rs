@@ -204,16 +204,29 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
 /// は列名 `distinct` を許可している）に由来する文脈判定（SQL-25 (c)・TASK-209）。
 /// `tokens[pos]` が大文字小文字を無視して `DISTINCT` に一致し、かつ次のトークンが
 /// `Ident`（`AS` を除く）または `'*'` の場合に限り修飾子とみなす。次が `FROM`・
-/// `,`・`)`・`(`・文末・`AS` のときは列名として扱う（`SELECT distinct FROM t`・
-/// `COUNT(distinct)`・`WHERE distinct = 'x'`・`SELECT distinct AS d, COUNT(*)
-/// FROM t GROUP BY distinct`（[`Parser::parse_aggregate_select_item`] が受理
-/// する「裸の識別子 ＋ 任意の `AS <alias>`」という既存の集計 SELECT リスト項目
-/// 形状）等の既存の列参照としての解釈を壊さない。PR #1098 レビュー対応: 次が
-/// `AS` の場合を列名側へ振り分ける）。
+/// `,`・`)`・`(`・文末のときは列名として扱う（`SELECT distinct FROM t`・
+/// `COUNT(distinct)`・`WHERE distinct = 'x'` 等の既存の列参照としての解釈を
+/// 壊さない）。
+///
+/// 次トークンが `Ident` として字句解析される `AS` の場合はさらに 2 つの読みが
+/// 衝突する（`catalog::validate_identifier` は列名 `as` も許可しているため）。
+/// PR #1098 レビュー対応（codex/review P1・Cursor Bugbot 指摘）:
+/// - `DISTINCT AS <alias>`（`tokens[pos+2]` が `Ident`）: `DISTINCT` 自体が
+///   列名で、`AS <alias>` はその別名（[`Parser::parse_aggregate_select_item`]
+///   が受理する「裸の識別子 ＋ 任意の `AS <alias>`」の形。GROUP BY 対象列と
+///   して使う `SELECT distinct AS d, COUNT(*) FROM t GROUP BY distinct` 等）。
+///   この場合は列名側（`false`）へ振り分ける。
+/// - `DISTINCT AS`（`tokens[pos+2]` が `Ident` でない＝`FROM`・`,`・`)`・
+///   文末等）: 列名 `as` の前に置かれた `DISTINCT` 修飾子（
+///   `COUNT(DISTINCT as)`・`SELECT DISTINCT as FROM t`）。この場合は修飾子側
+///   （`true`）へ振り分ける。
 pub(crate) fn is_distinct_modifier(tokens: &[Token], pos: usize) -> bool {
     matches!(tokens.get(pos), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DISTINCT"))
         && match tokens.get(pos + 1) {
-            Some(Token::Ident(next)) => !next.eq_ignore_ascii_case("AS"),
+            Some(Token::Ident(next)) if next.eq_ignore_ascii_case("AS") => {
+                !matches!(tokens.get(pos + 2), Some(Token::Ident(_)))
+            }
+            Some(Token::Ident(_)) => true,
             Some(Token::Punct('*')) => true,
             _ => false,
         }
@@ -9258,6 +9271,35 @@ mod tests {
             }
             other => panic!("expected Aggregate statement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_named_as() {
+        // PR #1098 レビュー対応（codex/review P1・Cursor Bugbot 指摘）:
+        // `is_distinct_modifier` が次トークン `Ident("AS")` を常に列名側の目印と
+        // 誤判定すると、列名 `as`（`catalog::validate_identifier` が許可する
+        // 識別子）を対象にした `SELECT DISTINCT as ...` まで列名 `distinct` の
+        // 投影として解釈され `42601` で拒否されていた。`AS` の 1 つ先の
+        // トークンまで見て「別名なし＝列名 as に対する DISTINCT 修飾子」と
+        // 判定することで、この形状が受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql("SELECT DISTINCT as FROM documents", &lookup)
+            .expect("SELECT DISTINCT <column named 'as'> must be accepted");
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(agg.group_by.as_ref().map(|g| g.column.as_str()), Some("as"));
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_count_distinct_column_named_as() {
+        // 上記と同じ曖昧さの `COUNT(DISTINCT <expr>)`（[`Parser::parse_aggregate_item`]）
+        // 側での固定（PR #1098 レビュー対応）。
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT COUNT(DISTINCT as) FROM documents", &lookup)
+            .expect("COUNT(DISTINCT <column named 'as'>) must be accepted");
     }
 
     #[test]
