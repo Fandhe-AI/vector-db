@@ -66,9 +66,14 @@ pub struct TlsServerConfig {
     key: SigningKey,
     channel_binding: Option<TlsServerEndPoint>,
     /// SCRAM-SHA-256-PLUS（`p=tls-server-end-point`）を機構リストへ
-    /// 提示するか（[`Self::with_scram_channel_binding`]。既定
-    /// `true`＝提示する。libpq 相互運用上の懸念により無効化する opt-in を
-    /// 用意する。詳細は `docs/design/tls-channel-binding.md` 参照）。
+    /// 提示するか（[`Self::with_scram_channel_binding`]）。既定 `false`
+    /// （非提示）。psql 18.6・OpenSSL 3.5.5 での実測（Issue #970 §3 ブロック
+    /// C。`tests/wire_scram_plus_psql_interop.rs`）で、本サーバーが受理する
+    /// 唯一の葉鍵種別（Ed25519）の証明書に対し libpq の既定設定
+    /// （`channel_binding=prefer`）が `could not find digest for NID UNDEF`
+    /// で TLS 接続自体に失敗することを確認したため、既定を非提示側へ倒す
+    /// （`channel_binding=disable` は成功）。詳細・実測結果・opt-in 手順は
+    /// `docs/design/tls-channel-binding.md` 参照。
     advertise_scram_channel_binding: bool,
 }
 
@@ -100,8 +105,9 @@ impl TlsServerConfig {
     /// から `tls-server-end-point`（Issue #970）を 1 回だけ算出する。算出に
     /// 失敗しても起動失敗にはせず `channel_binding` を `None` にする
     /// （[`Self::channel_binding`] のドキュメンテーションコメント参照）。
-    /// SCRAM-SHA-256-PLUS の提示は既定で有効（[`Self::
-    /// with_scram_channel_binding`] で opt-out できる）。
+    /// SCRAM-SHA-256-PLUS の提示は既定で無効（libpq 相互運用ゲートの実測結果。
+    /// [`Self::with_scram_channel_binding`] のドキュメンテーションコメント
+    /// 参照）。
     pub fn new(
         chain: ServerCertificateChain,
         key: SigningKey,
@@ -113,7 +119,7 @@ impl TlsServerConfig {
                 chain,
                 key,
                 channel_binding,
-                advertise_scram_channel_binding: true,
+                advertise_scram_channel_binding: false,
             })
         } else {
             Err(TlsServerConfigError::PublicKeyMismatch)
@@ -121,8 +127,9 @@ impl TlsServerConfig {
     }
 
     /// SCRAM-SHA-256-PLUS の機構リスト提示可否を明示的に設定する
-    /// （libpq 相互運用ゲートの結果に応じた opt-out。#967 が CLI から
-    /// 呼ぶ想定。詳細は `docs/design/tls-channel-binding.md` 参照）。
+    /// （libpq 相互運用ゲートの実測結果により既定 `false`。opt-in で `true`
+    /// にできる。#967 が CLI から呼ぶ想定。詳細は
+    /// `docs/design/tls-channel-binding.md` 参照）。
     pub fn with_scram_channel_binding(mut self, enabled: bool) -> Self {
         self.advertise_scram_channel_binding = enabled;
         self
