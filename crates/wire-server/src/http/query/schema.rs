@@ -819,15 +819,257 @@ pub static DELETE_SCHEMA: ObjectSchema = ObjectSchema {
     ],
 };
 
+/// `create_table.columns[*]` のサブスキーマ（NOSQL-13・TASK-207、Issue #910）。
+/// 受理する `type` の語彙は SQL 表層の `CREATE TABLE` と同じ 3 種
+/// （`text`／`vector`／`integer`／`bigint`）に限る（意味検証は
+/// [`super::ddl`] が engine のトークン入口
+/// （`engine::sql::allowlist::validate_create_table_tokens`）へ渡す前に行う。
+/// 本スキーマは型のみを検査する）。
+pub static DDL_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "ddl_column",
+    fields: &[
+        FieldSpec {
+            key: "name",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "type",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "dim",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "nullable",
+            presence: Presence::Optional,
+            ty: FieldType::Bool,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "default",
+            presence: Presence::Optional,
+            // 文字列・数値・真偽値のいずれも型としては受理し、`bool`／`null`
+            // 相当（SQL の CREATE TABLE で表現できない DEFAULT）の拒否は
+            // [`super::ddl`] の意味検証が担う（`FILTER_ITEM_SCHEMA.value` と
+            // 同じ設計）。
+            ty: FieldType::Scalar,
+            nullable: false,
+        },
+    ],
+};
+
+/// `create_table.constraints[*].references` のサブスキーマ（`foreign_key`
+/// 制約専用。NOSQL-13・TASK-207、Issue #910）。
+pub static DDL_REFERENCES_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "ddl_references",
+    fields: &[
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "columns",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::String),
+            nullable: false,
+        },
+    ],
+};
+
+/// `create_table.constraints[*]` のサブスキーマ（NOSQL-13・TASK-207、
+/// Issue #910）。`kind` の語彙（`primary_key`／`unique`／`foreign_key`／
+/// `check`）・`columns` の必須性は [`super::ddl`] の意味検証が判定する
+/// （`check` は `columns` を要求しないため、本スキーマでは `columns` を
+/// `Optional` として宣言し、`kind` ごとの必須性は呼び出し元が
+/// `Validated::required_array` で判定する。`WHERE_ID_SCHEMA` と同じ
+/// 「スキーマは型のみ、意味は呼び出し元」設計）。
+pub static DDL_CONSTRAINT_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "ddl_constraint",
+    fields: &[
+        FieldSpec {
+            key: "kind",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "columns",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::String),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "references",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&DDL_REFERENCES_SCHEMA),
+            nullable: false,
+        },
+    ],
+};
+
+/// `create_table` op のトップレベルスキーマ（NOSQL-13・TASK-207、Issue #910）。
+/// `engine::sql::allowlist::validate_create_table_tokens` と同一の実行器へ
+/// トークン列として渡す入口は [`super::ddl`] が担う。
+pub static CREATE_TABLE_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "create_table",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "columns",
+            presence: Presence::Required,
+            ty: FieldType::Array(ElementType::Object(&DDL_COLUMN_SCHEMA)),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "constraints",
+            presence: Presence::Optional,
+            ty: FieldType::Array(ElementType::Object(&DDL_CONSTRAINT_SCHEMA)),
+            nullable: false,
+        },
+    ],
+};
+
+/// `alter_table.add_column` のサブスキーマ（NOSQL-13・TASK-207、Issue #910）。
+/// 受理する `type` の語彙は SQL 表層 `ALTER TABLE ADD COLUMN`
+/// （`engine::sql::ddl_column_type::SqlColumnTypeName`）と同じ集合。
+pub static DDL_ADD_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "ddl_add_column",
+    fields: &[
+        FieldSpec {
+            key: "name",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "type",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "dim",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "precision",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "scale",
+            presence: Presence::Optional,
+            ty: FieldType::Number,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "enum_type",
+            presence: Presence::Optional,
+            ty: FieldType::String,
+            nullable: false,
+        },
+    ],
+};
+
+/// `alter_table.drop_column` のサブスキーマ（NOSQL-13・TASK-207、Issue #910）。
+/// SQL 表層の `ALTER TABLE ... DROP COLUMN` が未結線（[`super::ddl`]
+/// モジュール doc 参照）のため、本スキーマを通過しても常に `0A000` を返す。
+pub static DDL_DROP_COLUMN_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "ddl_drop_column",
+    fields: &[FieldSpec {
+        key: "name",
+        presence: Presence::Required,
+        ty: FieldType::String,
+        nullable: false,
+    }],
+};
+
+/// `alter_table` op のトップレベルスキーマ（NOSQL-13・TASK-207、Issue #910）。
+/// `add_column`／`drop_column` は排他必須（[`super::ddl`] が意味検証する）。
+pub static ALTER_TABLE_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "alter_table",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "add_column",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&DDL_ADD_COLUMN_SCHEMA),
+            nullable: false,
+        },
+        FieldSpec {
+            key: "drop_column",
+            presence: Presence::Optional,
+            ty: FieldType::Object(&DDL_DROP_COLUMN_SCHEMA),
+            nullable: false,
+        },
+    ],
+};
+
+/// `drop_table` op のトップレベルスキーマ（NOSQL-13・TASK-207、Issue #910）。
+pub static DROP_TABLE_SCHEMA: ObjectSchema = ObjectSchema {
+    name: "drop_table",
+    fields: &[
+        FieldSpec {
+            key: "op",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+        FieldSpec {
+            key: "table",
+            presence: Presence::Required,
+            ty: FieldType::String,
+            nullable: false,
+        },
+    ],
+};
+
 /// op 名（厳密一致。trim・大文字小文字の読み替えはしない）→ [`ObjectSchema`]
 /// の対応表。`schema_for` の実体であり、単一情報源として扱う。
-pub const OP_SCHEMAS: [(&str, &ObjectSchema); 6] = [
+pub const OP_SCHEMAS: [(&str, &ObjectSchema); 9] = [
     ("search", &SEARCH_SCHEMA),
     ("scan", &SCAN_SCHEMA),
     ("aggregate", &AGGREGATE_SCHEMA),
     ("insert", &INSERT_SCHEMA),
     ("update", &UPDATE_SCHEMA),
     ("delete", &DELETE_SCHEMA),
+    ("create_table", &CREATE_TABLE_SCHEMA),
+    ("alter_table", &ALTER_TABLE_SCHEMA),
+    ("drop_table", &DROP_TABLE_SCHEMA),
 ];
 
 /// `op` 名からスキーマを引く。語彙外は `None`（`0A000` への写像・応答は
@@ -868,7 +1110,17 @@ mod tests {
         let ops: Vec<&str> = OP_SCHEMAS.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             ops,
-            vec!["search", "scan", "aggregate", "insert", "update", "delete"]
+            vec![
+                "search",
+                "scan",
+                "aggregate",
+                "insert",
+                "update",
+                "delete",
+                "create_table",
+                "alter_table",
+                "drop_table",
+            ]
         );
         for (name, schema) in OP_SCHEMAS.iter() {
             assert!(std::ptr::eq(schema_for(name).unwrap(), *schema));
@@ -1143,7 +1395,7 @@ mod tests {
 
     #[test]
     fn unknown_key_is_rejected_per_op() {
-        let cases: [(&'static ObjectSchema, &str); 6] = [
+        let cases: [(&'static ObjectSchema, &str); 9] = [
             (
                 &SEARCH_SCHEMA,
                 r#"{"op":"search","table":"docs","limit":1,"bogus":1}"#,
@@ -1167,6 +1419,18 @@ mod tests {
             (
                 &DELETE_SCHEMA,
                 r#"{"op":"delete","table":"docs","where":{"id":1},"bogus":1}"#,
+            ),
+            (
+                &CREATE_TABLE_SCHEMA,
+                r#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text"}],"bogus":1}"#,
+            ),
+            (
+                &ALTER_TABLE_SCHEMA,
+                r#"{"op":"alter_table","table":"docs","add_column":{"name":"a","type":"text"},"bogus":1}"#,
+            ),
+            (
+                &DROP_TABLE_SCHEMA,
+                r#"{"op":"drop_table","table":"docs","bogus":1}"#,
             ),
         ];
         for (schema, json) in cases {
@@ -1196,6 +1460,14 @@ mod tests {
             (
                 &DELETE_SCHEMA,
                 r#"{"op":"delete","table":"docs","where":{"id":1},"tenant_id":"evil"}"#,
+            ),
+            (
+                &CREATE_TABLE_SCHEMA,
+                r#"{"op":"create_table","table":"docs","columns":[{"name":"a","type":"text"}],"tenant_id":"evil"}"#,
+            ),
+            (
+                &DROP_TABLE_SCHEMA,
+                r#"{"op":"drop_table","table":"docs","tenant_id":"evil"}"#,
             ),
         ] {
             let v = obj(json);

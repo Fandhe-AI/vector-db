@@ -1,11 +1,13 @@
 # NoSQL API
 
 `wire-server --surface nosql` が公開する 3 エンドポイント（`POST /v1/session`・
-`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 6 値
-（`search`／`scan`／`aggregate`／`insert`／`update`／`delete`）の JSON スキーマを
-利用者向けに整理する。`update`／`delete` は `where`（単一行・`id` 完全一致形）は
-束縛・実行結線済みで、`filter`（述語形）は語彙・スキーマ検証のみ実装済み
-（実行結線は未実装。後述の各節参照）。
+`POST /v1/session/close`・`POST /v1/query`）と、`POST /v1/query` の `op` 9 値
+（`search`／`scan`／`aggregate`／`insert`／`update`／`delete`／`create_table`／
+`alter_table`／`drop_table`）の JSON スキーマを利用者向けに整理する。
+`update`／`delete` は `where`（単一行・`id` 完全一致形）は束縛・実行結線済みで、
+`filter`（述語形）は語彙・スキーマ検証のみ実装済み（実行結線は未実装。後述の
+各節参照）。`create_table`／`alter_table`／`drop_table`（DDL 3 op）は
+`--ddl-allowed-users` に列挙したユーザーのみ実行できる（後述の各節参照）。
 
 **この文書の情報源はコードとテストのみ**であり、`docs/spec`（private submodule）
 の本文は転記しない。参照が必要な箇所は TASK-nn・ビヘイビア ID のポインタ表記に
@@ -443,6 +445,69 @@ SQL 表層とのパリティ・RLS-9 応答同一性・台帳のプロセス・�
 層 B `three_client_http_e2e.rs::run_sql_nosql_dml_parity_scenario`
 （Issue #877）が検証する。
 
+### `create_table`／`alter_table`／`drop_table`（DDL）
+
+NOSQL-13・TASK-207（Issue #910）で `op` 語彙へ加わった DDL 3 op。SQL 表層の
+`CREATE TABLE`／`ALTER TABLE ... ADD COLUMN`／`DROP TABLE`（SQL-23）と
+**同一の実行器**（`engine::core::EngineCore::execute_parsed_in_session`）へ、
+JSON の各フィールドを SQL 表層と同じ字句トークン列へ写像したうえで到達させる
+（第 2 の DDL 実行器・第 2 の権限判定は存在しない。写像の実装は
+`crates/wire-server/src/http/query/ddl.rs`）。
+
+**DDL 実行権限**: `--ddl-allowed-users` に列挙したユーザーのみ実行できる
+（`POST /v1/session` のログイン成功直後に確定し、以後そのセッションの寿命中
+固定される）。権限の無いセッションは、対象テーブルの有無にかかわらず常に
+`42501`（`403`）のみを返す（存在オラクル非公開。テナント境界とは別軸の判定）。
+
+`create_table.columns[].type` の受理集合は `text`／`vector`／`integer`／
+`bigint`（SQL 表層の `CREATE TABLE` と同じ）。`alter_table.add_column.type` は
+`text`／`integer`／`bigint`／`real`／`double`（`DOUBLE PRECISION`）／
+`boolean`／`date`／`timestamp`／`bytea`／`json`／`jsonb`／`uuid`／
+`numeric`（`precision`／`scale` 必須）／`vector`（`dim` 必須。構文は通るが
+実行段で `0A000`）／`enum`（`enum_type` 必須）。
+
+| キー | 必須 | 型 | 備考 |
+| --- | --- | --- | --- |
+| `op` | ○ | string | `"create_table"`／`"alter_table"`／`"drop_table"` |
+| `table` | ○ | string | |
+| `columns`（`create_table`） | ○ | object[] | `{"name","type","dim"?,"nullable"?,"default"?}`。予約列名（`id`／`tenant_id`／`visibility`／`check`／`constraint`）は `42601` |
+| `constraints`（`create_table`） | △ | object[] | `{"kind":"primary_key"｜"unique"｜"foreign_key"｜"check","columns"?,"references"?}`。`references`＝`{"table","columns"?}`。`check` は `0A000`（述語の JSON 写像は別論点。後続 Issue の担当） |
+| `add_column`（`alter_table`） | △ | object | `{"name","type","dim"?,"precision"?,"scale"?,"enum_type"?}`。`drop_column` と排他必須（両方・双方欠落は `42601`） |
+| `drop_column`（`alter_table`） | △ | object | `{"name"}`。SQL 表層の `ALTER TABLE ... DROP COLUMN` が未結線のため常に `0A000` |
+
+成功応答は 3 op 共通で `{"ok":true}`（行数・件数を返さない）。
+
+要求例（`create_table`）:
+
+```json
+{"op": "create_table", "table": "docs", "columns": [
+  {"name": "embedding", "type": "vector", "dim": 3},
+  {"name": "lang", "type": "text", "nullable": true}
+]}
+```
+
+要求例（`alter_table`）:
+
+```json
+{"op": "alter_table", "table": "docs",
+ "add_column": {"name": "note", "type": "text"}}
+```
+
+要求例（`drop_table`）:
+
+```json
+{"op": "drop_table", "table": "docs"}
+```
+
+`create_index`／`drop_index`／`create_view`／`drop_view` は NOSQL-13 の対象外
+のまま語彙外（`0A000`）に据え置く。
+
+検証コード: `crates/wire-server/src/http/query/op.rs`・`schema.rs`・
+`ddl.rs`（単体テスト）・`gate.rs`・
+`crates/wire-server/tests/nosql13_ddl.rs`・`nosql1_op_vocabulary.rs`・
+`nosql8_schema_validation.rs`・`nosql9_op_allowlist.rs`・
+`crates/engine/tests/sql_ddl_tokens_public_api.rs`。
+
 ## `filter` 配列
 
 `search`／`scan`／`aggregate` 共通で使える事前フィルタ配列。
@@ -557,6 +622,9 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 | `UPDATE docs SET lang = 'en' WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `update` + `filter` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は Issue #871 の担当） |
 | `DELETE FROM docs WHERE id = 1 USING OPERATION_ID 'op-1'` | `delete` + `where.id` + `operation_id`（結線済み。同一実行器・同一台帳キー空間） |
 | `DELETE FROM docs WHERE lang = 'ja' USING OPERATION_ID 'op-1'` | `delete` + `filter` + `operation_id`（語彙・スキーマのみ実装済み。実行結線は Issue #871 の担当） |
+| `CREATE TABLE docs (embedding VECTOR(3), lang TEXT)` | `create_table` + `columns`（Issue #910。同一実行器） |
+| `ALTER TABLE docs ADD COLUMN note TEXT` | `alter_table` + `add_column`（Issue #910。同一実行器） |
+| `DROP TABLE docs` | `drop_table`（Issue #910。同一実行器） |
 
 対応の無いもの（NoSQL 側に受理形が存在しない。実際の応答は語彙外 `op` として
 `0A000`、または未知キーとして `42601`）:
@@ -570,6 +638,9 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 - `LIKE` の前方一致（`prefix`）以外の一致方式
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
 - `GROUP BY` への `ORDER BY`／`LIMIT` の付与
+- `ALTER TABLE ... DROP COLUMN`（SQL 表層が未結線。`alter_table.drop_column` は `0A000`）
+- `CREATE TABLE` の `CHECK` 制約（`create_table.constraints[].kind == "check"` は `0A000`）
+- `CREATE INDEX`／`DROP INDEX`／`CREATE VIEW`／`DROP VIEW`（NOSQL-13 の対象外）
 
 逆方向（NoSQL にあって SQL に対応形がないもの）は無い。
 
