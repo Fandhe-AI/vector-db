@@ -244,7 +244,7 @@ fn serve_tls_connection<H: RequestHandler>(
         return;
     }
 
-    // `DeadlineStream` で包んでから `TlsStream` に渡す（D-E）。TlsStream の
+    // `DeadlineStream` で包んでから `TlsStream` に渡す（H8）。TlsStream の
     // 内部レコード読み取りループ（`fill_from_inner`）が `inner.read` を
     // 複数回呼んでも、各呼び出しの直前に絶対期限までの残り時間を下位
     // ソケットへ再設定するため、`conn::handle_connection_with` 側が 1 回の

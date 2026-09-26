@@ -32,7 +32,7 @@
 //!   （平文であっても）要求を解釈されずに応答なしで閉じられること（H4）
 //! - TLS-7: TLS レコード 1 個分の暗号文を 1 バイトずつ送り続けても、要求
 //!   読み取りの絶対期限が本番値の近傍で効くこと（`http::deadline_stream`
-//!   の D-E 対応の回帰）
+//!   の H8 対応の回帰）
 
 #[path = "http_common/mod.rs"]
 mod http_common;
@@ -88,7 +88,7 @@ fn spawn_router_listener_tls_with_limiter(
 /// [`spawn_router_listener_tls_with_limiter`] の、要求読み取りの絶対期限
 /// （`read_timeout`）も呼び出し元が指定できる版。TLS-7（トリクル送信下でも
 /// 絶対期限が本番の 30 秒より大幅に延びないことの回帰確認。`http::
-/// deadline_stream` の D-E 対応）を現実的な時間で検証するために使う。
+/// deadline_stream` の H8 対応）を現実的な時間で検証するために使う。
 fn spawn_router_listener_tls_with_limiter_and_read_timeout(
     users_path: &std::path::Path,
     mode: TlsMode,
@@ -618,7 +618,7 @@ fn require_mode_closes_over_capacity_connection_without_response() {
 
 /// TLS-7: TLS レコード 1 個分の暗号文を 1 バイトずつ小さな間隔で送り続けて
 /// も、要求読み取りの絶対期限（Slowloris 対策）が本番の値の近傍で正しく
-/// 効くこと（`http::deadline_stream::DeadlineStream` の D-E 対応の回帰。
+/// 効くこと（`http::deadline_stream::DeadlineStream` の H8 対応の回帰。
 /// 単体テスト `http::deadline_stream::tests::
 /// repeated_reads_are_bounded_by_absolute_deadline_despite_trickle` の
 /// TLS 実プロトコル版）。`DeadlineStream` が無ければ

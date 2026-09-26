@@ -262,6 +262,17 @@ TLS opt-in（`--tls-cert`／`--tls-key`／`--tls-mode`）を接続した
   送出を兼ねる。無応答クローズ経路（`Outcome::CloseSilently`）は
   `graceful_close`（TLS では `close_notify`。平文では no-op）してから
   `shutdown_both` する。
+- **H8（TLS 上のトリクル送信に対する絶対期限）**: `tls::stream::TlsStream::
+  read` は 1 レコード分がそろうまで内部で `inner.read` を複数回ループする
+  ため、`http::conn` が `read` 呼び出し前に一度だけ設定するソケット
+  タイムアウトは内部ループの各反復で使い回され、相手が 1 レコードの中身を
+  期限ぎりぎりの間隔で 1 バイトずつ送り続けると 1 回の `read` 呼び出しが
+  「レコード長 × タイムアウト値」まで際限なく延びる（Slowloris の変種。
+  平文経路には無い問題）。`http::deadline_stream::DeadlineStream` で生
+  ソケットを包んでから `TlsStream::new` へ渡すことで是正した。
+  `set_read_timeout` を絶対時刻へ変換して保持し、内部ループから複数回
+  呼ばれる `Read::read` の直前に毎回「残り時間」を下位ソケットへ
+  再設定する。平文経路（`DeadlineStream` を経由しない）は無変更。
 
 既知の制約（対象外として持ち越し）:
 

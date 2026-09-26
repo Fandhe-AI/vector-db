@@ -16,7 +16,7 @@
 //! 相手が 1 レコードの中身を期限ぎりぎりの間隔で 1 バイトずつ送り続けると、
 //! 外側から見た 1 回の `read` 呼び出しが「レコード長 × タイムアウト値」まで
 //! 際限なく延びうる（Slowloris の変種。設計記録:
-//! `docs/design/tls-wire-connection.md`「HTTPS 表層（#968）」D-E）。
+//! `docs/design/tls-wire-connection.md`「HTTPS 表層（#968）」H8）。
 //!
 //! [`DeadlineStream`] は `TlsStream::new` へ渡す前に生 `TcpStream` を包み、
 //! `set_read_timeout` を絶対時刻（[`Instant`]）へ変換して保持する。以後の
