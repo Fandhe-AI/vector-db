@@ -9,10 +9,12 @@
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
+use engine::numeric::Decimal;
 use engine::policy::PolicyContext;
 use engine::row_codec::Value;
 use engine::sql::exec::{Cell, ColumnMeta};
 use engine::storage::{Storage, Visibility};
+use engine::uuid::Uuid;
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -326,6 +328,449 @@ fn offset_skips_output_rows_but_window_values_reflect_full_population() {
     for row in &offset.rows {
         assert_eq!(cell_int(&row.cells[1]), 6);
     }
+}
+
+// ---------- NULL 契約・主要スカラー型のキー・集計引数 ----------
+//
+// レビュー指摘（Issue #930 最終レビュー 1）: `WindowKeyValue`／`cmp_window_key`／
+// `partition_key_bytes`（`sql::window`）の NULL 契約（PARTITION BY で NULL 同値化・
+// ORDER BY で NULL は ASC 末尾・DESC 先頭。peer 決定性の詳細は
+// `docs/design/window-functions.md` 参照）と、DATE/TIMESTAMP/NUMERIC/UUID/
+// BOOLEAN/REAL/DOUBLE/BIGINT をキー・集計引数に使うケースを固定する。
+
+/// 任意のテーブル・列値で 1 行挿入する（`insert_row`／`insert_row_with_visibility`
+/// は `TABLE`（`docs`）専用のため、本セクション専用のテーブルに使う汎用版）。
+fn insert_values(storage: &Storage, ctx: &PolicyContext, table: &str, id: u64, values: &[Value]) {
+    let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
+        "test-op-{table}-{}-{id}",
+        ctx.tenant_id()
+    ))
+    .expect("valid operation_id");
+    engine::tenant::insert_typed_row(storage, table, ctx, id, Visibility::Public, values, &op_id)
+        .expect("insert row");
+}
+
+fn cell_float(cell: &Cell) -> f64 {
+    match cell {
+        Cell::Float(v) => *v,
+        other => panic!("expected Cell::Float, got {other:?}"),
+    }
+}
+
+fn cell_numeric(cell: &Cell) -> Decimal {
+    match cell {
+        Cell::Numeric(d) => *d,
+        other => panic!("expected Cell::Numeric, got {other:?}"),
+    }
+}
+
+const NULLCTL_TABLE: &str = "nullctl";
+
+fn schema_null_contract() -> TableSchema {
+    TableSchema::new(
+        NULLCTL_TABLE,
+        vec![
+            ColumnDef::new("pgrp", ColumnType::Text, true),
+            ColumnDef::new("ord", ColumnType::Integer, true),
+        ],
+    )
+}
+
+/// `pgrp`（PARTITION BY 対象）・`ord`（ORDER BY 対象）をそれぞれ独立に NULL 混在
+/// させた 5 行（NULL 契約の検証専用。値の意図は各テストのコメント参照）。
+fn seed_null_contract(storage: &Storage, ctx: &PolicyContext) {
+    storage
+        .create_table(&schema_null_contract())
+        .expect("create table");
+    insert_values(
+        storage,
+        ctx,
+        NULLCTL_TABLE,
+        1,
+        &[Value::Text("a".to_string()), Value::Integer(10)],
+    );
+    insert_values(
+        storage,
+        ctx,
+        NULLCTL_TABLE,
+        2,
+        &[Value::Text("a".to_string()), Value::Integer(20)],
+    );
+    insert_values(
+        storage,
+        ctx,
+        NULLCTL_TABLE,
+        3,
+        &[Value::Text("a".to_string()), Value::Null],
+    );
+    insert_values(
+        storage,
+        ctx,
+        NULLCTL_TABLE,
+        4,
+        &[Value::Null, Value::Integer(5)],
+    );
+    insert_values(
+        storage,
+        ctx,
+        NULLCTL_TABLE,
+        5,
+        &[Value::Null, Value::Integer(15)],
+    );
+}
+
+#[test]
+fn partition_by_null_groups_together_and_order_by_null_sorts_last_asc_first_desc() {
+    let path = unique_db_path("window-null-contract");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_null_contract(&storage, &ctx);
+    let core = new_core(storage);
+
+    // PARTITION BY NULL 同値化: pgrp="a" の 3 行 (id 1,2,3) は同一パーティション、
+    // pgrp=NULL の 2 行 (id 4,5) も NULL 同士で同一パーティションにまとまる
+    // （NULL 同士を別パーティションに分けない）。
+    let by_partition = expect_query(core.execute_sql(
+        &ctx,
+        &format!("SELECT id, COUNT(*) OVER (PARTITION BY pgrp) FROM {NULLCTL_TABLE} LIMIT 10"),
+    ));
+    let rows = row_map(&by_partition, 0);
+    for id in [1u64, 2, 3] {
+        assert_eq!(cell_int(&rows[&id][1]), 3, "pgrp=a group size, id {id}");
+    }
+    for id in [4u64, 5] {
+        assert_eq!(cell_int(&rows[&id][1]), 2, "pgrp=NULL group size, id {id}");
+    }
+
+    // ORDER BY ... ASC: NULL は末尾（PostgreSQL 既定）。非 NULL は昇順
+    // 5(id4),10(id1),15(id5),20(id2) の後に NULL(id3) が続く。
+    let asc = expect_query(core.execute_sql(
+        &ctx,
+        &format!("SELECT id, ROW_NUMBER() OVER (ORDER BY ord) FROM {NULLCTL_TABLE} LIMIT 10"),
+    ));
+    let asc_rows = row_map(&asc, 0);
+    assert_eq!(cell_int(&asc_rows[&4][1]), 1);
+    assert_eq!(cell_int(&asc_rows[&1][1]), 2);
+    assert_eq!(cell_int(&asc_rows[&5][1]), 3);
+    assert_eq!(cell_int(&asc_rows[&2][1]), 4);
+    assert_eq!(
+        cell_int(&asc_rows[&3][1]),
+        5,
+        "NULL ord must sort last under ASC"
+    );
+
+    // ORDER BY ... DESC: NULL は先頭（PostgreSQL 既定）。NULL(id3) の後に
+    // 降順 20(id2),15(id5),10(id1),5(id4) が続く。
+    let desc = expect_query(core.execute_sql(
+        &ctx,
+        &format!("SELECT id, ROW_NUMBER() OVER (ORDER BY ord DESC) FROM {NULLCTL_TABLE} LIMIT 10"),
+    ));
+    let desc_rows = row_map(&desc, 0);
+    assert_eq!(
+        cell_int(&desc_rows[&3][1]),
+        1,
+        "NULL ord must sort first under DESC"
+    );
+    assert_eq!(cell_int(&desc_rows[&2][1]), 2);
+    assert_eq!(cell_int(&desc_rows[&5][1]), 3);
+    assert_eq!(cell_int(&desc_rows[&1][1]), 4);
+    assert_eq!(cell_int(&desc_rows[&4][1]), 5);
+}
+
+const TYPED_TABLE: &str = "typed_keys";
+
+fn schema_typed_keys() -> TableSchema {
+    TableSchema::new(
+        TYPED_TABLE,
+        vec![
+            ColumnDef::new("grp", ColumnType::Text, false),
+            ColumnDef::new("c_big", ColumnType::BigInt, true),
+            ColumnDef::new("c_real", ColumnType::Real, true),
+            ColumnDef::new("c_double", ColumnType::Double, true),
+            ColumnDef::new("c_bool", ColumnType::Boolean, true),
+            ColumnDef::new("c_date", ColumnType::Date, true),
+            ColumnDef::new("c_ts", ColumnType::Timestamp, true),
+            ColumnDef::new(
+                "c_num",
+                ColumnType::Numeric {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            ),
+            ColumnDef::new("c_uuid", ColumnType::Uuid, true),
+        ],
+    )
+}
+
+fn decimal(unscaled: i128, scale: u8) -> Decimal {
+    Decimal::from_parts(unscaled, scale).expect("valid decimal for test")
+}
+
+fn uuid_n(n: u8) -> Uuid {
+    Uuid::from_bytes([n; 16])
+}
+
+/// `grp="a"` の 3 行は各型付き列にすべて異なる非 NULL 値を持ち（SUM で正しく
+/// 合算されることの検証・キー列としては行ごとに異なるパーティションになる
+/// ことの検証を兼ねる。ただし `c_bool` は取りうる値が 2 通りしかないため
+/// 3 行とも同一値にする）。`grp="b"` の 2 行はすべての型付き列が NULL
+/// （NULL 同士が 1 パーティションにまとまることの検証）。
+fn seed_typed_keys(storage: &Storage, ctx: &PolicyContext) {
+    storage
+        .create_table(&schema_typed_keys())
+        .expect("create table");
+    insert_values(
+        storage,
+        ctx,
+        TYPED_TABLE,
+        1,
+        &[
+            Value::Text("a".to_string()),
+            Value::BigInt(100),
+            Value::Real(1.5),
+            Value::Double(10.5),
+            Value::Bool(true),
+            Value::Date(0),
+            Value::Timestamp(0),
+            Value::Numeric(decimal(1000, 2)),
+            Value::Uuid(uuid_n(1)),
+        ],
+    );
+    insert_values(
+        storage,
+        ctx,
+        TYPED_TABLE,
+        2,
+        &[
+            Value::Text("a".to_string()),
+            Value::BigInt(200),
+            Value::Real(2.5),
+            Value::Double(20.5),
+            Value::Bool(true),
+            Value::Date(1),
+            Value::Timestamp(1_000_000),
+            Value::Numeric(decimal(2000, 2)),
+            Value::Uuid(uuid_n(2)),
+        ],
+    );
+    insert_values(
+        storage,
+        ctx,
+        TYPED_TABLE,
+        3,
+        &[
+            Value::Text("a".to_string()),
+            Value::BigInt(300),
+            Value::Real(3.5),
+            Value::Double(30.5),
+            Value::Bool(true),
+            Value::Date(2),
+            Value::Timestamp(2_000_000),
+            Value::Numeric(decimal(3000, 2)),
+            Value::Uuid(uuid_n(3)),
+        ],
+    );
+    for id in [4u64, 5] {
+        insert_values(
+            storage,
+            ctx,
+            TYPED_TABLE,
+            id,
+            &[
+                Value::Text("b".to_string()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ],
+        );
+    }
+}
+
+#[test]
+fn partition_by_accepts_all_scalar_key_types_and_groups_nulls_together() {
+    let path = unique_db_path("window-typed-keys");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_typed_keys(&storage, &ctx);
+    let core = new_core(storage);
+
+    let result = expect_query(core.execute_sql(
+        &ctx,
+        &format!(
+            "SELECT id, \
+             COUNT(*) OVER (PARTITION BY c_big), \
+             COUNT(*) OVER (PARTITION BY c_real), \
+             COUNT(*) OVER (PARTITION BY c_double), \
+             COUNT(*) OVER (PARTITION BY c_bool), \
+             COUNT(*) OVER (PARTITION BY c_date), \
+             COUNT(*) OVER (PARTITION BY c_ts), \
+             COUNT(*) OVER (PARTITION BY c_num), \
+             COUNT(*) OVER (PARTITION BY c_uuid) \
+             FROM {TYPED_TABLE} LIMIT 10"
+        ),
+    ));
+    let rows = row_map(&result, 0);
+    // BIGINT/REAL/DOUBLE/DATE/TIMESTAMP/NUMERIC/UUID 列は行ごとに異なる値
+    // なので、id 1..3 はそれぞれ単独パーティション (count=1) になる。
+    for id in [1u64, 2, 3] {
+        for col in [1usize, 2, 3, 5, 6, 7, 8] {
+            assert_eq!(cell_int(&rows[&id][col]), 1, "col {col} id {id}");
+        }
+        // BOOLEAN は 3 行とも同一値 (true) のため 1 パーティションにまとまる。
+        assert_eq!(cell_int(&rows[&id][4]), 3, "c_bool id {id}");
+    }
+    // NULL の 2 行 (id 4,5) は列を問わず NULL 同士で 1 パーティションにまとまる。
+    for id in [4u64, 5] {
+        for (col, cell) in rows[&id][1..=8].iter().enumerate() {
+            assert_eq!(cell_int(cell), 2, "col {} id {id}", col + 1);
+        }
+    }
+}
+
+#[test]
+fn sum_over_numeric_like_types_computes_correct_totals_and_null_group_is_null() {
+    let path = unique_db_path("window-typed-sum");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_typed_keys(&storage, &ctx);
+    let core = new_core(storage);
+
+    let result = expect_query(core.execute_sql(
+        &ctx,
+        &format!(
+            "SELECT id, \
+             SUM(c_big) OVER (PARTITION BY grp), \
+             SUM(c_real) OVER (PARTITION BY grp), \
+             SUM(c_double) OVER (PARTITION BY grp), \
+             SUM(c_num) OVER (PARTITION BY grp) \
+             FROM {TYPED_TABLE} LIMIT 10"
+        ),
+    ));
+    let rows = row_map(&result, 0);
+    for id in [1u64, 2, 3] {
+        assert_eq!(cell_signed(&rows[&id][1]), 600, "SUM(c_big) id {id}");
+        assert_eq!(cell_float(&rows[&id][2]), 7.5, "SUM(c_real) id {id}");
+        assert_eq!(cell_float(&rows[&id][3]), 61.5, "SUM(c_double) id {id}");
+        assert_eq!(
+            cell_numeric(&rows[&id][4]),
+            decimal(6000, 2),
+            "SUM(c_num) id {id}"
+        );
+    }
+    // すべて NULL の grp="b" グループは合算対象が無いため SUM は NULL。
+    for id in [4u64, 5] {
+        assert!(matches!(rows[&id][1], Cell::Null), "SUM(c_big) id {id}");
+        assert!(matches!(rows[&id][2], Cell::Null), "SUM(c_real) id {id}");
+        assert!(matches!(rows[&id][3], Cell::Null), "SUM(c_double) id {id}");
+        assert!(matches!(rows[&id][4], Cell::Null), "SUM(c_num) id {id}");
+    }
+}
+
+#[test]
+fn min_max_over_date_and_timestamp_computes_correct_bounds() {
+    let path = unique_db_path("window-typed-minmax");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_typed_keys(&storage, &ctx);
+    let core = new_core(storage);
+
+    let result = expect_query(core.execute_sql(
+        &ctx,
+        &format!(
+            "SELECT id, \
+             MIN(c_date) OVER (PARTITION BY grp), \
+             MAX(c_date) OVER (PARTITION BY grp), \
+             MIN(c_ts) OVER (PARTITION BY grp), \
+             MAX(c_ts) OVER (PARTITION BY grp) \
+             FROM {TYPED_TABLE} LIMIT 10"
+        ),
+    ));
+    let rows = row_map(&result, 0);
+    for id in [1u64, 2, 3] {
+        assert_eq!(rows[&id][1], Cell::Date(0), "MIN(c_date) id {id}");
+        assert_eq!(rows[&id][2], Cell::Date(2), "MAX(c_date) id {id}");
+        assert_eq!(rows[&id][3], Cell::Timestamp(0), "MIN(c_ts) id {id}");
+        assert_eq!(
+            rows[&id][4],
+            Cell::Timestamp(2_000_000),
+            "MAX(c_ts) id {id}"
+        );
+    }
+    for id in [4u64, 5] {
+        assert_eq!(rows[&id][1], Cell::Null, "MIN(c_date) id {id}");
+        assert_eq!(rows[&id][2], Cell::Null, "MAX(c_date) id {id}");
+        assert_eq!(rows[&id][3], Cell::Null, "MIN(c_ts) id {id}");
+        assert_eq!(rows[&id][4], Cell::Null, "MAX(c_ts) id {id}");
+    }
+}
+
+#[test]
+fn rejects_sum_of_non_numeric_column_types() {
+    let path = unique_db_path("window-reject-sum-types");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let ctx = ctx_for("tenant-a");
+    seed_typed_keys(&storage, &ctx);
+    let core = new_core(storage);
+
+    for column in ["c_bool", "c_date", "c_ts", "c_uuid"] {
+        expect_rejected(
+            &core,
+            &ctx,
+            &format!("SELECT id, SUM({column}) OVER () FROM {TYPED_TABLE} LIMIT 10"),
+            "22000",
+        );
+    }
+}
+
+// ---------- パーティション数上限 ----------
+
+#[test]
+fn partition_count_over_max_window_partitions_is_rejected_as_payload_too_large() {
+    let path = unique_db_path("window-max-partitions");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let schema = TableSchema::new(
+        "wide_partitions",
+        vec![ColumnDef::new("k", ColumnType::Text, false)],
+    );
+    storage.create_table(&schema).expect("create table");
+    let ctx = ctx_for("tenant-a");
+
+    // `MAX_WINDOW_PARTITIONS`（`sql::group_by::MAX_GROUPS` = 10,000）を明らかに
+    // 超える規模を投入し、fail-closed に `54000` へ落ちることを実データで確認する
+    // （`sql_group_by.rs::group_count_over_max_groups_is_rejected_as_payload_too_large`
+    // と同方針。境界値ちょうどの検証は `sql::window::limit_tests` が単体テストで
+    // 別途担う）。
+    const OVER: u64 = 10_001;
+    for i in 0..OVER {
+        insert_values(
+            &storage,
+            &ctx,
+            "wide_partitions",
+            i,
+            &[Value::Text(format!("k{i}"))],
+        );
+    }
+
+    let core = new_core(storage);
+    let err = core
+        .execute_sql(
+            &ctx,
+            "SELECT id, COUNT(*) OVER (PARTITION BY k) FROM wide_partitions LIMIT 10",
+        )
+        .expect_err("exceeding MAX_WINDOW_PARTITIONS must be rejected");
+    assert_eq!(err.wire_code(), "54000");
 }
 
 // ---------- 決定性 ----------
