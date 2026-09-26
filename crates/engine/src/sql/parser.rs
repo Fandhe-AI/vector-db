@@ -120,6 +120,11 @@ pub struct BoundStatement {
     /// `expr_filters` フィールド自体は EXPLAIN・テスト等の可観測性のため
     /// 残置し、実行経路からは参照しない。
     pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。`AND` で結ぶ
+    /// `metadata_filters`／`expr_filters` とは独立に保持し、SCALAR 段は
+    /// 「両方が空かどうか」ではなく「3 つとも空かどうか」でゲートする契約に
+    /// 変える（`sql::exec` 等のフィルタ空判定を参照）。
+    pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     pub(crate) ranking: Ranking,
     pub(crate) limit: usize,
     /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。クエリ句 `USING MODE`
@@ -160,6 +165,7 @@ impl BoundStatement {
             rls_predicate_present,
             expr_filters: Vec::new(),
             expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
             ranking,
             limit,
             mode: crate::sql::mode::resolve_mode(None, None),
@@ -199,6 +205,23 @@ impl BoundStatement {
     /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
     pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
         &self.expr_filters
+    }
+
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。
+    pub fn or_filters(&self) -> &[crate::sql::where_tree::BoundOrGroup] {
+        &self.or_filters
+    }
+
+    /// `metadata_filters`・`expr_filters`・`or_filters` のいずれかが非空か
+    /// （TASK-208・Issue #912）。`sql::exec` 等が「WHERE にフィルタ条件が
+    /// 1 つも無い」ことを判定する既存の `metadata_filters.is_empty() &&
+    /// expr_filters.is_empty()` ゲートは、この判定へ置き換える契約とする
+    /// （置き換え漏れは OR 条件が黙って無視される fail-open のバグになる。
+    /// security.md「不安全な設計」対応）。
+    pub fn has_where_filters(&self) -> bool {
+        !self.metadata_filters.is_empty()
+            || !self.expr_filters.is_empty()
+            || !self.or_filters.is_empty()
     }
 
     /// DISTANCE 段のランキング方式。
@@ -1167,25 +1190,57 @@ fn is_typed_compare_column_type(ty: &ColumnType) -> bool {
     )
 }
 
+/// [`bind_where_predicates`]・[`bind_where_predicates_recursive`] の戻り値
+/// （TASK-208・SQL-24、Issue #912）: `(metadata_filters, expr_filters,
+/// rls_predicate_present, or_filters)`。clippy `type_complexity` 回避のための
+/// 型別名（意味的なラップ型ではなく、そのままタプルとして分配束縛して使う）。
+type BoundWherePredicates = (
+    Vec<MetadataFilter>,
+    Vec<crate::sql::udf_call::BoundExpr>,
+    bool,
+    Vec<crate::sql::where_tree::BoundOrGroup>,
+);
+
 pub(crate) fn bind_where_predicates(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
     dummy_equality_flags: &[bool],
-) -> Result<
-    (
-        Vec<MetadataFilter>,
-        Vec<crate::sql::udf_call::BoundExpr>,
-        bool,
-    ),
-    SqlSurfaceError,
-> {
+) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    // `dummy_equality_flags` は述語ツリー全体（トップレベル・`Or` 分岐の
+    // ネストを含む）を通じたソース出現順（深さ優先・左から右）の
+    // `Equality` 通し番号で添字付けされる（`sql::params::
+    // where_equality_literal_is_param` がトークン順で数える契約と一致させる
+    // ため、`equality_ordinal` は再帰全体で 1 つのカウンタを共有する。
+    // TASK-208・Issue #912）。
+    let mut equality_ordinal: usize = 0;
+    bind_where_predicates_recursive(
+        where_predicates,
+        schema,
+        udfs,
+        node_budget,
+        dummy_equality_flags,
+        &mut equality_ordinal,
+    )
+}
+
+/// [`bind_where_predicates`] の再帰本体。トップレベルの述語列だけでなく、
+/// [`WherePredicate::Or`] の各分岐（`AND` 列）を束縛するためにも自分自身を
+/// 再帰的に呼ぶ（TASK-208・SQL-24、Issue #912）。
+fn bind_where_predicates_recursive(
+    where_predicates: &[WherePredicate],
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+    dummy_equality_flags: &[bool],
+    equality_ordinal: &mut usize,
+) -> Result<BoundWherePredicates, SqlSurfaceError> {
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
-    let mut equality_ordinal: usize = 0;
     let mut expr_filters = Vec::new();
     let mut rls_predicate_present = false;
+    let mut or_filters = Vec::new();
     for predicate in where_predicates {
         match predicate {
             WherePredicate::Equality { column, value } => {
@@ -1212,11 +1267,11 @@ pub(crate) fn bind_where_predicates(
                 }
                 filter_skip_enum_validation.push(
                     dummy_equality_flags
-                        .get(equality_ordinal)
+                        .get(*equality_ordinal)
                         .copied()
                         .unwrap_or(false),
                 );
-                equality_ordinal += 1;
+                *equality_ordinal += 1;
             }
             WherePredicate::Compare { column, op, value } => {
                 // `< > <= >=`（TABLE-13・TASK-199、Issue #891・レーン B）。
@@ -1264,6 +1319,31 @@ pub(crate) fn bind_where_predicates(
                 }
                 expr_filters.push(bound);
             }
+            WherePredicate::Or(branches) => {
+                // TASK-208・SQL-24（Issue #912）: 各分岐を自分自身へ再帰的に
+                // 束縛する。`equality_ordinal` は再帰全体で共有するカウンタを
+                // そのまま渡し（ソース出現順＝深さ優先・左から右で数える契約）、
+                // `node_budget` も共有する（式の総ノード数上限は述語ツリー全体
+                // で 1 つ。`udf_call::MAX_EXPR_NODES` の既存契約を変えない）。
+                let mut bound_branches = Vec::with_capacity(branches.len());
+                for branch in branches {
+                    let (branch_metadata, branch_expr, _branch_rls, branch_or) =
+                        bind_where_predicates_recursive(
+                            branch,
+                            schema,
+                            udfs,
+                            node_budget,
+                            dummy_equality_flags,
+                            equality_ordinal,
+                        )?;
+                    bound_branches.push(crate::sql::where_tree::BoundConjunction::new(
+                        branch_metadata,
+                        branch_expr,
+                        branch_or,
+                    ));
+                }
+                or_filters.push(crate::sql::where_tree::BoundOrGroup::new(bound_branches));
+            }
         }
     }
     let metadata_filters = declarative_filter::bind_all_for_describe(
@@ -1271,7 +1351,12 @@ pub(crate) fn bind_where_predicates(
         schema,
         &filter_skip_enum_validation,
     )?;
-    Ok((metadata_filters, expr_filters, rls_predicate_present))
+    Ok((
+        metadata_filters,
+        expr_filters,
+        rls_predicate_present,
+        or_filters,
+    ))
 }
 
 pub fn bind(
@@ -1358,7 +1443,7 @@ pub fn bind_in_session(
 
     let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
 
-    let (metadata_filters, expr_filters, rls_predicate_present) =
+    let (metadata_filters, expr_filters, rls_predicate_present, or_filters) =
         bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget, &[])?;
 
     let ranking = bind_ranking(&stmt.order_by, schema, true)?;
@@ -1380,6 +1465,7 @@ pub fn bind_in_session(
         rls_predicate_present,
         expr_filters,
         expr_filter_programs,
+        or_filters,
         ranking,
         limit,
         mode: resolved_mode,
@@ -1426,13 +1512,14 @@ pub(crate) fn bind_projection_for_describe(
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
 
-    let (_metadata_filters, _expr_filters, _rls_predicate_present) = bind_where_predicates(
-        &stmt.where_predicates,
-        schema,
-        udfs,
-        &mut node_budget,
-        dummy_equality_flags,
-    )?;
+    let (_metadata_filters, _expr_filters, _rls_predicate_present, _or_filters) =
+        bind_where_predicates(
+            &stmt.where_predicates,
+            schema,
+            udfs,
+            &mut node_budget,
+            dummy_equality_flags,
+        )?;
 
     let _ranking = bind_ranking(&stmt.order_by, schema, validate_vector_literal)?;
     let _limit = validate_search_limit(stmt.limit)?;
@@ -1502,6 +1589,10 @@ pub struct BoundPredicateDelete {
     /// 出せず、アクセサーは設けない。`BoundScan::expr_filter_programs` と
     /// 同じ判断）。
     pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。[`Self::new`]
+    /// （NoSQL 表層の直接構築経路）は常に空にする——NoSQL 表層は本 Issue の
+    /// スコープ外（計画§「対象外」参照）。
+    pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     pub(crate) operation_id: Option<OperationId>,
     /// 影響行数の上限（[`check_affected_row_count`] へ渡す運搬役。既定値は
     /// [`DEFAULT_MAX_DML_AFFECTED_ROWS`]）。
@@ -1512,6 +1603,7 @@ impl BoundPredicateDelete {
     /// クレート外から `BoundPredicateDelete` を直接構築する constructor
     /// （NoSQL 表層 `delete` op〔#875・#876・NOSQL-12〕の入口。`BoundScan::new`
     /// と同じ契約。`expr_filters` のステップ列コンパイルは内部で行う）。
+    /// `or_filters` は常に空（NoSQL 表層は `OR` 未対応。TASK-208・Issue #912）。
     pub fn new(
         table: String,
         metadata_filters: Vec<MetadataFilter>,
@@ -1525,6 +1617,7 @@ impl BoundPredicateDelete {
             metadata_filters,
             expr_filters,
             expr_filter_programs,
+            or_filters: Vec::new(),
             operation_id,
             max_affected_rows,
         }
@@ -1543,6 +1636,18 @@ impl BoundPredicateDelete {
     /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
     pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
         &self.expr_filters
+    }
+
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。
+    pub fn or_filters(&self) -> &[crate::sql::where_tree::BoundOrGroup] {
+        &self.or_filters
+    }
+
+    /// [`BoundStatement::has_where_filters`] と同じ判定（TASK-208・Issue #912）。
+    pub fn has_where_filters(&self) -> bool {
+        !self.metadata_filters.is_empty()
+            || !self.expr_filters.is_empty()
+            || !self.or_filters.is_empty()
     }
 
     /// 文末専用句で搬送された、検証済みの `operation_id`。
@@ -1571,7 +1676,7 @@ pub fn bind_predicate_delete(
 ) -> Result<BoundPredicateDelete, SqlSurfaceError> {
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
-    let (metadata_filters, expr_filters, _rls_predicate_present) =
+    let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
         bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget, &[])?;
 
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
@@ -1581,6 +1686,7 @@ pub fn bind_predicate_delete(
         metadata_filters,
         expr_filters,
         expr_filter_programs,
+        or_filters,
         operation_id: stmt.operation_id().cloned(),
         max_affected_rows: DEFAULT_MAX_DML_AFFECTED_ROWS,
     })
@@ -2413,6 +2519,8 @@ pub struct BoundPredicateUpdate {
     pub(crate) metadata_filters: Vec<MetadataFilter>,
     /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
     pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。
+    pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     pub(crate) operation_id: Option<OperationId>,
 }
 
@@ -2437,6 +2545,7 @@ impl BoundPredicateUpdate {
         assignments: Vec<(usize, crate::row_codec::Value)>,
         metadata_filters: Vec<MetadataFilter>,
         expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+        or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
         operation_id: Option<OperationId>,
     ) -> Self {
         Self {
@@ -2444,6 +2553,7 @@ impl BoundPredicateUpdate {
             assignments,
             metadata_filters,
             expr_filters,
+            or_filters,
             operation_id,
         }
     }
@@ -2466,6 +2576,11 @@ impl BoundPredicateUpdate {
     /// `WHERE` の式述語（UDF インライン展開済み）。
     pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
         &self.expr_filters
+    }
+
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。
+    pub fn or_filters(&self) -> &[crate::sql::where_tree::BoundOrGroup] {
+        &self.or_filters
     }
 
     /// 文末専用句で搬送された、検証済みの `operation_id`。
@@ -2512,15 +2627,21 @@ pub fn bind_update_form(
             let assignments = bind_set_assignments(&predicate.assignments, schema)?;
 
             let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-            let (metadata_filters, expr_filters, _rls_predicate_present) = bind_where_predicates(
-                &predicate.where_predicates,
-                schema,
-                udfs,
-                &mut node_budget,
-                &[],
-            )?;
+            let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
+                bind_where_predicates(
+                    &predicate.where_predicates,
+                    schema,
+                    udfs,
+                    &mut node_budget,
+                    &[],
+                )?;
 
-            if metadata_filters.is_empty() && expr_filters.is_empty() {
+            // TASK-208・Issue #912: `or_filters` を含めないと `WHERE a OR b`
+            // だけの述語（`metadata_filters`／`expr_filters` は両方空）が
+            // 「無条件 UPDATE」と誤判定され、正当な OR 述語つき UPDATE が
+            // 拒否される（fail-closed の過剰側ではあるが正当な入力を壊す
+            // 回帰になるため、判定漏れとして修正する）。
+            if metadata_filters.is_empty() && expr_filters.is_empty() && or_filters.is_empty() {
                 return Err(SqlSurfaceError::unsupported(
                     "predicate-form UPDATE WHERE clause must contain at least one non-visible() predicate (unconditional UPDATE is not supported; use TRUNCATE for whole-table operations)",
                 ));
@@ -2531,6 +2652,7 @@ pub fn bind_update_form(
                 assignments,
                 metadata_filters,
                 expr_filters,
+                or_filters,
                 predicate.operation_id.clone(),
             )))
         }
@@ -3494,6 +3616,9 @@ pub struct BoundAggregate {
     /// `expr_filters` をステップ列コンパイルした実行形（Issue #353。
     /// `BoundStatement::expr_filter_programs` と同じ 1 対 1 対応の契約）。
     pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。[`Self::new`]・
+    /// [`Self::new_grouped`]（NoSQL 表層の直接構築経路）は常に空にする。
+    pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     pub(crate) rls_predicate_present: bool,
     /// 出力列順（`items` とは独立。`GROUP BY` の有無によらず常に構築する）。
     pub(crate) projection: Vec<ProjectionColumn>,
@@ -3550,6 +3675,7 @@ impl BoundAggregate {
             metadata_filters,
             expr_filters,
             expr_filter_programs,
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection,
             group_by: None,
@@ -3637,6 +3763,7 @@ impl BoundAggregate {
             metadata_filters,
             expr_filters,
             expr_filter_programs,
+            or_filters: Vec::new(),
             rls_predicate_present: false,
             projection,
             group_by: Some(BoundGroupBy {
@@ -3666,6 +3793,18 @@ impl BoundAggregate {
     /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
     pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
         &self.expr_filters
+    }
+
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。
+    pub fn or_filters(&self) -> &[crate::sql::where_tree::BoundOrGroup] {
+        &self.or_filters
+    }
+
+    /// [`BoundStatement::has_where_filters`] と同じ判定（TASK-208・Issue #912）。
+    pub fn has_where_filters(&self) -> bool {
+        !self.metadata_filters.is_empty()
+            || !self.expr_filters.is_empty()
+            || !self.or_filters.is_empty()
     }
 
     /// `WHERE` 句に RLS 相当の述語（テナント境界を表す条件）が含まれるか。
@@ -3931,13 +4070,14 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         }
     }
 
-    let (metadata_filters, expr_filters, rls_predicate_present) = bind_where_predicates(
-        stmt.where_predicates(),
-        schema,
-        udfs,
-        &mut node_budget,
-        dummy_equality_flags,
-    )?;
+    let (metadata_filters, expr_filters, rls_predicate_present, or_filters) =
+        bind_where_predicates(
+            stmt.where_predicates(),
+            schema,
+            udfs,
+            &mut node_budget,
+            dummy_equality_flags,
+        )?;
 
     let group_by = match stmt.group_by() {
         None => None,
@@ -3962,6 +4102,7 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
         metadata_filters,
         expr_filters,
         expr_filter_programs,
+        or_filters,
         rls_predicate_present,
         projection,
         group_by,
@@ -3989,6 +4130,9 @@ pub struct BoundScan {
     /// `sql::expr_program` が `pub(crate) mod` のためクレート外に型を出せず、
     /// アクセサーは設けない（`BoundStatement::expr_filter_programs` と同じ判断）。
     pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。[`Self::new`]
+    /// （NoSQL 表層の直接構築経路）は常に空にする。
+    pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
     /// `LIMIT` の検証済み値（`1..=core::MAX_SEARCH_K`。[`validate_search_limit`]）。
     pub(crate) limit: usize,
 }
@@ -4022,6 +4166,7 @@ impl BoundScan {
             metadata_filters,
             expr_filters,
             expr_filter_programs,
+            or_filters: Vec::new(),
             limit,
         }
     }
@@ -4044,6 +4189,18 @@ impl BoundScan {
     /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
     pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
         &self.expr_filters
+    }
+
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。
+    pub fn or_filters(&self) -> &[crate::sql::where_tree::BoundOrGroup] {
+        &self.or_filters
+    }
+
+    /// [`BoundStatement::has_where_filters`] と同じ判定（TASK-208・Issue #912）。
+    pub fn has_where_filters(&self) -> bool {
+        !self.metadata_filters.is_empty()
+            || !self.expr_filters.is_empty()
+            || !self.or_filters.is_empty()
     }
 
     /// `LIMIT` 句の値。
@@ -4094,13 +4251,14 @@ pub(crate) fn bind_scan_with_dummy_flags(
 
     let projection = bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
 
-    let (metadata_filters, expr_filters, _rls_predicate_present) = bind_where_predicates(
-        stmt.where_predicates(),
-        schema,
-        udfs,
-        &mut node_budget,
-        dummy_equality_flags,
-    )?;
+    let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
+        bind_where_predicates(
+            stmt.where_predicates(),
+            schema,
+            udfs,
+            &mut node_budget,
+            dummy_equality_flags,
+        )?;
 
     let limit = validate_search_limit(stmt.limit())?;
 
@@ -4114,6 +4272,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
         metadata_filters,
         expr_filters,
         expr_filter_programs,
+        or_filters,
         limit,
     })
 }
@@ -5495,6 +5654,7 @@ mod tests {
         let bound = BoundPredicateUpdate::new(
             "documents".to_string(),
             vec![(1, crate::row_codec::Value::Text("x".to_string()))],
+            vec![],
             vec![],
             vec![],
             Some(OperationId::parse("op-0001").expect("valid operation_id")),

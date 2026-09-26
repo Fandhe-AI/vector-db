@@ -25,6 +25,7 @@
 
 use crate::declarative_filter::MetadataFilter;
 use crate::sql::udf_call::{BinOp, BoundExpr};
+use crate::sql::where_tree::BoundOrGroup;
 
 /// [`classify_scalar_plan`] の分類結果。閉じた語彙（`sql::explain` の
 /// `scalar_plan:` 行の値と 1 対 1）。
@@ -69,6 +70,17 @@ pub struct ScalarShapeInput<'a> {
     pub scalar_prefilter: bool,
     pub metadata_filters: &'a [MetadataFilter],
     pub expr_filters: &'a [BoundExpr],
+    /// `WHERE` の `OR` 群（TASK-208・SQL-24、Issue #912）。
+    ///
+    /// **BREAKING CHANGE**: 本フィールドの追加は `ScalarShapeInput` を構造体
+    /// リテラルで組み立てる既存コードのコンパイルを壊す（`#[non_exhaustive]`
+    /// を付けていない `pub` 型のため）。移行方針: OR 群を持たない既存呼び出しは
+    /// 空スライス（`&[]`）を渡す。
+    ///
+    /// 索引経路（`sql::scalar_index`）は現時点で OR 群の和集合計算に対応して
+    /// いない（Issue #912 のスコープでは索引最適化を対象外とし、正しさを優先
+    /// して `ScalarPlan::PlainScan` へ一律縮退する。索引対応は別 Issue）。
+    pub or_filters: &'a [BoundOrGroup],
 }
 
 /// `id <op> <数値リテラル>` へ正規化した式述語（左右いずれの位置で束縛されて
@@ -130,7 +142,17 @@ pub fn classify_scalar_plan(input: &ScalarShapeInput<'_>) -> ScalarPlan {
     if !input.scalar_prefilter {
         return ScalarPlan::PlainScan;
     }
-    if input.metadata_filters.is_empty() && input.expr_filters.is_empty() {
+    if input.metadata_filters.is_empty()
+        && input.expr_filters.is_empty()
+        && input.or_filters.is_empty()
+    {
+        return ScalarPlan::PlainScan;
+    }
+    // TASK-208・SQL-24（Issue #912）: OR 群を含む述語は索引の和集合計算に
+    // 未対応のため一律 `PlainScan` へ縮退する（モジュールドキュメント
+    // 「索引対応述語の狭い定義」と同じ判断: 対応できない形は安全側の全走査に
+    // 倒す。索引最適化〔`ScalarPlan::IndexDisjunction` 相当〕は別 Issue）。
+    if !input.or_filters.is_empty() {
         return ScalarPlan::PlainScan;
     }
     // BOOLEAN 列の等価述語が 1 つでも含まれる場合は索引経路へ進まない
@@ -392,6 +414,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexTypedRange);
     }
@@ -403,6 +426,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexConjunction);
     }
@@ -417,6 +441,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
@@ -428,6 +453,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
@@ -444,6 +470,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
@@ -457,6 +484,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
@@ -468,6 +496,7 @@ mod tests {
             scalar_prefilter: false,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
@@ -478,6 +507,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &[],
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
@@ -489,6 +519,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexEquality);
     }
@@ -500,6 +531,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &[],
             expr_filters: &exprs,
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexIdRange);
     }
@@ -512,6 +544,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &exprs,
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexConjunction);
     }
@@ -529,6 +562,35 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &[],
             expr_filters: &exprs,
+            or_filters: &[],
+        };
+        assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
+    }
+
+    /// TASK-208・SQL-24（Issue #912）: OR 群を含む述語は、他の述語が完全に索引
+    /// 対応形状であっても一律 `PlainScan` へ縮退する（索引の和集合計算は本 Issue
+    /// のスコープ外。モジュールドキュメント「索引対応述語の狭い定義」と同じ判断）。
+    #[test]
+    fn plain_scan_when_or_filters_present_even_with_index_eligible_metadata_filters() {
+        let filters = vec![eq_filter(1)];
+        let or_group = crate::sql::where_tree::BoundOrGroup::new(vec![
+            crate::sql::where_tree::BoundConjunction::new(
+                vec![eq_filter(1)],
+                Vec::new(),
+                Vec::new(),
+            ),
+            crate::sql::where_tree::BoundConjunction::new(
+                vec![eq_filter(2)],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ]);
+        let or_filters = vec![or_group];
+        let input = ScalarShapeInput {
+            scalar_prefilter: true,
+            metadata_filters: &filters,
+            expr_filters: &[],
+            or_filters: &or_filters,
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
