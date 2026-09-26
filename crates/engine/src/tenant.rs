@@ -354,6 +354,14 @@ pub enum TenantWriteError {
     /// 発生しうる）。違反（`CheckViolation`）に丸めず `XX000`（内部事象）として
     /// 書き込みを拒否する（fail-closed。値・詳細はクライアントへ渡さない）。
     CheckEvaluationFailed,
+    /// `FOREIGN KEY` 制約（TABLE-17・TASK-205、Issue #907）の参照整合性違反
+    /// （`23503`）: 参照元の書き込みで参照先の値の組が同一テナント内に存在しない、
+    /// または参照先の削除・更新・TRUNCATE・置換で参照元の行が残る。一意性制約と
+    /// 同じ単一の検査点（`constraint` モジュール）が台帳照合・行の書き込みの**後**・
+    /// commit の**前**に返す。`Display`／`Debug` はキー値・行 id・テナント名・
+    /// テーブル名・参照先の有無の理由（不在なのか他テナント所有なのか）を一切
+    /// 含まない固定文言（RLS-9・RLS-10 (c)。security.md P0）。
+    ForeignKeyViolation,
     /// 明示トランザクション（SQL-31・TASK-221）の単一ライタ占有により、書き込み
     /// トランザクションの取得（[`Storage::begin_write_txn`]）がロック待ちの上限を
     /// 超過した（`55P03`）。`Storage(StorageError::WriteLockTimeout)` へ一般化せず
@@ -467,6 +475,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
             TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
             TenantWriteError::CheckEvaluationFailed => ErrorClass::InternalError,
+            TenantWriteError::ForeignKeyViolation => ErrorClass::ForeignKeyViolation,
             TenantWriteError::WriteLockTimeout => ErrorClass::LockNotAvailable,
         }
     }
@@ -523,6 +532,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::CheckEvaluationFailed => {
                 write!(f, "check constraint evaluation failed")
             }
+            TenantWriteError::ForeignKeyViolation => {
+                write!(f, "foreign key constraint violation")
+            }
             TenantWriteError::WriteLockTimeout => {
                 write!(f, "write lock not available: timed out waiting for writer")
             }
@@ -560,6 +572,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::UniqueViolation => f.write_str("UniqueViolation"),
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),
             TenantWriteError::CheckEvaluationFailed => f.write_str("CheckEvaluationFailed"),
+            TenantWriteError::ForeignKeyViolation => f.write_str("ForeignKeyViolation"),
             TenantWriteError::WriteLockTimeout => f.write_str("WriteLockTimeout"),
         }
     }
@@ -1699,6 +1712,21 @@ pub(crate) fn upsert_typed_rows_unchecked(
                 &written_ids,
             )?;
         }
+        // `DO UPDATE` で既存行を更新した場合、このテーブルを参照先とする
+        // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照先側を検査する
+        // （更新した列が主キー・UNIQUE 制約の構成列を含む場合のみ実際に走査する）。
+        if updated > 0 {
+            if let UpsertAction::DoUpdate(assignments) = action {
+                let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
+                crate::constraint::enforce_referencing_rows_in_txn(
+                    &write_txn,
+                    table,
+                    &schema,
+                    ctx.tenant_id(),
+                    crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
+                )?;
+            }
+        }
     }
     if inserted > 0 || updated > 0 {
         crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -1814,6 +1842,16 @@ pub(crate) fn update_row_unchecked(
             &schema_for_pk,
             ctx.tenant_id(),
             &[id],
+        )?;
+        // 全列置換は参照先キー（主キー・UNIQUE 構成列）を変え得るため、このテーブルを
+        // 参照先とする `FOREIGN KEY` の参照先側も検査する（TABLE-17・TASK-205、
+        // Issue #907）。
+        crate::constraint::enforce_referencing_rows_in_txn(
+            &write_txn,
+            table,
+            &schema_for_pk,
+            ctx.tenant_id(),
+            crate::constraint::ReferencedRowsChange::AllColumnsReplaced,
         )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -2586,6 +2624,16 @@ pub(crate) fn update_row_columns_unchecked(
                 ctx.tenant_id(),
                 &[id],
             )?;
+            // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
+            // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ走査）。
+            let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
+            crate::constraint::enforce_referencing_rows_in_txn(
+                &write_txn,
+                table,
+                &schema,
+                ctx.tenant_id(),
+                crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
+            )?;
         }
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -2768,7 +2816,7 @@ fn delete_row_impl(
     validate_identifier(table)?;
     let write_txn = storage.begin_write_txn().map_err(convert_write_txn_err)?;
     let mut captured_row: Option<CapturedRow> = None;
-    let owns_existing = {
+    let (owns_existing, schema) = {
         // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
         // `insert_row`/`update_row` と同じ前段を通す。
         let schema = require_table_schema_write(&write_txn, table)?;
@@ -2863,8 +2911,21 @@ fn delete_row_impl(
             // （[`delete_row_unchecked`] のドキュメント参照）。
             return Err(TenantWriteError::NotFound);
         }
-        owns_existing
+        (owns_existing, schema)
     };
+    // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
+    // 参照先側の検査。行を実際に削除した場合のみ行う——対象行が不存在・他テナント
+    // 所有（いずれも区別しない `NotFound`）の場合は何も変化していないため走査
+    // 自体を行わず、他テナントの行の有無で処理経路が分岐しない（RLS-9・RLS-10）。
+    if owns_existing {
+        crate::constraint::enforce_referencing_rows_in_txn(
+            &write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            crate::constraint::ReferencedRowsChange::Removed,
+        )?;
+    }
     // `project` は commit **前**・`row_table`（可変借用）が上記ブロックの終端で
     // 既に解放された後に呼ぶ（`delete_row_impl` ドキュメントの `project` 節参照）。
     // `captured_row` が `Some` になるのは `owns_existing && capture.is_some()` の
@@ -3192,7 +3253,7 @@ pub(crate) fn delete_rows_where_unchecked<E>(
         .begin_write_txn()
         .map_err(|e| dml_write_err(convert_write_txn_err(e)))?;
 
-    let candidate_ids = {
+    let (candidate_ids, schema) = {
         let schema = require_table_schema_write(&write_txn, table).map_err(dml_write_err)?;
         if let Some(expected) = expected_schema {
             if expected != &schema {
@@ -3215,7 +3276,9 @@ pub(crate) fn delete_rows_where_unchecked<E>(
         let row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(|e| dml_write_err(map_row_table_error(e)))?;
-        enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?
+        let candidate_ids =
+            enumerate_dml_candidates(&row_table, ctx, needs_embedding, limit, &mut predicate)?;
+        (candidate_ids, schema)
     };
 
     if candidate_ids.len() > limit {
@@ -3237,6 +3300,20 @@ pub(crate) fn delete_rows_where_unchecked<E>(
                 .remove(&key)
                 .map_err(|e| dml_write_err(CatalogError::from(e)))?;
         }
+    }
+
+    // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の
+    // 参照先側の検査（行を 1 件以上削除した場合のみ。候補は自テナント所有の行に
+    // 限られる）。
+    if !candidate_ids.is_empty() {
+        crate::constraint::enforce_referencing_rows_in_txn(
+            &write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            crate::constraint::ReferencedRowsChange::Removed,
+        )
+        .map_err(dml_write_err)?;
     }
 
     let rows_affected = candidate_ids.len();
@@ -3381,6 +3458,17 @@ pub(crate) fn update_rows_where_unchecked<E>(
             &candidate_ids,
         )
         .map_err(dml_write_err)?;
+        // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・TASK-205、
+        // Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ走査）。
+        let updated_columns: Vec<usize> = assignments.iter().map(|(idx, _)| *idx).collect();
+        crate::constraint::enforce_referencing_rows_in_txn(
+            &write_txn,
+            table,
+            &schema,
+            ctx.tenant_id(),
+            crate::constraint::ReferencedRowsChange::ColumnsUpdated(&updated_columns),
+        )
+        .map_err(dml_write_err)?;
     }
 
     let rows_affected = candidate_ids.len();
@@ -3401,7 +3489,7 @@ pub(crate) fn truncate_table_unchecked(
     target.with_txn(|write_txn| {
         // テーブル不存在の判定・並行 DDL との整合のため他の書き込み系操作と
         // 同じ前段を通す。
-        require_table_schema_write(write_txn, table)?;
+        let schema = require_table_schema_write(write_txn, table)?;
         // TRUNCATE 要求のクライアント由来の内容はテーブル名（台帳キー
         // `(tenant, table, operation_id)` に既に含まれる）以外に存在しない
         // （`content_hash::for_truncate` ドキュメント参照）。
@@ -3425,6 +3513,16 @@ pub(crate) fn truncate_table_unchecked(
             .retain_in((start, end), |_, _| false)
             .map_err(CatalogError::from)?;
         drop(row_table);
+        // このテーブルを参照先とする `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）
+        // の参照先側の検査。自テナントの参照元行が 1 件でも残れば `23503`（他テナントの
+        // 行は削除も走査もしないため、他テナントの参照元行の有無は結果に影響しない）。
+        crate::constraint::enforce_referencing_rows_in_txn(
+            write_txn,
+            table,
+            &schema,
+            tenant,
+            crate::constraint::ReferencedRowsChange::Removed,
+        )?;
         crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
         Ok(((), TxnEffect::Wrote))
     })
@@ -3759,6 +3857,19 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 &ids,
             )?;
         }
+    }
+    // 置換で旧行を削除した場合、このテーブルを参照先とする `FOREIGN KEY`
+    // （TABLE-17・TASK-205、Issue #907）の参照先側を検査する（旧行 id を参照する
+    // 参照元行が残れば `23503`）。
+    if outcome.removed > 0 {
+        let schema_for_fk = require_table_schema_write(&write_txn, table)?;
+        crate::constraint::enforce_referencing_rows_in_txn(
+            &write_txn,
+            table,
+            &schema_for_fk,
+            ctx.tenant_id(),
+            crate::constraint::ReferencedRowsChange::Removed,
+        )?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;

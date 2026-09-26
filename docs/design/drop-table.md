@@ -126,11 +126,18 @@ drop_table_without_permission_is_rejected_with_42501_regardless_of_table_existen
 （`2BP01`）で拒否するようになった（同一 write txn 内・TOCTOU 回避。詳細は
 `docs/design/create-view.md` 参照）。対象名がビューだった場合は
 `CatalogError::WrongObjectKind` → `SqlSurfaceError::WrongObjectType`（`42809`）。
-FOREIGN KEY（#907）由来の `2BP01` は引き続き未実装のまま。
+
+## `2BP01`（FOREIGN KEY からの参照）実装済み（Issue #907）
+
+`FOREIGN KEY`（TABLE-17・TASK-205）の実装により、`Storage::drop_table` は
+他テーブルの `FOREIGN KEY` が対象テーブルを参照先にしている場合、データの
+有無を問わずカタログ情報のみで `CatalogError::DependentObjectsStillExist` →
+`SqlSurfaceError::DependentObjectsStillExist`（`2BP01`）として拒否する
+（同一 write txn 内。自己参照は参照元ごと削除されるため依存に数えない。詳細は
+`docs/design/foreign-key.md` 参照）。
 
 ## 対象外・申し送り
 
-- `2BP01` 依存オブジェクト検査（FOREIGN KEY 分・#907 待ち）
 - NoSQL 表層の `drop_table` op（#910 の担当）
 - `CREATE TABLE`・`ALTER TABLE` の SQL 構文（#899〜#901）
 - ドロップ済みテーブルのキャッシュエントリの能動的解放（現状は世代照合による

@@ -140,6 +140,30 @@ fn new_core_with_small_batch_limit(max_files: usize) -> (Arc<EngineCore>, temp_d
     (Arc::new(core), guard)
 }
 
+/// `FOREIGN KEY` 付きの親子テーブル（TABLE-17・TASK-205、Issue #907）を持つ
+/// スローアウェイ `EngineCore`。`FOREIGN KEY` の宣言面は SQL 表層の `CREATE TABLE`
+/// のみ（NoSQL `op` 語彙に DDL は無い）のため、DDL 実行権限を付与したセッションで
+/// production の SQL 経路からテーブルを作る。宣言済みテーブルへの NoSQL
+/// `insert`／`update`／`delete` は engine 内の単一検査点を通るため `23503` が
+/// 実要求から到達可能になる。
+fn new_core_with_foreign_key() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("err4-http-projection-fk");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant ctx");
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    for ddl in [
+        "CREATE TABLE fk_parent (embedding VECTOR(2))",
+        "CREATE TABLE fk_child (embedding VECTOR(2), parent_id BIGINT REFERENCES fk_parent)",
+    ] {
+        core.execute_sql_in_session(&ctx, &mut session, ddl)
+            .expect("fk fixture DDL must succeed");
+    }
+    (Arc::new(core), guard)
+}
+
 fn spawn(core: Arc<EngineCore>) -> SocketAddr {
     let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
     http_common::spawn_router_listener_with_engine(&users_path, SessionStore::new(), core)
@@ -199,7 +223,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 31] = [
+const EXPECTED_STATUS: [(&str, u16); 33] = [
     ("22000", 400),
     ("28P01", 401),
     ("28000", 401),
@@ -246,6 +270,11 @@ const EXPECTED_STATUS: [(&str, u16); 31] = [
     // `CheckViolation`（`23514`。TABLE-16・TASK-204、Issue #906）は
     // `UniqueViolation` と同じ「対象の状態と矛盾する」意味論のため同じ 409。
     ("23514", 409),
+    // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）: 参照整合性違反（`23503`）は
+    // `UniqueViolation`／`CheckViolation` と同じ 409、宣言の不正（`42830`）は
+    // SQL 表層専用の DDL の分類で 400。
+    ("23503", 409),
+    ("42830", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -304,7 +333,7 @@ fn assert_projected(resp: &HttpResponse, expected_wire_code: &str) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 32);
+const _: () = assert!(ErrorClass::ALL.len() == 34);
 
 /// `23502` を共有する分類（ERR-6・TABLE-16・TASK-204、Issue #904）。
 /// [`err4_projection_table_is_closed_over_all_error_classes`] がこの組にだけ
@@ -734,12 +763,73 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // TASK-206・INDEX-7・SQL-23（Issue #908）: 索引 DDL は SQL 表層専用。
         ErrorClass::UndefinedObject,
         ErrorClass::UndefinedColumn,
+        // `InvalidForeignKey`（`42830`。TABLE-17・TASK-205、Issue #907）は
+        // `FOREIGN KEY` 宣言（SQL 表層専用の `CREATE TABLE`）の分類で到達不能。
+        // `ForeignKeyViolation`（`23503`）は宣言済みテーブルへの書き込み op から
+        // 到達可能なため含めない（`err4_f_foreign_key_violation_reachable_via_*`）。
+        ErrorClass::InvalidForeignKey,
     ] {
         let raw =
             wire_server::http::response::encode_error(class, "test message", SystemTime::now());
         let resp = http_common::parse_single_response(&raw);
         assert_projected(&resp, class.wire_code());
     }
+}
+
+/// `ForeignKeyViolation`（`23503`。TABLE-17・TASK-205、Issue #907）は NoSQL 表層の
+/// 実要求から到達可能: 参照先が不在の値を持つ行の `insert` は engine の単一検査点
+/// （`constraint::enforce_row_constraints_in_txn`）で拒否される。応答に参照先の値・
+/// テナントを含めない。
+#[test]
+fn err4_f_foreign_key_violation_reachable_via_nosql_insert() {
+    let (core, _guard) = new_core_with_foreign_key();
+    let addr = spawn(core);
+
+    let body = br#"{"op":"insert","table":"fk_child","rows":[{"id":1,"embedding":[0.1,0.2],"parent_id":999}],"operation_id":"err4-fk-insert"}"#;
+    let resp = query_as_alice(addr, body);
+    assert_projected(&resp, "23503");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+    assert!(
+        !http_common::error_message_of(&resp).contains("999"),
+        "FK violation message must not echo the referenced value"
+    );
+}
+
+/// `ForeignKeyViolation`（`23503`）は NoSQL `update` op（参照元列を参照先に存在
+/// しない値へ更新）からも到達可能。
+#[test]
+fn err4_f_foreign_key_violation_reachable_via_nosql_update() {
+    let (core, _guard) = new_core_with_foreign_key();
+    let addr = spawn(core);
+
+    let insert_parent = br#"{"op":"insert","table":"fk_parent","rows":[{"id":1,"embedding":[0.1,0.2]}],"operation_id":"err4-fk-update-parent"}"#;
+    assert_eq!(query_as_alice(addr, insert_parent).status, 200);
+    let insert_child = br#"{"op":"insert","table":"fk_child","rows":[{"id":1,"embedding":[0.1,0.2],"parent_id":1}],"operation_id":"err4-fk-update-child"}"#;
+    assert_eq!(query_as_alice(addr, insert_child).status, 200);
+
+    let update = br#"{"op":"update","table":"fk_child","set":{"parent_id":999},"where":{"id":1},"operation_id":"err4-fk-update"}"#;
+    let resp = query_as_alice(addr, update);
+    assert_projected(&resp, "23503");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
+}
+
+/// `ForeignKeyViolation`（`23503`）は NoSQL `delete` op（参照元行が残る参照先行の
+/// 削除。参照先側の検査）からも到達可能。
+#[test]
+fn err4_f_foreign_key_violation_reachable_via_nosql_delete() {
+    let (core, _guard) = new_core_with_foreign_key();
+    let addr = spawn(core);
+
+    let insert_parent = br#"{"op":"insert","table":"fk_parent","rows":[{"id":1,"embedding":[0.1,0.2]}],"operation_id":"err4-fk-delete-parent"}"#;
+    assert_eq!(query_as_alice(addr, insert_parent).status, 200);
+    let insert_child = br#"{"op":"insert","table":"fk_child","rows":[{"id":1,"embedding":[0.1,0.2],"parent_id":1}],"operation_id":"err4-fk-delete-child"}"#;
+    assert_eq!(query_as_alice(addr, insert_child).status, 200);
+
+    let delete_parent =
+        br#"{"op":"delete","table":"fk_parent","where":{"id":1},"operation_id":"err4-fk-delete"}"#;
+    let resp = query_as_alice(addr, delete_parent);
+    assert_projected(&resp, "23503");
+    http_common::assert_message_does_not_echo(&resp, "tenant-a");
 }
 
 /// `55P03`（書き込みゲートの待機上限超過。SQL-31・TASK-221）は到達不能では

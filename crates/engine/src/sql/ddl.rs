@@ -105,8 +105,21 @@ pub(crate) fn execute_create_table(
         let checks = crate::sql::check_constraint::validate_and_build(&schema, &validated.checks)?;
         schema = schema.with_checks(checks);
     }
+    // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）。参照先の名前解決・主キー／
+    // UNIQUE 制約との照合・型の照合はカタログ参照を要するため、`Storage::create_table`
+    // の write トランザクション内（テーブル名重複判定の後）で行う（TOCTOU 回避）。
+    if !validated.foreign_keys.is_empty() {
+        schema = schema.with_foreign_keys(validated.foreign_keys.clone());
+    }
     storage.create_table(&schema).map_err(|e| match e {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::duplicate_table(name),
+        // `FOREIGN KEY` の参照先（TABLE-17・TASK-205、Issue #907）。`create_table` が
+        // `TableNotFound` を返すのは参照先テーブルの不在のみ（作成対象自身の重複は
+        // 上の `TableAlreadyExists` が先に判定する）。参照先名がビュー・索引名なら
+        // 種別不一致（`42809`）、参照先列が一意キーと一致しない・型不一致は `42830`。
+        CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+        CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
+        CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
         CatalogError::Invalid(detail) => {
             SqlSurfaceError::unsupported(format!("invalid table schema: {detail}"))
         }
@@ -115,7 +128,6 @@ pub(crate) fn execute_create_table(
         CatalogError::WriteLockTimeout => SqlSurfaceError::LockNotAvailable,
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
-        | CatalogError::TableNotFound(_)
         | CatalogError::ColumnAlreadyExists(_)
         | CatalogError::RowNotFound(_)
         | CatalogError::IncompatibleRowKeyFormat
@@ -129,12 +141,10 @@ pub(crate) fn execute_create_table(
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
-        // `ViewNotFound`／`WrongObjectKind`／`DependentViewsExist`／
-        // `ViewLimitExceeded` は `CREATE VIEW`／`DROP VIEW`
-        // （TABLE-18・SQL-23・TASK-205、Issue #909）専用の変種で、
-        // `Storage::create_table` からは返らない（到達不能）。
+        // `ViewNotFound`／`DependentViewsExist`／`ViewLimitExceeded` は
+        // `CREATE VIEW`／`DROP VIEW`（TABLE-18・SQL-23・TASK-205、Issue #909）
+        // 専用の変種で、`Storage::create_table` からは返らない（到達不能）。
         | CatalogError::ViewNotFound(_)
-        | CatalogError::WrongObjectKind(_)
         | CatalogError::DependentViewsExist(_)
         | CatalogError::ViewLimitExceeded(_)
         // `TooManyColumns` は `ALTER TABLE ADD COLUMN`（Issue #900・
@@ -173,11 +183,10 @@ pub struct DropTableOutcome {}
 /// ストア・`operation_id` 台帳エントリの単一 write txn 削除。テーブル単位
 /// 世代 bump を含む）へ委譲し、`CatalogError` を SQL 表層の契約へ写像する。
 ///
-/// 依存オブジェクト検査（`2BP01`。VIEW・FOREIGN KEY からの参照）の挿入点:
-/// VIEW（#909）・FOREIGN KEY（#907）はいずれも未実装のため、現時点では
-/// `drop_table` 呼び出しの前後どちらにも検査を追加していない。実装される際は
-/// ここへ、`require_ddl_permission` の直後・`Storage::drop_table` 呼び出しの
-/// 直前として追加する想定。
+/// 依存オブジェクト検査（`2BP01`。VIEW〔#909〕・FOREIGN KEY〔#907。TABLE-15・
+/// TABLE-17〕からの参照）は `Storage::drop_table` 自身の write トランザクション内
+/// （カタログエントリ削除の前）で判定し、[`map_drop_table_error`] が
+/// `DependentViewsExist`／`DependentObjectsStillExist` を `2BP01` へ写像する。
 pub(crate) fn execute_drop_table(
     storage: &Storage,
     validated: &ValidatedDropTable,
@@ -209,6 +218,12 @@ fn map_drop_table_error(e: CatalogError) -> SqlSurfaceError {
         // （`42809`）、対象テーブルをビューが参照している場合（`2BP01`）。
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::DependentViewsExist(name) => {
+            SqlSurfaceError::DependentObjectsStillExist { name }
+        }
+        // 他テーブルの `FOREIGN KEY` が対象テーブルを参照している（TABLE-15・
+        // TABLE-17・TASK-205、Issue #907）。カタログ情報のみによる判定で、`name` は
+        // 対象テーブル名そのもの（参照元テーブル名・テナントデータは含めない）。
+        CatalogError::DependentObjectsStillExist(name) => {
             SqlSurfaceError::DependentObjectsStillExist { name }
         }
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で、書き込み
@@ -402,7 +417,10 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::IndexAlreadyExists(_)
         | CatalogError::IndexNotFound(_)
         | CatalogError::IndexKindMismatch(_)
-        | CatalogError::IndexLimitExceeded(_) => SqlSurfaceError::Internal {
+        | CatalogError::IndexLimitExceeded(_)
+        // `FOREIGN KEY` 宣言の照合（`create_table` 専用。TABLE-17・TASK-205、
+        // Issue #907）は `alter_table_add_column` からは返らない（到達不能）。
+        | CatalogError::InvalidForeignKey(_) => SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         },
     }
@@ -607,6 +625,7 @@ mod tests {
             primary_key: None,
             unique_constraints: Vec::new(),
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table");
         storage
@@ -762,6 +781,7 @@ mod tests {
             primary_key: None,
             unique_constraints: Vec::new(),
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("create table must succeed");
         let schema = storage.get_table_schema("docs").expect("schema must exist");
@@ -781,6 +801,7 @@ mod tests {
             primary_key: None,
             unique_constraints: Vec::new(),
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         execute_create_table(&storage, &validated).expect("first create must succeed");
         let err = execute_create_table(&storage, &validated)
@@ -801,6 +822,7 @@ mod tests {
             primary_key: None,
             unique_constraints: Vec::new(),
             checks: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         let err = execute_create_table(&storage, &validated)
             .expect_err("two VECTOR columns must be rejected");

@@ -3370,6 +3370,10 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
         TenantWriteError::CheckEvaluationFailed => SqlSurfaceError::Internal {
             detail: "check constraint evaluation failed".to_string(),
         },
+        // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）。`_` 節
+        // （`XX000`）へ丸めると、クライアントが参照整合性違反をサーバー内部事象と
+        // 取り違える。値・参照先の有無の理由を含まない固定文言。
+        TenantWriteError::ForeignKeyViolation => SqlSurfaceError::ForeignKeyViolation,
         // `tenant::insert_typed_row_unchecked`／`insert_typed_rows_unchecked`／
         // `update_row_columns_unchecked` 自体は `operation_id` 必須化ガード
         // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs`
@@ -3989,6 +3993,14 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
             SqlSurfaceError::Internal {
                 detail: "check constraint evaluation failed".to_string(),
             }
+        }
+        // `FOREIGN KEY` 制約違反（`23503`。TABLE-17・TASK-205、Issue #907）: ファイル形
+        // `INSERT` の置換（`replace_typed_rows_by_text_key`）で旧チャンク行を削除しようと
+        // して参照先側の検査に違反した場合、または新規チャンク行の参照元列が参照元側の
+        // 検査に違反した場合。行形 `INSERT`（[`map_write_error`]）と同じ写像にし、`_` 節
+        // （`XX000`）へ丸めない。
+        IncrementalError::Write(TenantWriteError::ForeignKeyViolation) => {
+            SqlSurfaceError::ForeignKeyViolation
         }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),
