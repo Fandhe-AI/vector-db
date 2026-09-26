@@ -3585,14 +3585,15 @@ impl BoundAggregateItem {
     }
 }
 
-/// SELECT リストの出力列 1 つ（TASK-167・SQL-14）。`GROUP BY` なしの単一行集計
-/// （TASK-166・SQL-13）では `bind_aggregate` が `items` の宣言順で自動生成し、既存
-/// 挙動を変えない。`GROUP BY` ありの場合は `AggregateSelectItem::GroupKey`／
-/// `Aggregate` の並び順をそのまま反映する。
+/// SELECT リストの出力列 1 つ（TASK-167・SQL-14。SQL-25 (d) で複数列 `GROUP BY`
+/// へ拡張）。`GROUP BY` なしの単一行集計（TASK-166・SQL-13）では `bind_aggregate`
+/// が `items` の宣言順で自動生成し、既存挙動を変えない。`GROUP BY` ありの場合は
+/// `AggregateSelectItem::GroupKey`／`Aggregate` の並び順をそのまま反映する。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ProjectionColumn {
-    /// `GROUP BY` 列の値（`sql::group_by::GroupKey` から復元）。
-    GroupKey { name: String },
+    /// `GROUP BY` 列の値（`sql::group_by::GroupKey` の `key_index` 番目の成分から
+    /// 復元。`key_index` は [`BoundGroupBy::column_indices`] の添字）。
+    GroupKey { key_index: usize, name: String },
     /// `items[item_index]` の集計結果。
     Aggregate { item_index: usize, name: String },
 }
@@ -3607,10 +3608,11 @@ pub(crate) struct BoundHaving {
     pub(crate) literal: f64,
 }
 
-/// `ORDER BY` 対象を束縛した形（TASK-167・SQL-14）。
+/// `ORDER BY` 対象を束縛した形（TASK-167・SQL-14。SQL-25 (d) で `GroupKey` に
+/// キー番号〔[`BoundGroupBy::column_indices`] の添字〕を持たせた）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum OrderTarget {
-    GroupKey,
+    GroupKey(usize),
     Aggregate(usize),
 }
 
@@ -3620,11 +3622,12 @@ pub(crate) struct BoundOrderBy {
     pub(crate) descending: bool,
 }
 
-/// 束縛済みの `GROUP BY` 句（TASK-167・SQL-14）。`column_index` は `schema.columns`
-/// の添字（束縛段で `TEXT` 列であることを確認済み）。
+/// 束縛済みの `GROUP BY` 句（TASK-167・SQL-14。SQL-25 (d) で複数列へ拡張）。
+/// `column_indices` は宣言順を保持した `schema.columns` の添字列（束縛段で全て
+/// `TEXT` 列であることを確認済み）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundGroupBy {
-    pub(crate) column_index: usize,
+    pub(crate) column_indices: Vec<usize>,
     pub(crate) having: Vec<BoundHaving>,
     pub(crate) order_by: Option<BoundOrderBy>,
     pub(crate) limit: Option<usize>,
@@ -3729,28 +3732,12 @@ impl BoundAggregate {
         })
     }
 
-    /// クレート外から `GROUP BY`／`HAVING` 付き実行計画を直接構築する
-    /// constructor（TASK-186・NOSQL-5。[`Self::new`] の `GROUP BY` あり版。
-    /// SQL テキストを一切組み立てず、列名解決（[`resolve_group_by_column`]）・
-    /// HAVING 対象の型検査（[`check_having_target_is_numeric`]）を SQL テキスト
-    /// 経由の [`bind_group_by_clause`] と共有する）。
-    ///
-    /// `items`（空・[`crate::sql::allowlist::MAX_AGGREGATE_ITEMS`] 超過）は
-    /// [`Self::new`] と同じ検査・分類（`42601`／`54000`）。`having` の件数は
-    /// [`crate::sql::allowlist::check_having_predicate_count`]（`54000`。
-    /// `Vec` 確保より前）、各 [`HavingSpec::literal`] の非有限は
-    /// [`SqlSurfaceError::unsupported`]（`42601`。SQL 側の数値リテラル構文
-    /// 自体が非有限値を表現できないのと同じ分類）、`item_index` が `items` の
-    /// 範囲外・対象が `TEXT` 型の `MIN`/`MAX` は
-    /// [`SqlSurfaceError::invalid_input`]（`22000`）で拒否する。
-    ///
-    /// `group_by_column` は `schema` 上の既存 `TEXT` 列名限定（未知列・
-    /// `VECTOR` 列・疑似列 `id` はいずれも `22000`）。`ORDER BY`／`LIMIT`
-    /// 相当は本入口の対象外（`order_by: None`・`limit: None` 固定。NoSQL
-    /// 表層のスキーマにこれらに相当するキーが存在しないため）。`projection`
-    /// は `[GroupKey{name: group_by_column}] ++ items`（宣言順）の規範形に
-    /// 固定する（SQL の規範形 `SELECT <col>, <aggs...> FROM t GROUP BY <col>`
-    /// と同一の列順・既定エイリアス名）。`rls_predicate_present` は
+    /// クレート外から単一列 `GROUP BY`／`HAVING` 付き実行計画を直接構築する
+    /// constructor（TASK-186・NOSQL-5。[`Self::new`] の `GROUP BY` あり版）。
+    /// SQL-25 (d) で複数列へ拡張した [`Self::new_grouped_by_columns`] へ
+    /// `&[group_by_column]` を渡すだけの委譲になり、挙動・エラー分類は変わらない
+    /// （既存呼び出し元の互換性を維持する。破壊的変更にしない）。詳細な検査内容は
+    /// [`Self::new_grouped_by_columns`] のドキュメント参照。
     /// [`Self::new`] と同じ理由で常に `false` 固定。
     pub fn new_grouped(
         table: String,
@@ -3758,6 +3745,48 @@ impl BoundAggregate {
         metadata_filters: Vec<MetadataFilter>,
         expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
         group_by_column: &str,
+        having: Vec<HavingSpec>,
+        schema: &TableSchema,
+    ) -> Result<Self, SqlSurfaceError> {
+        Self::new_grouped_by_columns(
+            table,
+            items,
+            metadata_filters,
+            expr_filters,
+            &[group_by_column],
+            having,
+            schema,
+        )
+    }
+
+    /// クレート外から複数列 `GROUP BY`／`HAVING` 付き実行計画を直接構築する
+    /// constructor（SQL-25 (d)。[`Self::new_grouped`] の複数キー版で、単一列
+    /// 経路は本関数へ `&[group_by_column]` を渡すだけの委譲になった）。
+    /// SQL テキストを一切組み立てず、列名解決（[`resolve_group_by_column`]）・
+    /// HAVING 対象の型検査（[`check_having_target_is_numeric`]）を SQL テキスト
+    /// 経由の [`bind_group_by_clause`] と共有する。
+    ///
+    /// `items`（空・[`crate::sql::allowlist::MAX_AGGREGATE_ITEMS`] 超過）・
+    /// `having`（件数・非有限リテラル・範囲外 `item_index`・非数値対象）の検査は
+    /// [`Self::new_grouped`] と同じ。`group_by_columns` は空スライスなら `42601`
+    /// （SQL テキスト側で `GROUP BY` に列 0 個は構文的に書けないのと同じ分類）、
+    /// [`crate::sql::allowlist::MAX_GROUP_BY_COLUMNS`] 超過は `54000`
+    /// （[`crate::sql::allowlist::check_group_by_column_count`] と同じ判定を
+    /// `Vec` 確保より前に行う）、重複する列名は `42601`（SQL テキスト経由の
+    /// `Parser::parse_group_by_clause` と同じ分類）、各列は `schema` 上の既存
+    /// `TEXT` 列名限定（未知列・`VECTOR` 列・疑似列 `id` はいずれも `22000`）。
+    /// `ORDER BY`／`LIMIT` 相当は本入口の対象外（`order_by: None`・`limit: None`
+    /// 固定。NoSQL 表層のスキーマにこれらに相当するキーが存在しないため）。
+    /// `projection` は `[GroupKey{0..k}] ++ items`（宣言順）の規範形に固定する
+    /// （SQL の規範形 `SELECT <col...>, <aggs...> FROM t GROUP BY <col...>` と
+    /// 同一の列順・既定エイリアス名）。`rls_predicate_present` は [`Self::new`]
+    /// と同じ理由で常に `false` 固定。
+    pub fn new_grouped_by_columns(
+        table: String,
+        items: Vec<BoundAggregateItem>,
+        metadata_filters: Vec<MetadataFilter>,
+        expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+        group_by_columns: &[&str],
         having: Vec<HavingSpec>,
         schema: &TableSchema,
     ) -> Result<Self, SqlSurfaceError> {
@@ -3769,7 +3798,24 @@ impl BoundAggregate {
         crate::sql::allowlist::check_aggregate_item_count(items.len())?;
         crate::sql::allowlist::check_having_predicate_count(having.len())?;
 
-        let column_index = resolve_group_by_column(schema, group_by_column)?;
+        if group_by_columns.is_empty() {
+            return Err(SqlSurfaceError::unsupported(
+                "GROUP BY must reference at least one column",
+            ));
+        }
+        crate::sql::allowlist::check_group_by_column_count(group_by_columns.len())?;
+        for (i, a) in group_by_columns.iter().enumerate() {
+            if group_by_columns[..i].contains(a) {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "duplicate GROUP BY column {a:?}"
+                )));
+            }
+        }
+
+        let mut column_indices = Vec::with_capacity(group_by_columns.len());
+        for column in group_by_columns {
+            column_indices.push(resolve_group_by_column(schema, column)?);
+        }
 
         let mut bound_having = Vec::with_capacity(having.len());
         for spec in having {
@@ -3792,10 +3838,13 @@ impl BoundAggregate {
             });
         }
 
-        let mut projection = Vec::with_capacity(items.len() + 1);
-        projection.push(ProjectionColumn::GroupKey {
-            name: group_by_column.to_string(),
-        });
+        let mut projection = Vec::with_capacity(items.len() + group_by_columns.len());
+        for (key_index, column) in group_by_columns.iter().enumerate() {
+            projection.push(ProjectionColumn::GroupKey {
+                key_index,
+                name: column.to_string(),
+            });
+        }
         for (item_index, item) in items.iter().enumerate() {
             projection.push(ProjectionColumn::Aggregate {
                 item_index,
@@ -3814,7 +3863,7 @@ impl BoundAggregate {
             rls_predicate_present: false,
             projection,
             group_by: Some(BoundGroupBy {
-                column_index,
+                column_indices,
                 having: bound_having,
                 order_by: None,
                 limit: None,
@@ -4168,9 +4217,9 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
-    // GROUP BY 列名（`SELECT` リストの `GroupKey` 項目の照合・`ORDER BY`/`LIMIT`
-    // 束縛より前に確定させる。`GROUP BY` なしなら `None`）。
-    let group_by_column = stmt.group_by().map(|g| g.column.as_str());
+    // GROUP BY 列名一覧（`SELECT` リストの `GroupKey` 項目の照合・`ORDER BY`/
+    // `LIMIT` 束縛より前に確定させる。`GROUP BY` なしなら空スライス）。
+    let group_by_columns: &[String] = stmt.group_by().map(|g| g.columns.as_slice()).unwrap_or(&[]);
 
     let mut items = Vec::new();
     let mut projection = Vec::with_capacity(stmt.items().len());
@@ -4181,8 +4230,10 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
     // `ORDER BY` から unknown 扱いされる。PR #230 codex-review P1 指摘対応:
     // `SELECT lang AS a, lang AS b, ...` のように同一 `GROUP BY` 列を複数回
     // 別名で射影できるため、単一 `Option<String>` では後勝ちで先のエイリアスが
-    // 失われる。全エイリアスを保持する `Vec<String>` にする）。
-    let mut group_key_aliases: Vec<String> = Vec::new();
+    // 失われる。全エイリアスを保持する。SQL-25 (d) で複数列化: どのキー番号
+    // （`group_by_columns` の添字）に付けられたエイリアスかを保持するため
+    // `Vec<(usize, String)>` にする）。
+    let mut group_key_aliases: Vec<(usize, String)> = Vec::new();
     for item in stmt.items() {
         match item {
             AggregateSelectItem::Aggregate(item) => {
@@ -4209,16 +4260,29 @@ pub(crate) fn bind_aggregate_with_dummy_flags(
                 projection.push(ProjectionColumn::Aggregate { item_index, name });
             }
             // `allowlist::parse_aggregate_shape` が `GROUP BY` 句自体の有無・
-            // 列名一致を構造検証済みのため、ここへ到達する `GroupKey` 項目は常に
-            // `group_by_column` と同名（構造上の前提。念のため `unwrap_or` で
-            // フォールバックせず明示的に確認する）。
+            // 列名一致（いずれかの `GROUP BY` 列と同名）を構造検証済みのため、
+            // ここへ到達する `GroupKey` 項目は必ず `group_by_columns` のいずれか
+            // 1 つと同名（構造上の前提）。`key_index` はその位置。
             AggregateSelectItem::GroupKey { column, alias } => {
-                debug_assert_eq!(Some(column.as_str()), group_by_column);
+                let key_index = match group_by_columns.iter().position(|c| c == column) {
+                    Some(index) => index,
+                    None => {
+                        // 構文層が既に列名一致を検証済み（上記コメント参照）。
+                        // 到達しないはずの分岐だが、行経路の `unwrap`/`expect`
+                        // 相当を避けるため internal エラーへ落とし panic も
+                        // fail-open な既定値継続もさせず、`Err` を返す
+                        // （`.claude/rules/coding-rust.md`・`security.md`
+                        // 「fail-open にする変更は P0」）。
+                        return Err(crate::sql::aggregate::accumulator_bug(
+                            "GroupKey column must match a GROUP BY column at this point",
+                        ));
+                    }
+                };
                 let name = alias.clone().unwrap_or_else(|| column.clone());
                 if let Some(alias) = alias.clone() {
-                    group_key_aliases.push(alias);
+                    group_key_aliases.push((key_index, alias));
                 }
-                projection.push(ProjectionColumn::GroupKey { name });
+                projection.push(ProjectionColumn::GroupKey { key_index, name });
             }
         }
     }
@@ -4518,43 +4582,59 @@ fn check_having_target_is_numeric(
 }
 
 /// [`crate::sql::allowlist::GroupByClause`] を `schema`・束縛済み `items`（アキュムレータ
-/// 一覧）と照合して [`BoundGroupBy`] へ束縛する（TASK-167・SQL-14）。`HAVING`/
-/// `ORDER BY` の対象名は SELECT リストの集計項目の実効名（`item.name`）、
-/// `GROUP BY` 列名そのもの、または SELECT リストで `GROUP BY` 列に付けた
-/// `group_key_aliases`（SELECT リストで `GROUP BY` 列に付けられた全エイリアス）
+/// 一覧）と照合して [`BoundGroupBy`] へ束縛する（TASK-167・SQL-14。SQL-25 (d) で
+/// 複数キーへ拡張）。`HAVING`/`ORDER BY` の対象名は SELECT リストの集計項目の
+/// 実効名（`item.name`）、いずれかの `GROUP BY` 列名そのもの、または SELECT
+/// リストでそのキーに付けた `group_key_aliases`（キー番号ごとの全エイリアス）
 /// のいずれかに解決する（これらのエイリアスは SELECT リストの実効名であり
 /// `ORDER BY` から参照できて然るべきため。PR #230 Bugbot 指摘対応。同一
 /// `GROUP BY` 列を複数回別名で射影できるため複数保持する。PR #230
-/// codex-review P1 指摘対応）。
+/// codex-review P1 指摘対応）。複数キーに一致する識別子（例: 2 つのキーへ同じ
+/// 別名を付けた場合）・キーと集計項目の双方に一致する識別子はいずれも曖昧
+/// として `22000` で拒否する（§計画 3.2）。
 fn bind_group_by_clause(
     clause: &crate::sql::allowlist::GroupByClause,
     schema: &TableSchema,
     items: &[BoundAggregateItem],
-    group_key_aliases: &[String],
+    group_key_aliases: &[(usize, String)],
 ) -> Result<BoundGroupBy, SqlSurfaceError> {
     // GROUP BY 列は TEXT 列のみ許可する（VECTOR・疑似列 `id`・未知列はいずれも
     // 型不整合として拒否。§計画 3.2。`id` によるグルーピングは本タスクの対象外
     // ＝将来拡張候補）。SQL テキスト経由・直接構築経由（[`BoundAggregate::
-    // new_grouped`]・TASK-186・NOSQL-5）が [`resolve_group_by_column`] を共有する。
-    let column_index = resolve_group_by_column(schema, &clause.column)?;
+    // new_grouped_by_columns`]・TASK-186・NOSQL-5・SQL-25 (d)）が
+    // [`resolve_group_by_column`] を共有する。
+    let mut column_indices = Vec::with_capacity(clause.columns.len());
+    for column in &clause.columns {
+        column_indices.push(resolve_group_by_column(schema, column)?);
+    }
 
-    // HAVING/ORDER BY の対象名解決: `GROUP BY` 列名そのもの、`GROUP BY` 列の
-    // SELECT リストでの実効名（`group_key_aliases` のいずれか）、または `items`
-    // のいずれか 1 つの実効名に一意に一致する識別子のみを受理する（曖昧・非存在
-    // は `22000`）。
+    // HAVING/ORDER BY の対象名解決: いずれかの `GROUP BY` 列名そのもの、その
+    // キーの SELECT リストでの実効名（`group_key_aliases` のいずれか）、または
+    // `items` のいずれか 1 つの実効名に一意に一致する識別子のみを受理する
+    // （曖昧・非存在は `22000`）。
     let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
-        let matches_group_key =
-            name == clause.column || group_key_aliases.iter().any(|alias| alias == name);
+        let mut key_matches: Vec<usize> = clause
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.as_str() == name)
+            .map(|(idx, _)| idx)
+            .collect();
+        for (idx, alias) in group_key_aliases {
+            if alias == name && !key_matches.contains(idx) {
+                key_matches.push(*idx);
+            }
+        }
         let item_matches: Vec<usize> = items
             .iter()
             .enumerate()
             .filter(|(_, it)| it.name == name)
             .map(|(idx, _)| idx)
             .collect();
-        match (matches_group_key, item_matches.as_slice()) {
-            (true, []) => Ok(OrderTarget::GroupKey),
-            (false, [idx]) => Ok(OrderTarget::Aggregate(*idx)),
-            (false, []) => Err(SqlSurfaceError::invalid_input(format!(
+        match (key_matches.as_slice(), item_matches.as_slice()) {
+            ([key_idx], []) => Ok(OrderTarget::GroupKey(*key_idx)),
+            ([], [idx]) => Ok(OrderTarget::Aggregate(*idx)),
+            ([], []) => Err(SqlSurfaceError::invalid_input(format!(
                 "unknown GROUP BY reference: {name}"
             ))),
             _ => Err(SqlSurfaceError::invalid_input(format!(
@@ -4568,7 +4648,7 @@ fn bind_group_by_clause(
         let target = resolve_target(&pred.item_name)?;
         let item_index = match target {
             OrderTarget::Aggregate(idx) => idx,
-            OrderTarget::GroupKey => {
+            OrderTarget::GroupKey(_) => {
                 // GROUP BY 列（TEXT）は数値比較の対象にならない（HAVING 右辺は
                 // 常に数値リテラル）。列名一致でも `GroupKey` を指した場合は
                 // 型不整合として拒否する。
@@ -4625,7 +4705,7 @@ fn bind_group_by_clause(
     let offset = validate_search_offset(clause.offset)?;
 
     Ok(BoundGroupBy {
-        column_index,
+        column_indices,
         having,
         order_by,
         limit,
