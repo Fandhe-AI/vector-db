@@ -683,6 +683,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_offset_position() {
+        // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` は `$n` プレースホルダの許可
+        // 位置（本モジュールドキュメントの表）に含まれない。広域取得の `OFFSET` へ
+        // `$n` を渡す形は本モジュールの変更なしに構造上拒否される（許可リストに
+        // 無い位置は一律 `42601`）。
+        assert!(positions("SELECT * FROM documents LIMIT 5 OFFSET $1").is_err());
+    }
+
+    #[test]
     fn rejects_using_mode_position() {
         let err =
             positions("SELECT * FROM documents ORDER BY embedding <=> '[0]' LIMIT 5 USING MODE $1")

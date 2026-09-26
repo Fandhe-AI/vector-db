@@ -1567,6 +1567,16 @@ pub(crate) fn execute_grouped_aggregate(
         None => finished.sort_by(|(ka, _), (kb, _)| ka.cmp(kb)),
     }
 
+    // Issue #916・SQL-25 (b)・TASK-209: `OFFSET` はソート確定後・`LIMIT` 適用前に
+    // 適用する（グループはすでに可視行のみから構成済み〔`sql::aggregate` の
+    // 走査ループが RLS を適用してから集約する〕ため、この段で読み飛ばしても RLS
+    // 契約は変わらない）。`drain` の範囲は `finished.len()` でクランプし、添字
+    // アクセス（`[]`）を使わない（`.claude/rules/coding-rust.md`）。
+    if group_by.offset > 0 {
+        let drop_to = group_by.offset.min(finished.len());
+        finished.drain(..drop_to);
+    }
+
     if let Some(limit) = group_by.limit {
         finished.truncate(limit);
     }
@@ -1687,8 +1697,58 @@ mod tests {
                 having: Vec::new(),
                 order_by: None,
                 limit: None,
+                offset: 0,
             }),
         }
+    }
+
+    /// Issue #916・SQL-25 (b)・TASK-209: `OFFSET` はソート確定後・`LIMIT` 適用前に
+    /// 適用する（3.3 節）ことを、`ORDER BY` なし（既定のグループキー昇順ソート）の
+    /// `GROUP BY` 集計で確認する。5 グループ（"a".."e"）を昇順ソート後、
+    /// `OFFSET 2 LIMIT 2` は 3・4 番目（"c"・"d"）だけを返す。
+    #[test]
+    fn group_by_offset_skips_leading_sorted_groups_before_limit_applies() {
+        let path = unique_db_path("group-by-offset-paging");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column();
+        storage.create_table(&schema).expect("create table");
+        write_lang_rows(
+            &storage,
+            &schema,
+            &[(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")],
+        );
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let mut bound = bound_count_star_grouped_by_lang();
+        if let Some(group_by) = bound.group_by.as_mut() {
+            group_by.offset = 2;
+            group_by.limit = Some(2);
+        }
+
+        let result = execute_grouped_aggregate(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+            None,
+            None,
+        )
+        .expect("grouped aggregate with OFFSET should succeed");
+
+        let keys: Vec<&str> = result
+            .rows
+            .iter()
+            .map(|row| match &row.cells[0] {
+                Cell::Text(s) => s.as_str(),
+                other => panic!("expected group key cell to be Text, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, vec!["c", "d"]);
     }
 
     // Issue #349: TABLE-12 の整合検査（物理キー側 `tenant_id` とヘッダ側
@@ -1773,6 +1833,7 @@ mod tests {
                 having: Vec::new(),
                 order_by: None,
                 limit: None,
+                offset: 0,
             }),
         }
     }
@@ -2047,6 +2108,7 @@ mod tests {
                 having: Vec::new(),
                 order_by: None,
                 limit: None,
+                offset: 0,
             }),
         }
     }
