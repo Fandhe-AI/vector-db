@@ -132,6 +132,10 @@ pub mod cursor;
 pub mod ddl;
 pub(crate) mod ddl_column_type;
 pub(crate) mod describe;
+// `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する
+// 正準キー化・予算管理。`allowlist`（構文の脱糖先）と `aggregate`／`group_by`
+// （`Accumulator::CountDistinct` の予算管理）の双方から参照される。
+pub(crate) mod distinct;
 pub mod exec;
 pub mod explain;
 pub(crate) mod expr_program;

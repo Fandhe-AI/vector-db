@@ -200,6 +200,56 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
     )
 }
 
+/// `DISTINCT` が字句解析上 `Token::Ident` であること（[`catalog::validate_identifier`]
+/// は列名 `distinct` を許可している）に由来する文脈判定（SQL-25 (c)・TASK-209）。
+/// `tokens[pos]` が大文字小文字を無視して `DISTINCT` に一致し、かつ次のトークンが
+/// `Ident`（`AS` を除く）または `'*'` の場合に限り修飾子とみなす。次が `FROM`・
+/// `,`・`)`・`(`・文末のときは列名として扱う（`SELECT distinct FROM t`・
+/// `COUNT(distinct)`・`WHERE distinct = 'x'` 等の既存の列参照としての解釈を
+/// 壊さない）。
+///
+/// 次トークンが `Ident` として字句解析される `AS` の場合はさらに 2 つの読みが
+/// 衝突する（`catalog::validate_identifier` は列名 `as` も許可しているため）。
+/// PR #1098 レビュー対応（codex/review P1・Cursor Bugbot 指摘）:
+/// - `DISTINCT AS <alias>`（`tokens[pos+2]` が `Ident` で、かつそれ自身が
+///   `AS` 由来の連鎖ではない）: `DISTINCT` 自体が列名で、`AS <alias>` は
+///   その別名（[`Parser::parse_aggregate_select_item`] が受理する「裸の
+///   識別子 ＋ 任意の `AS <alias>`」の形。GROUP BY 対象列として使う
+///   `SELECT distinct AS d, COUNT(*) FROM t GROUP BY distinct` 等）。
+///   この場合は列名側（`false`）へ振り分ける。
+/// - `DISTINCT AS`（`tokens[pos+2]` が `Ident` でない＝`FROM`・`,`・`)`・
+///   文末等）: 列名 `as` の前に置かれた `DISTINCT` 修飾子（
+///   `COUNT(DISTINCT as)`・`SELECT DISTINCT as FROM t`）。この場合は修飾子側
+///   （`true`）へ振り分ける。
+/// - `DISTINCT as AS <alias>`（`tokens[pos+2]` も `AS` 由来の `Ident` で、
+///   その次（`tokens[pos+3]`）が `Ident`）: `tokens[pos+1]` の `as` は列名
+///   （`DISTINCT` は修飾子）、`tokens[pos+2]` の `AS` は列名 `as` に付く
+///   別名節の導入（`SELECT DISTINCT as AS alias FROM t`）。列名 `AS` を
+///   単なる別名（上記 1 つ目のケース）と誤読すると、2 段目の `AS <alias>`
+///   が余剰トークンとして構文エラーになり、この形状が拒否されてしまう
+///   （PR #1098 レビュー対応・codex/review P1 再指摘）。この場合は修飾子側
+///   （`true`）へ振り分ける。
+pub(crate) fn is_distinct_modifier(tokens: &[Token], pos: usize) -> bool {
+    matches!(tokens.get(pos), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("DISTINCT"))
+        && match tokens.get(pos + 1) {
+            Some(Token::Ident(next)) if next.eq_ignore_ascii_case("AS") => {
+                match tokens.get(pos + 2) {
+                    Some(Token::Ident(next2))
+                        if next2.eq_ignore_ascii_case("AS")
+                            && matches!(tokens.get(pos + 3), Some(Token::Ident(_))) =>
+                    {
+                        true
+                    }
+                    Some(Token::Ident(_)) => false,
+                    _ => true,
+                }
+            }
+            Some(Token::Ident(_)) => true,
+            Some(Token::Punct('*')) => true,
+            _ => false,
+        }
+}
+
 /// 1 文の集計項目リストが持てる要素数の上限（TASK-166・SQL-13）。無制限 `Vec` 確保を
 /// 避ける（`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」
 /// 対応）。
@@ -1227,11 +1277,15 @@ pub enum AggregateArg {
 
 /// SELECT リストの集計項目 1 つ（TASK-166・SQL-13）。`alias` 省略時の列名は
 /// [`AggregateFunc::default_alias`] を使う（`sql::parser::bind_aggregate` の責務）。
+/// `distinct`（SQL-25 (c)・TASK-209）は `COUNT(DISTINCT <expr>)` の修飾子。
+/// `COUNT` 以外の関数で `true` になることはない（[`Parser::parse_aggregate_item`]
+/// が構造的に絞り込む）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggregateItem {
     pub(crate) func: AggregateFunc,
     pub(crate) arg: AggregateArg,
     pub(crate) alias: Option<String>,
+    pub(crate) distinct: bool,
 }
 
 /// 集計 `SELECT` リストの 1 項目（TASK-167・SQL-14 で `AggregateItem` 単独から拡張）。
@@ -2099,21 +2153,43 @@ impl<'a> Parser<'a> {
         Ok(SelectItem::Column(self.expect_ident()?))
     }
 
-    /// 集計 SELECT リストの 1 項目（TASK-166・SQL-13）:
-    /// `<agg_name> '(' ('*' | <expr>) ')' [AS <alias>]`。`*` は `COUNT` 専用
-    /// （それ以外の関数での出現は `42601`）。空引数（`COUNT()`）・複数引数・
-    /// `DISTINCT` 修飾はいずれも構造的に受理しない（`)` を期待する位置で不一致となり
-    /// `42601` へ落ちる）。
+    /// 集計 SELECT リストの 1 項目（TASK-166・SQL-13。SQL-25 (c)・TASK-209 で
+    /// `COUNT(DISTINCT <expr>)` を追加）:
+    /// `<agg_name> '(' [DISTINCT] ('*' | <expr>) ')' [AS <alias>]`。`*` は
+    /// `COUNT` 専用（それ以外の関数での出現は `42601`）。空引数（`COUNT()`）・
+    /// 複数引数はいずれも構造的に受理しない（`)` を期待する位置で不一致となり
+    /// `42601` へ落ちる）。`DISTINCT` は `COUNT` 以外の関数・`COUNT(DISTINCT *)`
+    /// では `42601`（SQL-25 (c) の対象は `COUNT` のみ）。
     fn parse_aggregate_item(&mut self) -> Result<AggregateItem, SqlSurfaceError> {
         let name = self.expect_ident()?;
         let func = AggregateFunc::from_name(&name).ok_or_else(|| {
             SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
         })?;
         self.expect_punct('(')?;
+        // `DISTINCT` は `'('` の直後・引数の直前という文脈でのみ修飾子として
+        // 消費する（[`is_distinct_modifier`] と同じ判定規則。列名 `distinct` を
+        // 引数に持つ `COUNT(distinct)` を壊さないよう、次のトークンが識別子・`*`
+        // でない場合は消費しない）。
+        let distinct = if is_distinct_modifier(self.tokens, self.pos) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        if distinct && func != AggregateFunc::Count {
+            return Err(SqlSurfaceError::unsupported(
+                "DISTINCT is only allowed inside COUNT(DISTINCT ...)",
+            ));
+        }
         let arg = if matches!(self.peek(), Some(Token::Punct('*'))) {
             if func != AggregateFunc::Count {
                 return Err(SqlSurfaceError::unsupported(
                     "'*' is only allowed inside COUNT(*)",
+                ));
+            }
+            if distinct {
+                return Err(SqlSurfaceError::unsupported(
+                    "COUNT(DISTINCT *) is not supported",
                 ));
             }
             self.advance();
@@ -2134,7 +2210,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(AggregateItem { func, arg, alias })
+        Ok(AggregateItem {
+            func,
+            arg,
+            alias,
+            distinct,
+        })
     }
 
     /// 集計 SELECT リストの 1 項目（TASK-167・SQL-14 で拡張）。次のトークンが
@@ -4773,6 +4854,74 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
     })
 }
 
+/// `SELECT DISTINCT <column> [AS <alias>] FROM <table> [WHERE ...]
+/// [ORDER BY ...] [LIMIT ...]`（SQL-25 (c)・TASK-209）の許可形状。`GROUP BY`
+/// 実行器（[`ValidatedAggregate`]）へ直接脱糖する（SELECT リストに集計項目を
+/// 持たない `GroupKey` 単独の形。[`validate_sql_tokens`] がここで組み立てた
+/// `ParsedAggregateShape` を `parse_aggregate_shape` と同じ `Statement::
+/// Aggregate` へ写像するため、実行経路〔`bind_aggregate`・
+/// `execute_grouped_aggregate`〕は完全に共有される）。
+///
+/// 対象は単一の裸列参照のみ（複数列・`*`・式は `42601`。列名一致の判定を
+/// 経ないため `GroupByClause::column` はここでの唯一の列名をそのまま使う）。
+/// `GROUP BY`・`HAVING`・`OFFSET`・ベクトル順位付け（`ORDER BY <=>`・`HYBRID`・
+/// `USING PLAN`・`USING MODE`・`HINT ORDER`）はいずれもこの構文自体が持たない
+/// ため、併用は構造的に `42601` へ落ちる（SQL-25 (a) 参照）。列の型が
+/// `TEXT` であることの検査は意味論層（`sql::parser::bind_group_by_clause`）が
+/// 担う（`VECTOR` 列・`TEXT` 以外のスカラー列はいずれも `22000`）。
+fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+
+    p.expect_keyword(Keyword::Select)?;
+    p.expect_ident_matching("DISTINCT")?;
+    let column = p.expect_ident()?;
+    let alias = if p.peek_ident_matches("AS") {
+        p.advance();
+        Some(p.expect_ident()?)
+    } else {
+        None
+    };
+    p.expect_keyword(Keyword::From)?;
+    let table_name = p.expect_ident()?;
+
+    let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        p.parse_where()?
+    } else {
+        Vec::new()
+    };
+    let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+        Some(p.parse_aggregate_order_by()?)
+    } else {
+        None
+    };
+    let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+        Some(p.parse_aggregate_limit()?)
+    } else {
+        None
+    };
+    p.expect_end_of_statement()?;
+
+    Ok(ParsedAggregateShape {
+        table_name,
+        items: vec![AggregateSelectItem::GroupKey {
+            column: column.clone(),
+            alias,
+        }],
+        where_predicates,
+        group_by: Some(GroupByClause {
+            column,
+            having: Vec::new(),
+            order_by,
+            limit,
+            // `SELECT DISTINCT <column> ...` 構文自体が `OFFSET` を持たない
+            // ため常に `0`（Issue #916・SQL-25 (b)・TASK-209 の `offset` 追加に
+            // 伴う base 取り込みでの構造体フィールド整合）。
+            offset: 0,
+        }),
+    })
+}
+
 /// `SET search_mode = '<literal>'`（TASK-161・SQL-12）の許可形状。規範形は
 /// `=` ＋ 文字列リテラルの完全一致のみ（`TO` 形・非引用値・`RESET`/`SHOW` 等の緩和は
 /// SQL-12 に規範がないため、本実装は最も厳格な形に倒す。緩和は spec 側の判断事項）。
@@ -4942,7 +5091,29 @@ pub(crate) fn validate_sql_tokens(
         && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
             && matches!(tokens.get(2), Some(Token::Punct('('))))
             || contains_group_by);
+    // SQL-25 (c)・TASK-209: `SELECT` の直後（2 番目のトークン）が
+    // [`is_distinct_modifier`] の判定する `DISTINCT` 修飾子なら `SELECT DISTINCT`
+    // 形状（[`parse_distinct_shape`]）へ振り分ける。`is_aggregate_select`
+    // （`GROUP BY` を含む形）より前に判定する（`SELECT DISTINCT lang, COUNT(*)
+    // FROM t GROUP BY lang` のような両方に一致しうる入力は存在しない——
+    // `parse_distinct_shape` は単一の裸列参照のみを受理するため、集計項目や
+    // 複数列を伴う形は自然に `42601` へ落ちる）。
+    let is_distinct_select = matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
+        && is_distinct_modifier(tokens, 1);
     match tokens.first() {
+        Some(Token::Keyword(Keyword::Select)) if is_distinct_select => {
+            let shape = parse_distinct_shape(tokens)?;
+            let exists = lookup.table_exists(&shape.table_name)?;
+            if !exists {
+                return Err(SqlSurfaceError::undefined_table(shape.table_name));
+            }
+            Ok(Statement::Aggregate(ValidatedAggregate {
+                table_name: shape.table_name,
+                items: shape.items,
+                where_predicates: shape.where_predicates,
+                group_by: shape.group_by,
+            }))
+        }
         Some(Token::Keyword(Keyword::Select)) if is_aggregate_select => {
             let shape = parse_aggregate_shape(tokens)?;
             let exists = lookup.table_exists(&shape.table_name)?;
@@ -5114,6 +5285,14 @@ pub(crate) fn validate_sql_tokens(
             if rest_is_aggregate_select {
                 return Err(SqlSurfaceError::unsupported(
                     "EXPLAIN is not supported for aggregate SELECT statements",
+                ));
+            }
+            // SQL-25 (c)・TASK-209: `EXPLAIN SELECT DISTINCT ...` も同じ理由
+            // （`ValidatedAggregate` に `using_plan` が無く両立しない）で明示的に
+            // 拒否する。`EXPLAIN` の対象拡大は SQL-27 の管轄で本 Issue の対象外。
+            if is_distinct_modifier(rest, 1) {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXPLAIN is not supported for SELECT DISTINCT statements",
                 ));
             }
             // Issue #454: 広域取得（`ParsedSelect::Scan`）は `USING PLAN` を
@@ -9211,11 +9390,170 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// SQL-25 (c)・TASK-209 で `COUNT(DISTINCT <expr>)` を受理するよう仕様変更
+    /// （旧名 `rejects_distinct_modifier` から反転。アサーションの弱体化ではなく
+    /// 許可リストの構造判定のみを確認する回帰テスト）。
     #[test]
-    fn rejects_distinct_modifier() {
+    fn accepts_count_distinct_modifier() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT COUNT(DISTINCT lang) FROM documents", &lookup)
-            .expect_err("COUNT(DISTINCT ...) must be rejected");
+        validate_sql("SELECT COUNT(DISTINCT lang) FROM documents", &lookup)
+            .expect("COUNT(DISTINCT ...) must be accepted (SQL-25 (c))");
+    }
+
+    #[test]
+    fn rejects_count_distinct_star() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT COUNT(DISTINCT *) FROM documents", &lookup)
+            .expect_err("COUNT(DISTINCT *) must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_sum_distinct() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT SUM(DISTINCT id) FROM documents", &lookup)
+            .expect_err("DISTINCT is only allowed inside COUNT");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    /// `distinct` という列名の後方互換（SQL-25 (c) 追加前の既存解釈を維持する）。
+    #[test]
+    fn accepts_count_of_column_named_distinct() {
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT COUNT(distinct) FROM documents", &lookup)
+            .expect("COUNT(distinct) (column named 'distinct') must remain accepted");
+    }
+
+    #[test]
+    fn accepts_select_distinct_column() {
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT DISTINCT lang FROM documents", &lookup)
+            .expect("SELECT DISTINCT <column> must be accepted (SQL-25 (c))");
+    }
+
+    #[test]
+    fn accepts_select_distinct_bare_column_named_distinct_as_projection() {
+        // `distinct` という列名を持つ表への `SELECT distinct FROM t LIMIT n`
+        // （既存の広域取得としての解釈）は `is_distinct_modifier` の「次が
+        // `FROM` なら列名」判定で維持される。
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT distinct FROM documents LIMIT 5", &lookup)
+            .expect("bare column named 'distinct' must remain accepted as a projection");
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_with_alias_in_group_by_projection() {
+        // PR #1098 レビュー対応（codex/review P1）: `is_distinct_modifier` が
+        // 次トークンを任意の `Ident` とみなして `DISTINCT` 修飾子と誤判定すると、
+        // `distinct` という列名に `AS <alias>` を付けた既存の集計 SELECT リスト
+        // 項目（[`Parser::parse_aggregate_select_item`] が受理する「裸の識別子
+        // ＋ 任意の `AS <alias>`」の形。GROUP BY 対象列として使う場合に現れる）
+        // まで `parse_distinct_shape` へ誤って振り分けられ `42601` で拒否されて
+        // いた。次トークンが `AS` の場合は列名側へ振り分けることで、この形状が
+        // 引き続き受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql(
+            "SELECT distinct AS d, COUNT(*) FROM documents GROUP BY distinct",
+            &lookup,
+        )
+        .expect(
+            "column named 'distinct' with AS alias in GROUP BY projection must remain accepted",
+        );
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(
+                    agg.group_by.as_ref().map(|g| g.column.as_str()),
+                    Some("distinct")
+                );
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_named_as() {
+        // PR #1098 レビュー対応（codex/review P1・Cursor Bugbot 指摘）:
+        // `is_distinct_modifier` が次トークン `Ident("AS")` を常に列名側の目印と
+        // 誤判定すると、列名 `as`（`catalog::validate_identifier` が許可する
+        // 識別子）を対象にした `SELECT DISTINCT as ...` まで列名 `distinct` の
+        // 投影として解釈され `42601` で拒否されていた。`AS` の 1 つ先の
+        // トークンまで見て「別名なし＝列名 as に対する DISTINCT 修飾子」と
+        // 判定することで、この形状が受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql("SELECT DISTINCT as FROM documents", &lookup)
+            .expect("SELECT DISTINCT <column named 'as'> must be accepted");
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(agg.group_by.as_ref().map(|g| g.column.as_str()), Some("as"));
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_count_distinct_column_named_as() {
+        // 上記と同じ曖昧さの `COUNT(DISTINCT <expr>)`（[`Parser::parse_aggregate_item`]）
+        // 側での固定（PR #1098 レビュー対応）。
+        let lookup = catalog_with(&["documents"]);
+        validate_sql("SELECT COUNT(DISTINCT as) FROM documents", &lookup)
+            .expect("COUNT(DISTINCT <column named 'as'>) must be accepted");
+    }
+
+    #[test]
+    fn accepts_select_distinct_column_named_as_with_alias() {
+        // PR #1098 レビュー再指摘（codex/review P1）: `is_distinct_modifier` が
+        // `tokens[pos+1]` の `Ident("AS")` を見た時点で `tokens[pos+2]` が
+        // `Ident` なら無条件に「`DISTINCT` 自体が列名」と判定すると、列名 `as`
+        // （`AS` と字句上区別できない）自体に別名を付ける
+        // `SELECT DISTINCT as AS alias FROM t` まで、2 段目の `AS alias` を
+        // 余剰トークンとして `42601` で拒否していた。`tokens[pos+2]` 自体が
+        // さらに `AS` 由来で `tokens[pos+3]` が識別子（真の別名）の場合は
+        // 列名 `as` に対する `DISTINCT` 修飾子と判定することで、この形状が
+        // 受理されることを固定する。
+        let lookup = catalog_with(&["documents"]);
+        let statement = validate_sql("SELECT DISTINCT as AS alias FROM documents", &lookup)
+            .expect("SELECT DISTINCT <column named 'as'> AS <alias> must be accepted");
+        match statement {
+            Statement::Aggregate(agg) => {
+                assert_eq!(agg.group_by.as_ref().map(|g| g.column.as_str()), Some("as"));
+                match agg.items.as_slice() {
+                    [AggregateSelectItem::GroupKey { column, alias }] => {
+                        assert_eq!(column, "as");
+                        assert_eq!(alias.as_deref(), Some("alias"));
+                    }
+                    other => panic!("expected single GroupKey item, got {other:?}"),
+                }
+            }
+            other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_select_distinct_star_with_vector_ranking() {
+        // `SELECT DISTINCT *` とベクトル順位付けの併用は引き続き `42601` で
+        // 拒否する（SQL-25 (a) 参照。既存の `rejects_distinct` と同じ入力を、
+        // `SELECT DISTINCT` 対応後も一貫して拒否することを確認する）。
+        assert_rejected_as_syntax_error(
+            "SELECT DISTINCT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_select_distinct_with_explicit_group_by() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT DISTINCT lang FROM documents GROUP BY lang", &lookup)
+            .expect_err("SELECT DISTINCT does not accept an explicit GROUP BY clause");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_explain_select_distinct() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "EXPLAIN SELECT DISTINCT lang FROM documents USING PLAN(full_scan())",
+            &lookup,
+        )
+        .expect_err("EXPLAIN does not support SELECT DISTINCT");
         assert_eq!(err.wire_code(), "42601");
     }
 
