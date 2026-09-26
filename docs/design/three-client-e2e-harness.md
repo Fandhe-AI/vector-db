@@ -733,6 +733,52 @@ listen 後の stderr）を出力する。回帰テスト
 production コードは変更していない（stderr の消費側が閉じた場合に
 サーバーが abort する挙動の扱いは、本 Issue のスコープ外として別途判断する）。
 
+## TLS 上の 3 クライアント検証（Issue #969・WIRE-9）
+
+TASK-228（WIRE-9・WIRE-1、親 #941）のうち、自作 TLS 1.3 スタック
+（Issue #952〜#967・#970）の wire 接続への結線が完了した後段として、
+「無改造の実クライアントが TLS 越しに C1〜C4・RLS 分離を完走できるか」
+「TLS 1.2 のみの提示・改ざんレコード・切り詰めハンドシェイクが
+fail-closed で切断されるか」を検証する（新設ファイル
+`crates/wire-server/tests/wire9_tls.rs`）。
+
+- **層 A（常時 `make ci`）**: 内製の TLS 1.3 最小クライアント
+  （`tests/common/tls_client.rs`）で、TLS 越しの C1〜C4 一致・RLS 3 テナント
+  分離（他テナント Private 行の混入 0 件）・`--tls-mode require`（既定）の
+  平文拒否を回帰保護する。加えて、以下 7 種の負のテストがいずれも
+  fail-closed で切断され、かつ同一サーバープロセスが後続の正規接続を
+  完走できる（1 接続の失敗がプロセスを落とさない）ことを固定する。
+  実測した alert の description（RFC 8446 の値）は次のとおり:
+  - TLS 1.2 のみを提示する ClientHello（`supported_versions` 拡張なし／
+    TLS 1.2 のみを含む拡張の 2 変種）→ `protocol_version`（70）
+  - ハンドシェイク完了後の application data レコードを 1 バイト改ざん
+    → `bad_record_mac`（20）
+  - レコード長が `MAX_CIPHERTEXT_LEN`（2^14+256）を超えるヘッダのみ送信
+    （本体は待たずに拒否）→ `record_overflow`（22）
+  - ClientHello レコードの宣言長より短い本体で半クローズ／レコードヘッダ
+    自体を切り詰めて半クローズ → いずれも ServerHello（Handshake 型
+    レコード）を送らずに切断（alert の有無は実装依存のため、
+    Handshake 型レコードが出ないことのみを固定する）
+  - server flight 受信後・client Finished 送出前に半クローズ → pg wire の
+    平文バイトが一切届かずに切断
+- **層 B（`#[ignore]`。`make e2e-three-client-tls` から明示実行）**: 無改造の
+  `psql`（`sslmode=require`）・Python `psycopg`（`sslmode=require`）・
+  Node.js `pg`（`ssl: { rejectUnauthorized: false }`）が `--tls-mode require`
+  越しに C1〜C4・RLS 分離を完走すること、`psql`
+  `ssl_max_protocol_version=TLSv1.2` が TLS 1.3 専用サーバーに拒否される
+  ことを検証する。`tests/three_client/{psycopg_client.py,pg_client.js}` に
+  任意の `WIRE_SSLMODE`／`WIRE_SSL` 環境変数を追加した（未指定なら従来どおり
+  TLS 指定を渡さない。`three_client_e2e.rs` はいずれの変数も渡さないため
+  無改造のまま挙動不変）。
+
+証明書・鍵は RFC 8032 §7.1 TEST 1 の公開テストベクタ
+（`tls_client::RFC8032_TEST1_SEED`）からテスト実行時に一時ディレクトリへ
+生成し、秘密鍵 PEM をリポジトリへは置かない（security.md P0）。
+
+`three_client_e2e.rs`（平文の層 B）とはヘルパーを意図的に重複させている
+（`tls_client.rs` 冒頭コメントと同じ方針）。共有モジュール化は本 Issue の
+対象外（別 Issue 候補）。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
