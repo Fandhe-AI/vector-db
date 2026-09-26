@@ -161,6 +161,43 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
     }
 }
 
+/// 2 枝の列数・列型整合を検証する（SQL-29 (c) §2.2）。列数不一致・列型不一致は
+/// `DatatypeMismatch`（`42804`）、重複除去を伴う演算での `VECTOR` 列混在は
+/// `InvalidInput`（`22000`）で拒否する。[`validate_tree_types`]（実行前の事前
+/// 検証）・[`describe_tree`]（Describe 経路）で同じ関数を共有し、判定基準を
+/// 単一化する（PR #1105 レビュー指摘対応: 従来はこの判定ロジックを `eval_tree`
+/// と `describe_tree` の 2 箇所に重複実装しており、判定基準が乖離しうる構造
+/// だった）。
+fn check_branch_type_compatibility(
+    op: SetOperator,
+    l_columns: &[ColumnMeta],
+    r_columns: &[ColumnMeta],
+    l_has_vector: bool,
+    r_has_vector: bool,
+) -> Result<(), SqlSurfaceError> {
+    if l_columns.len() != r_columns.len() {
+        return Err(SqlSurfaceError::datatype_mismatch(format!(
+            "column count mismatch: {} vs {}",
+            l_columns.len(),
+            r_columns.len()
+        )));
+    }
+    for (i, (a, b)) in l_columns.iter().zip(r_columns.iter()).enumerate() {
+        if !columns_compatible(a, b) {
+            return Err(SqlSurfaceError::datatype_mismatch(format!(
+                "column {i} type mismatch between set operation branches"
+            )));
+        }
+    }
+    let dedup_needed = !matches!(op, SetOperator::UnionAll);
+    if dedup_needed && (l_has_vector || r_has_vector) {
+        return Err(SqlSurfaceError::invalid_input(
+            "VECTOR columns cannot be combined with UNION/INTERSECT/EXCEPT (use UNION ALL)",
+        ));
+    }
+    Ok(())
+}
+
 fn columns_have_vector(columns: &[ColumnMeta]) -> bool {
     columns.iter().any(|c| {
         matches!(
@@ -288,6 +325,75 @@ fn row_key(row: &ResultRow) -> Result<Vec<u8>, SqlSurfaceError> {
     Ok(out)
 }
 
+/// `payload_len` バイトのペイロードに対する [`push_len_prefixed`] の出力長
+/// （長さ接頭辞 `u32` BE の 4 byte ＋ペイロード本体）。[`row_key_len`] が
+/// `push_len_prefixed` を呼ばずに長さだけを算出するために使う。
+fn len_prefixed_total_len(payload_len: usize) -> Result<usize, SqlSurfaceError> {
+    u32::try_from(payload_len).map_err(|_| {
+        SqlSurfaceError::payload_too_large("set operation row key exceeds length limit")
+    })?;
+    Ok(4usize.saturating_add(payload_len))
+}
+
+/// [`row_key`] が実際に生成するバイト列の長さを、`Vec<u8>` を確保せずに算出
+/// する（PR #1105 レビュー指摘対応: 従来は `row_key` が可変長セルを複製した
+/// `Vec<u8>` を確保した後で `SetOpBudget::charge` を呼んでいたため、予算上限
+/// 付近で同程度の大きさの行キーを、予算検証より前に確保できてしまっていた
+/// 〔security.md「長さフィールドは上限検証してからアロケーションに使う」〕。
+/// 呼び出し元は本関数の戻り値を `budget.charge` へ渡してから `row_key` を
+/// 呼ぶこと。`row_key` と同じ型タグ・長さ接頭辞規約に従う必要があるため、
+/// 両者は変更時に必ず同時に保守する（`tests::row_key_len_matches_row_key_
+/// output_length` が全 variant を横断して不一致を検出する）。
+fn row_key_len(row: &ResultRow) -> Result<usize, SqlSurfaceError> {
+    let mut total: usize = 0;
+    for cell in &row.cells {
+        let cell_len = match cell {
+            // 型タグ 1 byte のみ（ペイロードなし）。
+            Cell::Null => 1,
+            // 型タグ 1 byte ＋ `u64`/`i64`/`f64` の 8 byte。
+            Cell::Integer(_) | Cell::Float(_) | Cell::SignedInteger(_) | Cell::Timestamp(_) => {
+                1 + 8
+            }
+            // 型タグ 1 byte ＋ `bool` の 1 byte。
+            Cell::Bool(_) => 1 + 1,
+            // 型タグ 1 byte ＋ `i32` の 4 byte。
+            Cell::Date(_) => 1 + 4,
+            // 型タグ 1 byte ＋長さ接頭辞つきペイロード。
+            Cell::Text(s) => 1 + len_prefixed_total_len(s.len())?,
+            Cell::Bytes(b) => 1 + len_prefixed_total_len(b.len())?,
+            Cell::Json(s) => 1 + len_prefixed_total_len(s.len())?,
+            Cell::Numeric(d) => 1 + len_prefixed_total_len(d.to_string().len())?,
+            // 型タグ 1 byte ＋ UUID 本体（[`crate::uuid::Uuid::as_bytes`] は
+            // 常に 16 byte）。
+            Cell::Uuid(_) => 1 + 16,
+            // 型タグ 1 byte（12）＋要素種別タグ 1 byte（0／1）＋要素数 `u32`
+            // （4 byte）＋各要素のペイロード。
+            Cell::Array(arr) => {
+                let mut n = 1usize + 1usize + 4usize;
+                match arr {
+                    crate::row_codec::ArrayValue::Text(items) => {
+                        for item in items {
+                            n = n.saturating_add(len_prefixed_total_len(item.len())?);
+                        }
+                    }
+                    crate::row_codec::ArrayValue::Bool(items) => {
+                        n = n.saturating_add(items.len());
+                    }
+                }
+                n
+            }
+            // §2.2 の型検証で本来到達しない（`row_key` と同じ防御的拒否）。
+            Cell::Vector(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "VECTOR column reached set operation row key encoding".to_string(),
+                });
+            }
+        };
+        total = total.saturating_add(cell_len);
+    }
+    Ok(total)
+}
+
 /// 単一の枝（`SELECT ... FROM <table> [WHERE ...]`）を束縛・実行する。可視かつ
 /// `WHERE` 一致行が `core::MAX_SEARCH_K` を超える場合は `54000`（超過検出のため
 /// `MAX_SEARCH_K + 1` を上限として走査する）。文全体で共有する `budget`
@@ -327,10 +433,54 @@ fn eval_branch(
     })
 }
 
-/// 構文木を後行順（postorder）で評価する。各 `Op` ノードで型整合
-/// （列数・列型。§2.2）を検証してから合成する。結果列名・メタデータは常に左の
-/// 子（左端の枝）に揃える。`budget` は文全体で共有する累計バイト予算
-/// （[`SetOpBudget`]）で、枝の評価・行キー生成のいずれでも消費する。
+/// 集合演算木全体の列数・列型整合を、行走査（[`eval_tree`]・
+/// [`crate::sql::scan::execute_scan_with_budget`]）より前に確定させる
+/// （PR #1105 レビュー指摘対応: 従来は `eval_tree` が左右の枝を実際に走査して
+/// から `check_branch_type_compatibility` を呼んでいたため、型不一致の文でも
+/// 全行走査・結果確保が先行し、行数・バイト上限エラー（`54000`）が本来返す
+/// べき `DatatypeMismatch`〔`42804`〕より先に成立し得た。`describe_tree` と
+/// 同じ判定基準を、行を一切走査しない `bind_scan`〔`eval_branch` が実際の
+/// 走査で使うのと同じ束縛〕で走査前に確定させる。戻り値は上位の呼び出し元
+/// では使わず、検証のみを目的とする）。
+fn validate_tree_types(
+    schemas: &HashMap<String, TableSchema>,
+    tree: &SetTree,
+    udfs: &UdfRegistry,
+) -> Result<(Vec<ColumnMeta>, bool), SqlSurfaceError> {
+    match tree {
+        SetTree::Branch(validated) => {
+            let schema =
+                schemas
+                    .get(&validated.table_name)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "schema missing for set operation branch table".to_string(),
+                    })?;
+            let bound = crate::sql::parser::bind_scan(validated, schema, udfs)?;
+            let columns = crate::sql::describe::projected_columns(bound.projection(), schema);
+            let has_vector = columns_have_vector(&columns);
+            Ok((columns, has_vector))
+        }
+        SetTree::Op { op, left, right } => {
+            let (l_columns, l_has_vector) = validate_tree_types(schemas, left, udfs)?;
+            let (r_columns, r_has_vector) = validate_tree_types(schemas, right, udfs)?;
+            check_branch_type_compatibility(
+                *op,
+                &l_columns,
+                &r_columns,
+                l_has_vector,
+                r_has_vector,
+            )?;
+            Ok((l_columns, l_has_vector))
+        }
+    }
+}
+
+/// 構文木を後行順（postorder）で評価する。結果列名・メタデータは常に左の子
+/// （左端の枝）に揃える。`budget` は文全体で共有する累計バイト予算
+/// （[`SetOpBudget`]）で、枝の評価・行キー生成のいずれでも消費する。列数・
+/// 列型整合の検証は本関数の呼び出し前に [`validate_tree_types`] が完結させて
+/// いるため、ここでは繰り返さない（PR #1105 レビュー指摘対応。二重実装を避け、
+/// 走査前検証の判定基準を単一化する）。
 fn eval_tree(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
@@ -353,28 +503,6 @@ fn eval_tree(
             let l = eval_tree(read_txn, ctx, schemas, left, udfs, budget)?;
             let r = eval_tree(read_txn, ctx, schemas, right, udfs, budget)?;
 
-            if l.columns.len() != r.columns.len() {
-                return Err(SqlSurfaceError::datatype_mismatch(format!(
-                    "column count mismatch: {} vs {}",
-                    l.columns.len(),
-                    r.columns.len()
-                )));
-            }
-            for (i, (a, b)) in l.columns.iter().zip(r.columns.iter()).enumerate() {
-                if !columns_compatible(a, b) {
-                    return Err(SqlSurfaceError::datatype_mismatch(format!(
-                        "column {i} type mismatch between set operation branches"
-                    )));
-                }
-            }
-
-            let dedup_needed = !matches!(op, SetOperator::UnionAll);
-            if dedup_needed && (l.has_vector || r.has_vector) {
-                return Err(SqlSurfaceError::invalid_input(
-                    "VECTOR columns cannot be combined with UNION/INTERSECT/EXCEPT (use UNION ALL)",
-                ));
-            }
-
             let rows = match op {
                 SetOperator::UnionAll => {
                     let mut rows = l.rows;
@@ -390,11 +518,14 @@ fn eval_tree(
                     let mut seen: HashSet<Vec<u8>> = HashSet::new();
                     let mut rows = Vec::new();
                     for row in l.rows.into_iter().chain(r.rows) {
-                        let key = row_key(&row)?;
                         // 行キー生成も文全体で共有する累計バイト予算の対象
                         // （PR #1105 レビュー指摘対応。`seen` への格納で複製される
-                        // 分の追加メモリを見逃さない）。
-                        budget.charge(key.len())?;
+                        // 分の追加メモリを見逃さない）。長さを `row_key_len` で
+                        // 先に算出して予算を確認してから `row_key` で実際に
+                        // `Vec<u8>` を確保する（予算超過時に確保前に拒否する。
+                        // 逆順だと上限直前で確保してから拒否することになる）。
+                        budget.charge(row_key_len(&row)?)?;
+                        let key = row_key(&row)?;
                         if seen.contains(&key) {
                             continue;
                         }
@@ -411,16 +542,18 @@ fn eval_tree(
                 SetOperator::Intersect | SetOperator::Except => {
                     let mut right_keys: HashSet<Vec<u8>> = HashSet::new();
                     for row in &r.rows {
+                        // 順序は上と同じ理由（長さ算出 → 予算確認 → 確保）。
+                        budget.charge(row_key_len(row)?)?;
                         let key = row_key(row)?;
-                        budget.charge(key.len())?;
                         right_keys.insert(key);
                     }
                     let keep_if_present = matches!(op, SetOperator::Intersect);
                     let mut seen: HashSet<Vec<u8>> = HashSet::new();
                     let mut rows = Vec::new();
                     for row in l.rows.into_iter() {
+                        // 順序は上と同じ理由（長さ算出 → 予算確認 → 確保）。
+                        budget.charge(row_key_len(&row)?)?;
                         let key = row_key(&row)?;
-                        budget.charge(key.len())?;
                         let present = right_keys.contains(&key);
                         if present != keep_if_present || seen.contains(&key) {
                             continue;
@@ -493,6 +626,12 @@ pub(crate) fn execute_with_budget(
         Some(n) => Some(crate::sql::parser::validate_search_limit(n)?),
         None => None,
     };
+    // PR #1105 レビュー指摘対応: 列数・列型整合（`DatatypeMismatch`・`42804`）を
+    // 全枝の走査・合成より前に確定させる（[`validate_tree_types`] のドキュメン
+    // テーションコメント参照）。従来は `eval_tree` が左右の枝を実際に走査して
+    // から検証していたため、型不一致の文でも全行走査・結果確保が先行し、
+    // 行数・バイト上限エラー（`54000`）が `42804` に先行し得た。
+    validate_tree_types(schemas, tree, udfs)?;
     let mut budget = SetOpBudget::new(budget_cap);
     let outcome = eval_tree(read_txn, ctx, schemas, tree, udfs, &mut budget)?;
     // §2.4: 上限判定（`MAX_SET_OP_ROWS`）は全体 `LIMIT` による切り詰めより前に
@@ -555,26 +694,13 @@ fn describe_tree(
                 describe_tree(schemas, left, udfs, dummy_equality_flags)?;
             let (r_columns, r_has_vector) =
                 describe_tree(schemas, right, udfs, dummy_equality_flags)?;
-            if l_columns.len() != r_columns.len() {
-                return Err(SqlSurfaceError::datatype_mismatch(format!(
-                    "column count mismatch: {} vs {}",
-                    l_columns.len(),
-                    r_columns.len()
-                )));
-            }
-            for (i, (a, b)) in l_columns.iter().zip(r_columns.iter()).enumerate() {
-                if !columns_compatible(a, b) {
-                    return Err(SqlSurfaceError::datatype_mismatch(format!(
-                        "column {i} type mismatch between set operation branches"
-                    )));
-                }
-            }
-            let dedup_needed = !matches!(op, SetOperator::UnionAll);
-            if dedup_needed && (l_has_vector || r_has_vector) {
-                return Err(SqlSurfaceError::invalid_input(
-                    "VECTOR columns cannot be combined with UNION/INTERSECT/EXCEPT (use UNION ALL)",
-                ));
-            }
+            check_branch_type_compatibility(
+                *op,
+                &l_columns,
+                &r_columns,
+                l_has_vector,
+                r_has_vector,
+            )?;
             Ok((l_columns, l_has_vector))
         }
     }
@@ -811,5 +937,99 @@ mod tests {
         )
         .expect_err("LIMIT over MAX_SEARCH_K must be rejected by describe_columns");
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    fn int_schema(name: &str) -> TableSchema {
+        TableSchema::new(
+            name,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("score", ColumnType::Integer, false),
+            ],
+        )
+    }
+
+    fn int_branch(table: &str) -> SetTree {
+        SetTree::Branch(Box::new(ValidatedScan {
+            table_name: table.to_string(),
+            projection: Projection::Columns(vec!["score".to_string()]),
+            where_predicates: Vec::new(),
+            limit: crate::core::MAX_SEARCH_K as u32,
+            offset: 0,
+        }))
+    }
+
+    /// PR #1105 レビュー指摘の回帰（set_op.rs:353）: 列型不一致
+    /// （`DatatypeMismatch`・`42804`）の判定は、`eval_tree` が左右の枝を実際に
+    /// 走査するより前に確定していること。枝 `a`（TEXT 列）には実データを
+    /// 投入し、枝 `b`（INTEGER 列）とは列型が一致しない構成にした上で、
+    /// 予算上限を `0` にする（`a` を少しでも走査すれば必ず `54000` になる
+    /// 構成）。従来（列型検証が `eval_tree` の走査後）は `54000` が先に成立して
+    /// いたが、修正後は走査前の [`validate_tree_types`] が `42804` を確定させる
+    /// ため、`54000` に先行されない。
+    #[test]
+    fn type_mismatch_is_rejected_before_any_branch_is_scanned_even_with_a_zero_budget() {
+        let path = unique_db_path("set-op-type-mismatch-before-scan");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&text_schema("a")).expect("create a");
+        let tenant_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        insert_text_row(&storage, "a", &tenant_ctx, "some text");
+
+        let tree = SetTree::Op {
+            op: SetOperator::UnionAll,
+            left: Box::new(text_branch("a")),
+            right: Box::new(int_branch("b")),
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), text_schema("a"));
+        schemas.insert("b".to_string(), int_schema("b"));
+        let udfs = UdfRegistry::default();
+
+        let err = execute_with_budget(&read_txn, &tenant_ctx, &schemas, &tree, &udfs, None, 0)
+            .expect_err("type mismatch must be rejected even with a zero-byte budget");
+        assert_eq!(err.wire_code(), "42804");
+    }
+
+    /// PR #1105 レビュー指摘の回帰（set_op.rs:393・415・423）: [`row_key_len`]
+    /// が算出する長さは、[`row_key`] が実際に確保する `Vec<u8>` の長さと
+    /// 全 variant で一致すること（両者は変更時に必ず同時に保守する必要が
+    /// あるため、この一致検証が乖離を検出する）。
+    #[test]
+    fn row_key_len_matches_row_key_output_length() {
+        let uuid = crate::uuid::parse_uuid_text("550e8400-e29b-41d4-a716-446655440000")
+            .expect("valid uuid literal");
+        let decimal = crate::numeric::parse_literal_exact("123.45").expect("valid decimal literal");
+        let row = ResultRow {
+            id: 1,
+            score: 0.0,
+            cells: vec![
+                Cell::Null,
+                Cell::Integer(42),
+                Cell::Text("hello world".to_string()),
+                Cell::Float(3.5),
+                Cell::Bool(true),
+                Cell::SignedInteger(-7),
+                Cell::Date(19_000),
+                Cell::Timestamp(1_700_000_000_000_000),
+                Cell::Bytes(vec![1, 2, 3, 4, 5]),
+                Cell::Json("{\"a\":1}".to_string()),
+                Cell::Numeric(decimal),
+                Cell::Uuid(uuid),
+                Cell::Array(crate::row_codec::ArrayValue::Text(vec![
+                    "x".to_string(),
+                    "yz".to_string(),
+                ])),
+                Cell::Array(crate::row_codec::ArrayValue::Bool(vec![true, false, true])),
+            ],
+        };
+
+        let computed_len = row_key_len(&row).expect("row_key_len should succeed");
+        let actual_len = row_key(&row).expect("row_key should succeed").len();
+        assert_eq!(
+            computed_len, actual_len,
+            "row_key_len must predict the exact byte length row_key allocates"
+        );
     }
 }
