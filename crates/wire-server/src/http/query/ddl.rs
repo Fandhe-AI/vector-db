@@ -233,8 +233,14 @@ fn optional_scalar<'a>(
 /// `create_table.columns[*]` の受理型名（SQL 表層の CREATE TABLE と同じ
 /// 集合。モジュール doc 参照）を型トークン列へ写像する。戻り値の `bool` は
 /// `VECTOR` 列か（`UNIQUE`／`DEFAULT`／`nullable: true` が使えない）を表す。
+/// `build_add_column_type_tokens`（`alter_table.add_column`）と同じく
+/// ASCII 大文字小文字を無視して判定する——`create_table` だけ大文字小文字を
+/// 区別すると `alter_table` で通る型名（例: `INTEGER`／`Text`）が
+/// `create_table` では拒否される非対称が生じ、SQL 表層との型名受理集合の
+/// パリティが崩れるため。
 fn create_table_type_tokens(ty: &str, dim: Option<u32>) -> Result<(Vec<Token>, bool), DdlError> {
-    match ty {
+    let ty = ty.to_ascii_lowercase();
+    match ty.as_str() {
         "text" => {
             if dim.is_some() {
                 return Err(DdlError::InvalidRequest);
@@ -806,6 +812,45 @@ mod tests {
             add_column_validated(r#"{"name":"n","type":"numeric","precision":0,"scale":256}"#);
         let v = DDL_ADD_COLUMN_SCHEMA.validate(&value).expect("valid shape");
         let err = build_add_column_type_tokens(&v).expect_err("scale 256 must be rejected");
+        assert!(matches!(err, DdlError::InvalidRequest));
+    }
+
+    // --- create_table_type_tokens（alter_table とのケース正規化パリティ） --
+
+    #[test]
+    fn create_table_type_tokens_accepts_uppercase_and_mixed_case_type_names() {
+        // `build_add_column_type_tokens`（alter_table.add_column）が ASCII
+        // 小文字化してから型名を判定するのに対し、本関数がケース区別のまま
+        // 完全一致していると `INTEGER`／`Text` が create_table では拒否・
+        // alter_table では受理される非対称が生じる（レビュー指摘の回帰）。
+        let (tokens, is_vector) =
+            create_table_type_tokens("INTEGER", None).expect("uppercase type name must succeed");
+        assert_eq!(tokens, vec![Token::Ident("INTEGER".to_string())]);
+        assert!(!is_vector);
+
+        let (tokens, is_vector) =
+            create_table_type_tokens("Text", None).expect("mixed-case type name must succeed");
+        assert_eq!(tokens, vec![Token::Ident("TEXT".to_string())]);
+        assert!(!is_vector);
+
+        let (tokens, is_vector) =
+            create_table_type_tokens("Vector", Some(3)).expect("mixed-case VECTOR must succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("VECTOR".to_string()),
+                Token::Punct('('),
+                Token::Number("3".to_string()),
+                Token::Punct(')'),
+            ]
+        );
+        assert!(is_vector);
+    }
+
+    #[test]
+    fn create_table_type_tokens_still_rejects_unknown_type_name() {
+        let err = create_table_type_tokens("bogus", None)
+            .expect_err("unknown type name must be rejected regardless of case");
         assert!(matches!(err, DdlError::InvalidRequest));
     }
 
