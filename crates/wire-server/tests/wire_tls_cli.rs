@@ -1,7 +1,9 @@
-//! `--tls-cert`／`--tls-key`／`--tls-mode` opt-in（Issue #967・親 #941・
-//! TASK-228。WIRE-7, WIRE-9 ポインタ）をバイナリ子プロセスとして起動し、
-//! CLI 引数の受理・拒否（fail-closed）・既定不変・平文ポリシー
-//! （`require`／`allow`）・秘密値の非出力を外形的に検証する結合テスト。
+//! `--tls-cert`／`--tls-key`／`--tls-mode`／`--tls-scram-channel-binding`
+//! opt-in（Issue #967・#970・親 #941・TASK-228。WIRE-7, WIRE-9, WIRE-18
+//! ポインタ）をバイナリ子プロセスとして起動し、CLI 引数の受理・拒否
+//! （fail-closed）・既定不変・平文ポリシー（`require`／`allow`）・
+//! SCRAM-SHA-256-PLUS 提示可否・秘密値の非出力を外形的に検証する結合
+//! テスト。
 //!
 //! `tests/wire_durability_cli.rs`（Issue #850）・`tests/wire_search_engine_cli.rs`
 //! （Issue #656）と同じ流儀（実バイナリを
@@ -25,6 +27,11 @@
 //! - R6: 非ループバック bind × `allow` は非 0 終了し hint 行が出ること
 //! - R7: R2・R5 の stderr に鍵・証明書の内容（seed の hex・PKCS#8 の
 //!   base64 本文・証明書 PEM の本文）が含まれないこと
+//! - R8（Issue #970）: `--tls-scram-channel-binding` 単独指定は組合せ不正・
+//!   未知の語彙値は fail-closed 拒否。`enable` は AuthenticationSASL の
+//!   機構リストへ `SCRAM-SHA-256-PLUS` を追加し起動ログへ運用上の注意行を
+//!   1 行出す一方、未指定（既定 `disable`）は機構リストが `SCRAM-SHA-256`
+//!   のみのまま・注意行も出ないこと
 
 #[path = "common/mod.rs"]
 mod common;
@@ -852,5 +859,203 @@ fn tls_error_messages_do_not_leak_secret_material() {
     assert!(
         !stderr.contains(tls_client::RFC8032_TEST1_SEED),
         "stderr must not contain the raw key seed hex: {stderr}"
+    );
+}
+
+// --- R8: --tls-scram-channel-binding（Issue #970） -----------------------
+
+#[test]
+fn tls_scram_channel_binding_alone_is_rejected() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-alone");
+    write_user_store_with_alice(&fixture.path("users.txt"));
+    assert_startup_rejected(
+        &[
+            "--users",
+            &fixture.path_str("users.txt"),
+            "--db",
+            &fixture.db_path_str(),
+            "--bind",
+            "127.0.0.1:0",
+            "--tls-scram-channel-binding",
+            "enable",
+        ],
+        "--tls-scram-channel-binding",
+    );
+}
+
+#[test]
+fn tls_scram_channel_binding_rejects_unknown_value() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-bad");
+    write_user_store_with_alice(&fixture.path("users.txt"));
+    let (cert_path, key_path) = write_valid_tls_pair(&fixture);
+    assert_startup_rejected(
+        &[
+            "--users",
+            &fixture.path_str("users.txt"),
+            "--db",
+            &fixture.db_path_str(),
+            "--bind",
+            "127.0.0.1:0",
+            "--tls-cert",
+            cert_path.to_str().expect("utf-8 path"),
+            "--tls-key",
+            key_path.to_str().expect("utf-8 path"),
+            "--tls-scram-channel-binding",
+            "true",
+        ],
+        "--tls-scram-channel-binding",
+    );
+}
+
+/// SCRAM 検証子を持つユーザーストア（`alice`）と、`--scram-mock-key-file`
+/// 用のモック鍵ファイルを書き出す（`wire_scram_plus_psql_interop.rs::
+/// write_scram_user_store_file` と同じ構成要素。ファイルをまたいだ
+/// private ヘルパーの共有はできないため意図的に重複させる）。
+fn write_scram_user_store_and_mock_key(
+    fixture: &TempFixtureDir,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let scram_salt = [7u8; wire_server::auth::scram::SALT_LEN];
+    let verifier = wire_server::auth::scram::generate_verifier(
+        b"pw-alice",
+        &scram_salt,
+        wire_server::auth::scram::SCRAM_ITERATIONS,
+    )
+    .expect("valid verifier");
+    let phc = wire_server::auth::argon2id::encode_phc(
+        b"unused-in-scram-mode",
+        b"0123456789abcdef",
+        &wire_server::auth::argon2id::RECOMMENDED_PARAMS,
+    )
+    .expect("valid phc");
+    let users_path = fixture.path("users.txt");
+    std::fs::write(
+        &users_path,
+        format!("alice:tenant-a:{phc}:{}\n", verifier.to_verifier_string()),
+    )
+    .expect("write scram user store");
+
+    let mock_key_path = fixture.path("scram-mock-key.bin");
+    std::fs::write(
+        &mock_key_path,
+        vec![9u8; wire_server::auth_method_opt::SCRAM_MOCK_KEY_FILE_MIN_LEN],
+    )
+    .expect("write scram mock key file");
+    (users_path, mock_key_path)
+}
+
+/// AuthenticationSASL（コード 10）の機構リストを読む（`wire_scram_plus_tls.rs::
+/// read_authentication_sasl_mechanisms` と同じ構成要素。意図的な重複）。
+fn read_authentication_sasl_mechanisms(stream: &mut impl Read) -> Vec<String> {
+    let (ty, body) = read_typed_message(stream);
+    assert_eq!(ty, b'R', "expected AuthenticationSASL");
+    let code = i32::from_be_bytes(body[..4].try_into().expect("4 bytes"));
+    assert_eq!(code, 10, "AuthenticationSASL code must be 10");
+    body[4..]
+        .split(|&b| b == 0)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// TLS ハンドシェイク完走後に StartupMessage を送り、AuthenticationSASL の
+/// 機構リストを読むところまでを共通化する（SCRAM 交換本体はこのテストの
+/// 対象外。機構リストの内容だけが `--tls-scram-channel-binding` の効果を
+/// 判定する対象）。
+fn connect_tls_and_read_sasl_mechanisms(addr: std::net::SocketAddr) -> Vec<String> {
+    let mut socket = TcpStream::connect(addr).expect("connect");
+    write_ssl_request(&mut socket);
+    let resp = read_exact_n(&mut socket, 1);
+    assert_eq!(&resp, b"S", "TLS-enabled server must accept SSL with 'S'");
+
+    let client = tls_client::drive_client_handshake_over_socket(&mut socket);
+    let mut channel = tls_client::TlsTestChannel::new(client, socket);
+
+    write_startup_message(&mut channel, "alice", "irrelevant-db-name");
+    read_authentication_sasl_mechanisms(&mut channel)
+}
+
+#[test]
+fn tls_scram_channel_binding_enable_advertises_plus_mechanism() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-enable");
+    let (users_path, mock_key_path) = write_scram_user_store_and_mock_key(&fixture);
+    let (cert_path, key_path) = write_valid_tls_pair(&fixture);
+
+    let mut server = common::SpawnedServer::spawn(&[
+        "--users",
+        users_path.to_str().expect("utf-8 path"),
+        "--db",
+        &fixture.db_path_str(),
+        "--bind",
+        "127.0.0.1:0",
+        "--auth-method",
+        "scram-sha-256",
+        "--scram-mock-key-file",
+        mock_key_path.to_str().expect("utf-8 path"),
+        "--tls-cert",
+        cert_path.to_str().expect("utf-8 path"),
+        "--tls-key",
+        key_path.to_str().expect("utf-8 path"),
+        "--tls-scram-channel-binding",
+        "enable",
+    ]);
+    let addr = server
+        .wait_for_listening(Instant::now() + Duration::from_secs(10))
+        .expect("server must reach listening state");
+
+    let mechanisms = connect_tls_and_read_sasl_mechanisms(addr.parse().expect("valid addr"));
+    assert!(
+        mechanisms.contains(&wire_server::auth::scram::MECHANISM_NAME_PLUS.to_string()),
+        "expected SCRAM-SHA-256-PLUS to be advertised: {mechanisms:?}"
+    );
+
+    let lines = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("SCRAM-SHA-256-PLUS advertised")),
+        "expected an advisory line for --tls-scram-channel-binding enable: {lines:?}"
+    );
+    assert_no_secret_leak(&lines, &fixture);
+}
+
+#[test]
+fn tls_scram_channel_binding_unset_does_not_advertise_plus_mechanism() {
+    let fixture = TempFixtureDir::new("r8-scram-cb-default");
+    let (users_path, mock_key_path) = write_scram_user_store_and_mock_key(&fixture);
+    let (cert_path, key_path) = write_valid_tls_pair(&fixture);
+
+    let mut server = common::SpawnedServer::spawn(&[
+        "--users",
+        users_path.to_str().expect("utf-8 path"),
+        "--db",
+        &fixture.db_path_str(),
+        "--bind",
+        "127.0.0.1:0",
+        "--auth-method",
+        "scram-sha-256",
+        "--scram-mock-key-file",
+        mock_key_path.to_str().expect("utf-8 path"),
+        "--tls-cert",
+        cert_path.to_str().expect("utf-8 path"),
+        "--tls-key",
+        key_path.to_str().expect("utf-8 path"),
+    ]);
+    let addr = server
+        .wait_for_listening(Instant::now() + Duration::from_secs(10))
+        .expect("server must reach listening state");
+
+    let mechanisms = connect_tls_and_read_sasl_mechanisms(addr.parse().expect("valid addr"));
+    assert_eq!(
+        mechanisms,
+        vec![wire_server::auth::scram::MECHANISM_NAME.to_string()],
+        "expected only SCRAM-SHA-256 (no PLUS) with the default (disable): {mechanisms:?}"
+    );
+
+    let lines = server.stop_and_drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("SCRAM-SHA-256-PLUS advertised")),
+        "unexpected PLUS advisory line with the default (disable): {lines:?}"
     );
 }
