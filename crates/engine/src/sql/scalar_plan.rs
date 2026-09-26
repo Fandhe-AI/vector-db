@@ -512,6 +512,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
@@ -523,6 +524,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::PlainScan);
     }
@@ -545,6 +547,7 @@ mod tests {
             scalar_prefilter: true,
             metadata_filters: &filters,
             expr_filters: &[],
+            or_filters: &[],
         };
         assert_eq!(classify_scalar_plan(&input), ScalarPlan::IndexPrefix);
     }
