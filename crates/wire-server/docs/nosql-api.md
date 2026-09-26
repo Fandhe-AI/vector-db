@@ -644,7 +644,9 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 - 定数のみの `SELECT`
 - `ORDER BY` 形／集計／広域取得への `EXPLAIN` 前置（`USING PLAN` 付き検索
   `SELECT` への `EXPLAIN` のみ受理）
-- `LIKE` の前方一致（`prefix`）以外の一致方式
+- `LIKE` の前方一致（`prefix`）以外の一致方式（SQL 表層は Issue #914・SQL-24 で
+  中間一致・後方一致・`_` を受理するが、NoSQL `filter` 側は未対応のまま。
+  NoSQL 側の対応は NOSQL-14 の担当）
 - `INSERT` のファイル形（`path`／`body` 列指定の増分インデックス投入）
 - `GROUP BY` への `ORDER BY`／`LIMIT` の付与
 - `ALTER TABLE ... DROP COLUMN`（SQL 表層が未結線。`alter_table.drop_column` は `0A000`）
