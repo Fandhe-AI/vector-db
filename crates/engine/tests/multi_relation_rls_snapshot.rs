@@ -30,10 +30,19 @@ fn schema(name: &str) -> TableSchema {
     TableSchema::new(name, vec![ColumnDef::new("path", ColumnType::Text, false)])
 }
 
+/// `schema` と同じ単一 `TEXT NOT NULL` 列（`path`）に整合する metadata を
+/// `row_codec::encode_scalar_columns` で組み立てて挿入する（PR #1104 レビュー対応で
+/// `RelationSnapshot::build` が `validate_scalar_columns` を通すようになったため、
+/// 空 metadata は非 nullable 列を持つスキーマと整合しない）。
 fn seed(storage: &Storage, table: &str, id: u64, tenant: &str, visibility: Visibility) {
     let ctx = PolicyContext::new(tenant).expect("valid tenant");
     let op_id = OperationId::parse(&format!("multi-relation-rls-{table}-{tenant}-{id}"))
         .expect("valid operation_id");
+    let metadata = engine::row_codec::encode_scalar_columns(
+        &schema(table),
+        &[engine::row_codec::Value::Text(String::new())],
+    )
+    .expect("encode scalar columns");
     engine::tenant::insert_row(
         storage,
         table,
@@ -43,7 +52,7 @@ fn seed(storage: &Storage, table: &str, id: u64, tenant: &str, visibility: Visib
             tenant_id: tenant,
             visibility,
             embedding: &[],
-            metadata: &[],
+            metadata: &metadata,
         },
         &op_id,
     )

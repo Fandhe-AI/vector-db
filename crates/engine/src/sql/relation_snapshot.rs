@@ -13,7 +13,7 @@
 //! `VisibleSnapshotBuilder` とは異なり、複数テーブル対応の新規エントリ
 //! ポイントのため）。走査順序は [`crate::sql::aggregate`] の走査規律
 //! （ヘッダのみデコード → 可視性判定 → tenant 整合検査 → dim・metadata の
-//! 構造検証）と同一にする。
+//! 構造検証 → スカラー列の構造検証）と同一にする。
 
 use crate::catalog::{self, TableSchema};
 use crate::policy::PolicyContext;
@@ -63,7 +63,8 @@ impl RelationSnapshot {
     /// テーブル本体を走査し、可視行だけを記録した [`RelationSnapshot`] を構築する
     /// （`sql::aggregate` の走査規律と同じ順序: ヘッダデコード →
     /// `PolicyContext::is_visible` → `verify_row_key_tenant` →
-    /// `decode_row_dim_and_metadata_borrowed`）。行数上限
+    /// `decode_row_dim_and_metadata_borrowed` →
+    /// `row_codec::validate_scalar_columns`）。行数上限
     /// [`crate::arena::MAX_ARENA_ROWS`] を超過した場合はクエリ自体を
     /// `54000`（[`SqlSurfaceError::payload_too_large`]）で拒否する（キャッシュ
     /// 登録見送りではなく拒否側に倒す）。
@@ -104,7 +105,7 @@ impl RelationSnapshot {
 
                 // PR #369 の契約: `Fast` 相当のスナップショットであっても dim・
                 // metadata の構造検証（破損検知）は必ず通す。
-                let (dim, _metadata) =
+                let (dim, metadata) =
                     storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?;
                 if dim != 0 {
                     if let Some(expected) = table.vector_dim() {
@@ -115,6 +116,16 @@ impl RelationSnapshot {
                         }
                     }
                 }
+
+                // レビュー指摘対応（PR #1104 Cursor Bugbot Medium）: dim/metadata の
+                // 枠検証（`decode_row_dim_and_metadata_borrowed`）は presence・長さ・
+                // バッファ境界のみを見る。列単位のスカラーペイロード（`TEXT` の
+                // UTF-8 妥当性・宣言長上限等）はここでは未検証のままで、既存の
+                // `sql::aggregate` の `DecodeTier::Fast` 経路（PR #369）が必須の
+                // fail-closed 破損検知として課している検証と揃える必要がある。
+                // `crate::row_codec::validate_scalar_columns`（検証専用・`Vec`
+                // 確保なし）で同じ構造検証を通す。
+                crate::row_codec::validate_scalar_columns(table, metadata)?;
 
                 if visible_rows.len() >= crate::arena::MAX_ARENA_ROWS {
                     return Err(SqlSurfaceError::payload_too_large(
@@ -133,11 +144,30 @@ impl RelationSnapshot {
 }
 
 impl ApproxHeapBytes for RelationSnapshot {
+    /// `GenerationKeyedCache` の容量判定用の概算バイト量（レビュー指摘対応・
+    /// PR #1104 codex P2）。旧実装は各要素のテナント ID 文字数と `u64` の 8 byte
+    /// しか数えておらず、`String` 自体のスタック表現（ptr/len/cap、64bit で
+    /// `size_of::<String>() == 24`）・`Vec` 側の確保済み容量（`len()` ではなく
+    /// `capacity()`。amortized 成長で未使用の余剰容量を含む）を無視していた。
+    /// 短いテナント ID の行が大量にあると実使用量が `total_bytes_limit` を
+    /// 超えても保持され続けてしまう（`rls.rs::PrefilterSnapshot::approx_heap_bytes`
+    /// と同じ「`capacity()` 基準・保守的に上振れ」方針に揃える）。
+    ///
+    /// - `visible_rows` バッキング配列: `capacity() * size_of::<(String, u64)>()`
+    ///   （`(String, u64)` タプルのスタック部分。`String` の管理領域込み）
+    /// - 各テナント ID 文字列のヒープ確保量: `String::capacity()`
+    ///   （`len()` ではなく確保済みバイト数を使う。過小評価しない）
     fn approx_heap_bytes(&self) -> usize {
-        self.visible_rows
+        let vec_backing_bytes = self
+            .visible_rows
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, u64)>());
+        let string_heap_bytes = self
+            .visible_rows
             .iter()
-            .map(|(tenant, _)| tenant.len().saturating_add(std::mem::size_of::<u64>()))
-            .fold(0usize, |acc, n| acc.saturating_add(n))
+            .map(|(tenant, _)| tenant.capacity())
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        vec_backing_bytes.saturating_add(string_heap_bytes)
     }
 }
 
@@ -285,11 +315,21 @@ mod tests {
 
     /// テスト専用の行挿入ヘルパー（`sql::hnsw_hybrid` の `seed_row` と同じ流儀。
     /// `tenant::insert_row` が要求する `operation_id` はテストごとに一意な文字列で
-    /// 満たす）。
+    /// 満たす）。`table` は `create_table` と同じ単一 `TEXT NOT NULL` 列（`path`）
+    /// のスキーマを前提とし、`row_codec::encode_scalar_columns` でその列に整合する
+    /// metadata を組み立てる（PR #1104 レビュー対応で `RelationSnapshot::build` が
+    /// `validate_scalar_columns` を通すようになったため、空 metadata は非
+    /// nullable 列を持つスキーマと整合しない）。
     fn seed_row(storage: &Storage, table: &str, id: u64, tenant: &str, visibility: Visibility) {
         let c = PolicyContext::new(tenant).expect("valid tenant");
         let op_id = OperationId::parse(&format!("relation-snapshot-test-{tenant}-{table}-{id}"))
             .expect("valid operation_id");
+        let schema = TableSchema::new(table, vec![ColumnDef::new("path", ColumnType::Text, false)]);
+        let metadata = crate::row_codec::encode_scalar_columns(
+            &schema,
+            &[crate::row_codec::Value::Text(String::new())],
+        )
+        .expect("encode scalar columns");
         crate::tenant::insert_row(
             storage,
             table,
@@ -299,7 +339,7 @@ mod tests {
                 tenant_id: tenant,
                 visibility,
                 embedding: &[],
-                metadata: &[],
+                metadata: &metadata,
             },
             &op_id,
         )
@@ -471,6 +511,117 @@ mod tests {
         assert!(
             matches!(err, SqlSurfaceError::Internal { .. }),
             "expected Internal, got {err:?}"
+        );
+    }
+
+    /// `sql::aggregate` の `write_row_raw` と同じ流儀（`tenant::insert_row` の
+    /// 検証を経由せず行テーブルへ直接バイト列を書き込む。破損行を作る検証専用
+    /// ヘルパー）。
+    fn write_row_raw(storage: &Storage, table_name: &str, tenant_id: &str, id: u64, buf: &[u8]) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(catalog::user_rows_table_def(
+                    &catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            table.insert((tenant_id, id), buf).expect("insert row");
+        }
+        storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    /// レビュー指摘の回帰（PR #1104 Cursor Bugbot Medium）: `RelationSnapshot::build`
+    /// は dim・metadata の枠検証は通すが、列単位のスカラーペイロード検証
+    /// （`row_codec::validate_scalar_columns`）を経ていなかったため、枠は正しいが
+    /// `TEXT` 列に不正 UTF-8 を含む破損行が可視として記録され `resolve` が成功
+    /// してしまっていた。`sql::aggregate` の同種回帰テスト
+    /// （`count_star_still_fails_closed_on_corrupted_metadata_with_no_scalar_reference`）
+    /// と同じ破損手順（妥当な `Text` 値の末尾バイトを不正 UTF-8 の単独継続バイトへ
+    /// 書き換え）で固定する。
+    #[test]
+    fn build_fails_closed_on_row_with_corrupted_scalar_metadata() {
+        let path = unique_db_path("relation-snapshot-corrupt-metadata");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![crate::catalog::ColumnDef::new(
+                "body",
+                ColumnType::Text,
+                false,
+            )],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let mut metadata = crate::row_codec::encode_scalar_columns(
+            &schema,
+            &[crate::row_codec::Value::Text("hello".to_string())],
+        )
+        .expect("encode scalar columns");
+        // presence タグ・長さフィールドはそのまま、値バイト列の末尾のみ不正
+        // UTF-8（単独継続バイト）へ書き換える。
+        let corrupt_offset = metadata.len() - 1;
+        metadata[corrupt_offset] = 0x80;
+
+        let buf = storage::encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[],
+            metadata: &metadata,
+        })
+        .expect("encode row");
+        write_row_raw(&storage, "docs", "tenant-a", 1, &buf);
+
+        let ctx = ctx_with("tenant-a", vec![Visibility::Public]);
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let err = RelationSnapshot::build(&read_txn, &schema, &ctx, 0)
+            .err()
+            .expect("must fail closed on corrupted scalar metadata");
+        assert!(
+            matches!(err, SqlSurfaceError::Internal { .. }),
+            "expected Internal, got {err:?}"
+        );
+    }
+
+    /// レビュー指摘の回帰（PR #1104 codex P2）: `approx_heap_bytes` がテナント ID の
+    /// 文字数と `u64` の 8 byte しか数えず、`String`／`Vec` の管理領域・確保容量を
+    /// 無視していたため、短いテナント ID の行が大量にあると `GenerationKeyedCache`
+    /// の `total_bytes_limit` が実効しない問題を固定する。旧実装の見積り方式
+    /// （`len()` 基準）より必ず大きい値になり、かつ `(String, u64)` タプル 1 つ分の
+    /// サイズ以上という保守的な下限を満たすことを確認する。
+    #[test]
+    fn approx_heap_bytes_accounts_for_string_and_vec_capacity_overhead() {
+        let path = unique_db_path("relation-snapshot-heap-bytes");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = create_table(&storage, "a");
+        const ROW_COUNT: u64 = 50;
+        for id in 0..ROW_COUNT {
+            seed_row(&storage, "a", id, "t", Visibility::Public);
+        }
+        let ctx = ctx_with("t", vec![Visibility::Public]);
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let snapshot = RelationSnapshot::build(&read_txn, &schema, &ctx, 0).expect("build");
+        assert_eq!(snapshot.visible_rows().len(), ROW_COUNT as usize);
+
+        let naive_estimate: usize = snapshot
+            .visible_rows()
+            .iter()
+            .map(|(tenant, _)| tenant.len().saturating_add(std::mem::size_of::<u64>()))
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        let actual = snapshot.approx_heap_bytes();
+
+        assert!(
+            actual > naive_estimate,
+            "approx_heap_bytes must account for String/Vec management overhead \
+             (management overhead), not just raw tenant id byte lengths: \
+             naive={naive_estimate} actual={actual}"
+        );
+        // 保守的な下限: 少なくとも各行 1 つ分の `(String, u64)` タプルサイズは
+        // 計上されている。
+        assert!(
+            actual >= (ROW_COUNT as usize).saturating_mul(std::mem::size_of::<(String, u64)>()),
+            "approx_heap_bytes must be at least rows * size_of::<(String, u64)>(): actual={actual}"
         );
     }
 }
