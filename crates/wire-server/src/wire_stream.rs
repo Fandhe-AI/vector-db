@@ -56,7 +56,17 @@ pub trait WireStream: Read + Write {
     /// `None` を返す）。TLS 接続では [`crate::tls::server_handshake::
     /// TlsSession::tls_server_end_point`] へ委譲し、非対応の署名
     /// アルゴリズム・提示無効化設定の場合も `None` になる。
-    fn tls_server_end_point(&self) -> Option<&[u8]>;
+    ///
+    /// 既定実装は `None`（Issue #970 追加時点で下流の既存 `WireStream`
+    /// 実装を破壊しないための互換維持。codex-review PR #1087 P1 是正）。
+    /// `None` を返す実装は `auth::scram::authenticate_scram` の呼び出し元
+    /// （`handshake.rs`）が SCRAM-SHA-256-PLUS を機構リストへ提示せず、
+    /// クライアントが `gs2-cbind-flag` に `p=<cb-name>` を送っても
+    /// `negotiate_channel_binding` が拒否する（fail-closed。`tests/
+    /// wire_scram_plus_tls.rs`・`tests/wire_scram_auth.rs` で固定）。
+    fn tls_server_end_point(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 impl WireStream for TcpStream {

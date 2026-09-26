@@ -797,7 +797,11 @@ fn run_server(args: &[String]) -> ExitCode {
     let tls_config = match &tls_options {
         None => None,
         Some((cert, key, _mode, scram_channel_binding)) => {
-            match wire_server::tls_opt::load_server_config_arc(cert, key, *scram_channel_binding) {
+            match wire_server::tls_opt::load_server_config_arc_with_options(
+                cert,
+                key,
+                *scram_channel_binding,
+            ) {
                 Ok(cfg) => Some(cfg),
                 Err(e) => {
                     eprintln!("wire-server: failed to load TLS configuration: {e}");

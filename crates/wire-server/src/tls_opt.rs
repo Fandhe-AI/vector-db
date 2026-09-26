@@ -133,20 +133,30 @@ impl std::fmt::Display for TlsConfigLoadError {
 impl std::error::Error for TlsConfigLoadError {}
 
 /// `cert`（証明書チェーン PEM）・`key`（Ed25519 PKCS#8 秘密鍵 PEM）から
-/// [`TlsServerConfig`] を構築する（Issue #967）。`scram_channel_binding`
-/// は `--tls-scram-channel-binding`（Issue #970）の解決済み値をそのまま
-/// [`TlsServerConfig::with_scram_channel_binding`] へ渡す（既定 `false`）。
+/// [`TlsServerConfig`] を構築する（Issue #967）。`PLUS` 提示は既定 `false`
+/// （非提示）のまま構築する後方互換の薄いラッパーで、実体は
+/// [`load_server_config_with_options`] に委譲する（codex-review PR #1087
+/// P1 是正: 公開関数へ必須引数を追加すると既存呼び出し元を破壊するため、
+/// 2 引数のシグネチャ自体は変えない）。
 ///
 /// 手順（鍵を先に読むのは、葉証明書の公開鍵照合に公開鍵が要るため）:
 /// 1. `key` から Ed25519 seed を読み、署名鍵を導出する。
 /// 2. 現在時刻（エポック秒）を取得する。
 /// 3. `cert` を検証付きで読む（署名鍵の公開鍵との一致・有効期限を含む）。
-/// 4. `TlsServerConfig::new` で組み立て、`with_scram_channel_binding` で
-///    `PLUS` 提示可否を確定する（公開鍵の再照合は定数時間）。
+/// 4. `TlsServerConfig::new` で組み立てる（公開鍵の再照合は定数時間）。
 ///
 /// `Ed25519Seed`／`SigningKey` は複製せず、鍵のバイト列・長さをエラー
 /// メッセージへ出さない（`Ed25519Seed` の `Drop` ゼロ化を活かす）。
-pub fn load_server_config(
+pub fn load_server_config(cert: &Path, key: &Path) -> Result<TlsServerConfig, TlsConfigLoadError> {
+    load_server_config_with_options(cert, key, false)
+}
+
+/// [`load_server_config`] に `--tls-scram-channel-binding`（Issue #970）の
+/// 解決済み値を追加で渡せる入口。`main.rs` はこちらを呼ぶ
+/// （`handle_connection_with_options`・`accept_loop_with_tls_mode` 等、
+/// 既存関数を「オプション追加時は `_with_options` を新設し、元の関数は
+/// 既定値で委譲する後方互換ラッパーへ変える」流儀に合わせる）。
+pub fn load_server_config_with_options(
     cert: &Path,
     key: &Path,
     scram_channel_binding: bool,
@@ -165,13 +175,24 @@ pub fn load_server_config(
 }
 
 /// [`load_server_config`] の結果を `Arc` へ包むヘルパー（`server::
-/// accept_loop_with_tls_mode` が要求する型と一致させる）。
+/// accept_loop_with_tls_mode` が要求する型と一致させる）。既定 `false`
+/// のまま構築する後方互換ラッパー（実体は
+/// [`load_server_config_arc_with_options`]）。
 pub fn load_server_config_arc(
+    cert: &Path,
+    key: &Path,
+) -> Result<Arc<TlsServerConfig>, TlsConfigLoadError> {
+    load_server_config_arc_with_options(cert, key, false)
+}
+
+/// [`load_server_config_arc`] に `--tls-scram-channel-binding` の解決済み
+/// 値を追加で渡せる入口（`main.rs` が呼ぶ）。
+pub fn load_server_config_arc_with_options(
     cert: &Path,
     key: &Path,
     scram_channel_binding: bool,
 ) -> Result<Arc<TlsServerConfig>, TlsConfigLoadError> {
-    load_server_config(cert, key, scram_channel_binding).map(Arc::new)
+    load_server_config_with_options(cert, key, scram_channel_binding).map(Arc::new)
 }
 
 #[cfg(test)]
@@ -232,11 +253,26 @@ mod tests {
         // `TlsServerConfig`（`Ok` 側）は鍵・証明書を保持するため `Debug` を
         // 導出しない（内容を誤ってログへ出さないための設計判断）。
         // `expect_err` は `Ok` 側に `Debug` を要求するため使わず、`match` で
-        // 直接判定する。
+        // 直接判定する。2 引数版の呼び出しが壊れないことも兼ねて確認する
+        // （codex-review PR #1087 P1 是正: 破壊的シグネチャ変更の回帰確認）。
         match load_server_config(
             Path::new("/nonexistent/cert.pem"),
             Path::new("/nonexistent/key.pem"),
-            false,
+        ) {
+            Err(TlsConfigLoadError::Key(_)) => {}
+            Err(other) => panic!("expected Key error, got a different error: {other}"),
+            Ok(_) => panic!("missing files must fail"),
+        }
+    }
+
+    #[test]
+    fn load_server_config_with_options_reports_missing_key_file() {
+        // `_with_options` 入口も同じ失敗を返すことを確認する（薄いラッパー
+        // であることの回帰確認）。
+        match load_server_config_with_options(
+            Path::new("/nonexistent/cert.pem"),
+            Path::new("/nonexistent/key.pem"),
+            true,
         ) {
             Err(TlsConfigLoadError::Key(_)) => {}
             Err(other) => panic!("expected Key error, got a different error: {other}"),
