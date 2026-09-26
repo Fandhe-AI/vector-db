@@ -108,6 +108,24 @@ fn try_accumulate_state_budget(
     Ok(next)
 }
 
+/// `current` に `add` を加えた累計が `cap`（[`build_result`] へ渡された
+/// `max_result_bytes`）を超えないことを確保前に検証する（`sql::scan` の
+/// `try_accumulate_budget` と同方針。[`try_accumulate_state_budget`] とは対象の
+/// 予算が異なる別枠のため、混同を避けるため別関数にしている）。
+fn try_accumulate_window_result_budget(
+    current: usize,
+    add: usize,
+    cap: usize,
+) -> Result<usize, SqlSurfaceError> {
+    let next = current.saturating_add(add);
+    if next > cap {
+        return Err(SqlSurfaceError::payload_too_large(
+            "window scan result exceeds capacity",
+        ));
+    }
+    Ok(next)
+}
+
 /// 新規パーティション追加前に [`MAX_WINDOW_PARTITIONS`] 上限を検査する
 /// （受入基準 2）。`cap` を引数化しているのは、実データを大量投入せずに
 /// 上限判定ロジックそのものを単体テストできるようにするため（本体は常に
@@ -206,6 +224,8 @@ struct MaterializedRow {
 /// の dispatch から呼ばれる）。`max_result_bytes` は投影段（[`crate::sql::scan::
 /// execute_scan`] への委譲）の結果バイト予算（`sql::scan` と同じ契約）で、
 /// ウィンドウ状態の予算（[`MAX_WINDOW_STATE_BYTES`] 等）とは独立に計上する。
+/// 本体は常に [`MAX_WINDOW_STATE_BYTES`] を状態予算の上限として渡す
+/// （[`execute_window_scan_with_caps`] 参照）。
 pub(crate) fn execute_window_scan(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
@@ -213,13 +233,46 @@ pub(crate) fn execute_window_scan(
     bound: &BoundScan,
     max_result_bytes: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let materialized = materialize_rows(read_txn, ctx, schema, bound)?;
+    execute_window_scan_with_caps(
+        read_txn,
+        ctx,
+        schema,
+        bound,
+        max_result_bytes,
+        MAX_WINDOW_STATE_BYTES,
+    )
+}
+
+/// [`execute_window_scan`] の本体。`state_cap` を引数化しているのは、
+/// 評価段（[`evaluate_window_item`]）の確保も materialize 段と同じ予算で有界に
+/// なっていることを、実データを大量投入せず小さい cap で単体テストできるように
+/// するため（PR #930 レビュー指摘 3）。
+fn execute_window_scan_with_caps(
+    read_txn: &redb::ReadTransaction,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundScan,
+    max_result_bytes: usize,
+    state_cap: usize,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let (materialized, mut state_bytes) =
+        materialize_rows(read_txn, ctx, schema, bound, state_cap)?;
 
     // ウィンドウ項目ごとに独立してパーティション分割・安定ソート・peer 評価を行い、
-    // `id -> Cell` の写像を作る。
-    let mut window_values: Vec<HashMap<u64, Cell>> = Vec::with_capacity(bound.windows().len());
+    // `materialized` と同じ添字（走査順）で引ける `Vec<Cell>` を作る（他テナントの
+    // 可視 Public 行と衝突しうる `id` をキーにしない。security.md P0「テナント境界」
+    // レビュー指摘対応。§モジュールドキュメント参照）。評価段の確保
+    // （`partitions`・結果ベクタ）も materialize 段と同じ `state_bytes`／`state_cap`
+    // へ計上を続ける（レビュー指摘 3）。
+    let mut window_values: Vec<Vec<Cell>> = Vec::with_capacity(bound.windows().len());
     for (item_index, item) in bound.windows().iter().enumerate() {
-        window_values.push(evaluate_window_item(item, item_index, &materialized)?);
+        window_values.push(evaluate_window_item(
+            item,
+            item_index,
+            &materialized,
+            &mut state_bytes,
+            state_cap,
+        )?);
     }
 
     build_result(
@@ -227,6 +280,7 @@ pub(crate) fn execute_window_scan(
         ctx,
         schema,
         bound,
+        &materialized,
         &window_values,
         max_result_bytes,
     )
@@ -234,13 +288,19 @@ pub(crate) fn execute_window_scan(
 
 /// 対象テーブルを 1 回、`LIMIT` による早期終了なしで走査し、可視かつ `WHERE` を
 /// 満たす行**全体**について [`MaterializedRow`] を集める（§モジュールドキュメント
-/// 「materialize 段」参照）。
+/// 「materialize 段」参照）。`state_cap` は [`MAX_WINDOW_STATE_BYTES`] 相当の上限
+/// （本体は常にその定数を渡す。単体テストが小さい cap を注入できるよう引数化した。
+/// PR #930 レビュー指摘対応）。戻り値の `usize` は最終累計バイト数で、評価段
+/// （[`evaluate_window_item`]）が同じ予算を続けて計上できるよう呼び出し元へ返す
+/// （materialize 段だけでなく評価段の確保も同一の [`MAX_WINDOW_STATE_BYTES`]
+/// 予算で有界にする。レビュー指摘 3）。
 fn materialize_rows(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,
-) -> Result<Vec<MaterializedRow>, SqlSurfaceError> {
+    state_cap: usize,
+) -> Result<(Vec<MaterializedRow>, usize), SqlSurfaceError> {
     let expected_dim = schema.vector_dim();
     let (tier, scalar_mask) = decode_tier_for_window(schema, bound);
     let expr_filter_programs: Vec<ExprProgram> = bound
@@ -369,7 +429,7 @@ fn materialize_rows(
             state_bytes = try_accumulate_state_budget(
                 state_bytes,
                 std::mem::size_of::<MaterializedRow>(),
-                MAX_WINDOW_STATE_BYTES,
+                state_cap,
             )?;
 
             let mut partition_keys = Vec::with_capacity(bound.windows().len());
@@ -382,7 +442,7 @@ fn materialize_rows(
                     state_bytes = try_accumulate_state_budget(
                         state_bytes,
                         window_key_value_bytes(&value),
-                        MAX_WINDOW_STATE_BYTES,
+                        state_cap,
                     )?;
                     pkeys.push(value);
                 }
@@ -402,7 +462,7 @@ fn materialize_rows(
                     state_bytes = try_accumulate_state_budget(
                         state_bytes,
                         window_key_value_bytes(&value),
-                        MAX_WINDOW_STATE_BYTES,
+                        state_cap,
                     )?;
                     okeys.push(value);
                 }
@@ -414,7 +474,7 @@ fn materialize_rows(
                         state_bytes = try_accumulate_state_budget(
                             state_bytes,
                             window_input_value_bytes(&value),
-                            MAX_WINDOW_STATE_BYTES,
+                            state_cap,
                         )?;
                         value
                     }
@@ -439,7 +499,7 @@ fn materialize_rows(
         }
     }
 
-    Ok(materialized)
+    Ok((materialized, state_bytes))
 }
 
 /// [`decode_tier_for`](crate::sql::scan) と同じ意図（Issue #350）だが、ウィンドウ
@@ -729,6 +789,18 @@ fn window_input_value_bytes(value: &WindowInputValue) -> usize {
     }
 }
 
+/// 評価段（[`evaluate_partition`]）が peer グループごとに複製する [`Cell`] 1 つの
+/// 概算メモリコスト（[`MAX_WINDOW_STATE_BYTES`] 予算計上用。上記 2 関数と同方針）。
+/// `MIN`/`MAX(<TEXT 列>)` は `Cell::Text` を保持しうるため文字列長も計上する
+/// （`resolve_aggregate_input` が TEXT を `MIN`/`MAX` に受理する。レビュー指摘）。
+fn window_cell_state_bytes(cell: &Cell) -> usize {
+    let base = std::mem::size_of::<Cell>();
+    match cell {
+        Cell::Text(s) => base.saturating_add(s.len()),
+        _ => base,
+    }
+}
+
 /// パーティションキー（複数列）の同値判定用の正準バイト列を作る。NULL 同士は
 /// 常に同じタグ（`0`）にエンコードされるため、`GROUP BY` と同じ「NULL 同士は
 /// 同値」の規則を自然に満たす。ハッシュ照合専用の識別子であり、順序は保証しない
@@ -846,24 +918,66 @@ fn cmp_window_key_value(a: &WindowKeyValue, b: &WindowKeyValue) -> std::cmp::Ord
     }
 }
 
-/// ウィンドウ項目 1 つ（`bound.windows()[item_index]`）を評価し、`id -> Cell` の
-/// 写像を返す（SQL-30・TASK-214）。
+/// ウィンドウ項目 1 つ（`bound.windows()[item_index]`）を評価し、`materialized` と
+/// 同じ添字（走査順）で引ける `Vec<Cell>` を返す（SQL-30・TASK-214）。他テナントの
+/// 可視 Public 行と衝突しうる `id` をキーにした写像にしないのは、`materialize_rows`
+/// の物理走査順で行を一意に区別するため（レビュー指摘対応。`build_result` 側の
+/// コメント参照）。`state_bytes`／`state_cap` は materialize 段から引き継いだ
+/// [`MAX_WINDOW_STATE_BYTES`] 予算で、本関数が新たに確保する `partitions` マップ・
+/// 結果ベクタもここへ計上する（レビュー指摘 3）。
 fn evaluate_window_item(
     item: &BoundWindowItem,
     item_index: usize,
     materialized: &[MaterializedRow],
-) -> Result<HashMap<u64, Cell>, SqlSurfaceError> {
+    state_bytes: &mut usize,
+    state_cap: usize,
+) -> Result<Vec<Cell>, SqlSurfaceError> {
     let mut partitions: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
     for (row_idx, row) in materialized.iter().enumerate() {
         let bytes = partition_key_bytes(&row.partition_keys[item_index]);
+        // `partitions` の `Vec<u8>` キー・`Vec<usize>` 値本体（行ごとに 1
+        // `usize` を追加）の確保も他の materialize 段の確保と同じ予算で
+        // 有界にする（レビュー指摘 3。キー本体は同一パーティションの 2 行目
+        // 以降は再利用されるが、安全側に倒して行ごとに計上する）。
+        *state_bytes = try_accumulate_state_budget(
+            *state_bytes,
+            bytes.len().saturating_add(std::mem::size_of::<usize>()),
+            state_cap,
+        )?;
         partitions.entry(bytes).or_default().push(row_idx);
     }
 
-    let mut result = HashMap::with_capacity(materialized.len());
+    // 結果ベクタ本体の確保も同じ予算へ計上する（レビュー指摘 3）。
+    *state_bytes = try_accumulate_state_budget(
+        *state_bytes,
+        materialized
+            .len()
+            .saturating_mul(std::mem::size_of::<Option<Cell>>()),
+        state_cap,
+    )?;
+    let mut result: Vec<Option<Cell>> = vec![None; materialized.len()];
     for indices in partitions.into_values() {
-        evaluate_partition(item, item_index, materialized, indices, &mut result)?;
+        evaluate_partition(
+            item,
+            item_index,
+            materialized,
+            indices,
+            &mut result,
+            state_bytes,
+            state_cap,
+        )?;
     }
-    Ok(result)
+    result
+        .into_iter()
+        .enumerate()
+        .map(|(row_idx, cell)| {
+            cell.ok_or_else(|| {
+                window_bug(&format!(
+                    "evaluate_partition left row index {row_idx} without a computed value"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// 1 パーティション分のウィンドウ値を計算する（安定ソート → peer 分割 →
@@ -873,7 +987,9 @@ fn evaluate_partition(
     item_index: usize,
     materialized: &[MaterializedRow],
     mut indices: Vec<usize>,
-    out: &mut HashMap<u64, Cell>,
+    out: &mut [Option<Cell>],
+    state_bytes: &mut usize,
+    state_cap: usize,
 ) -> Result<(), SqlSurfaceError> {
     // 安定ソート。比較順は ORDER BY キー → `id` 昇順 → `seq` 昇順（走査順の
     // タイブレーク。`sort_by`〔安定〕のみを使い `sort_unstable*` は使わない
@@ -973,7 +1089,19 @@ fn evaluate_partition(
                     window_bug("aggregate window function is missing its finished cell")
                 })?,
             };
-            out.insert(materialized[row_idx].id, cell);
+            // `MIN`/`MAX(<TEXT 列>)` は複製した `String` を保持しうるため
+            // （`resolve_aggregate_input` は TEXT を MIN/MAX に受理する）、行ごとの
+            // 複製値も materialize 段と同じ状態予算へ計上する（レビュー指摘:
+            // 評価段の確保が `MAX_WINDOW_STATE_BYTES` から漏れていた）。
+            *state_bytes = try_accumulate_state_budget(
+                *state_bytes,
+                window_cell_state_bytes(&cell),
+                state_cap,
+            )?;
+            let slot = out.get_mut(row_idx).ok_or_else(|| {
+                window_bug("evaluate_partition row index out of range for the result slice")
+            })?;
+            *slot = Some(cell);
         }
 
         rank = peer_end;
@@ -1130,14 +1258,64 @@ fn observe_window_row(
 /// `OFFSET` は `windows` を空にした複製を [`crate::sql::scan::execute_scan`] へ
 /// 渡すことで既存の実行器をそのまま再利用し、その結果へウィンドウ列を
 /// [`crate::sql::parser::BoundWindowItem::position`] に基づいて差し込む。
+///
+/// `materialized`／`window_values` はどちらも同じ添字（`materialize_rows` の
+/// 物理走査順）で対応する。`base_result`（`execute_scan_with_budget` への委譲）は
+/// 同じ `read_txn`・同じ `WHERE`／可視性条件を独立に走査するため、物理走査順は
+/// `materialized` と一致する（`OFFSET` も「可視かつ `WHERE` 一致の行を物理順で
+/// 数える」点で同一の意味論。`sql::scan` の該当コメント参照）。この不変条件を前提に
+/// `bound.offset()` から始まる添字で `base_result` の n 番目の出力行を
+/// `materialized[offset + n]` と対応付ける。他テナントの可視 `Public` 行と
+/// 衝突しうる `id` を対応付けキーに使わない（P1 レビュー指摘対応。以前は
+/// `id -> Cell` の `HashMap` で対応付けており、異なるテナントの可視行が同じ
+/// `id` を持つと後勝ちで値が上書きされ、順位・集計値が誤った行に付く欠陥が
+/// あった）。`id` の一致は defense-in-depth として引き続き検証する。
 fn build_result(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundScan,
-    window_values: &[HashMap<u64, Cell>],
+    materialized: &[MaterializedRow],
+    window_values: &[Vec<Cell>],
     max_result_bytes: usize,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    let offset = bound.offset();
+    let limit = bound.limit();
+    let output_end = materialized.len().min(offset.saturating_add(limit));
+
+    // レビュー指摘対応: `execute_scan_with_budget`（`base_result`）の
+    // `max_result_bytes` はウィンドウ以外の投影列のみを計上し、後から差し込む
+    // ウィンドウ列の `Cell` 構造体・可変長データ（`MIN`/`MAX(<TEXT 列>)` の
+    // `Cell::Text`）を計上しないため、その分だけ結果サイズ上限を超えられて
+    // しまっていた。出力候補行数（`offset..output_end`）に対して発生しうる
+    // ウィンドウ列のバイト数を先に見積り、同じ `max_result_bytes` 予算から
+    // 差し引いた残りを `base_result` へ渡すことで、投影列とウィンドウ列を
+    // 合わせた合計が常に `max_result_bytes` 以内になるようにする。
+    let mut window_bytes: usize = 0;
+    if offset < output_end {
+        let row_count = output_end - offset;
+        let per_row_struct_bytes = window_values
+            .len()
+            .saturating_mul(std::mem::size_of::<Cell>());
+        window_bytes = try_accumulate_window_result_budget(
+            window_bytes,
+            per_row_struct_bytes.saturating_mul(row_count),
+            max_result_bytes,
+        )?;
+        for cells in window_values {
+            for cell in cells.get(offset..output_end).unwrap_or(&[]) {
+                if let Cell::Text(s) = cell {
+                    window_bytes = try_accumulate_window_result_budget(
+                        window_bytes,
+                        s.len(),
+                        max_result_bytes,
+                    )?;
+                }
+            }
+        }
+    }
+    let remaining_result_bytes = max_result_bytes.saturating_sub(window_bytes);
+
     let mut base_bound = bound.clone();
     base_bound.windows = Vec::new();
     let base_result = crate::sql::scan::execute_scan_with_budget(
@@ -1145,7 +1323,7 @@ fn build_result(
         ctx,
         schema,
         &base_bound,
-        max_result_bytes,
+        remaining_result_bytes,
     )?;
 
     let plain_len = base_result.columns.len();
@@ -1200,23 +1378,34 @@ fn build_result(
         .collect::<Result<_, _>>()?;
 
     let mut rows = Vec::with_capacity(base_result.rows.len());
+    // `materialized`／`window_values` の対応する行への添字（`offset` から開始し、
+    // 出力行 1 件ごとに 1 つ進める。§関数ドキュメントの物理走査順の不変条件参照）。
+    let mut materialized_idx = offset;
     for base_row in base_result.rows {
+        let mat_row = materialized.get(materialized_idx).ok_or_else(|| {
+            window_bug("window scan row correlation index exceeded materialized rows")
+        })?;
+        // defense-in-depth: 対応付けは添字（物理走査順）で行うが、`materialize_rows`
+        // と `execute_scan_with_budget` は独立実装であるため、将来のドリフトで
+        // 行集合が食い違った場合に静かに誤った行へウィンドウ値を付けてしまわない
+        // よう `id` の一致も確認する（他テナントの可視 `Public` 行と衝突しうる
+        // `id` 自体を対応付けキーにはしない。P1 レビュー指摘対応）。
+        if mat_row.id != base_row.id {
+            return Err(window_bug(
+                "window scan row correlation id mismatch between materialize and base scan",
+            ));
+        }
         let mut cells: Vec<Cell> = Vec::with_capacity(total_len);
         let mut plain_iter = base_row.cells.into_iter();
         for pos in 0..total_len {
             if let Some(item_index) = bound.windows().iter().position(|w| w.position == pos) {
-                // `materialize_rows` の走査と `execute_scan_with_budget`（`base_result`）の
-                // 走査は独立実装であり、本来は同一の行集合に一致するはずの不変条件を持つ
-                // （テストで一致を確認済み）。将来のドリフトで行 id が食い違った場合に
-                // 静かに NULL を返すと不正確な結果を返してしまうため、この不一致は
-                // untrusted 入力起因ではない実装バグとして fail-closed にする。
                 let cell = window_values
                     .get(item_index)
                     .ok_or_else(|| window_bug("window item index out of range in build_result"))?
-                    .get(&base_row.id)
+                    .get(materialized_idx)
                     .cloned()
                     .ok_or_else(|| {
-                        window_bug("window_values missing entry for a base scan row id")
+                        window_bug("window_values missing entry for a materialized row index")
                     })?;
                 cells.push(cell);
             } else {
@@ -1235,6 +1424,9 @@ fn build_result(
             score: base_row.score,
             cells,
         });
+        materialized_idx = materialized_idx.checked_add(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("window scan row correlation index overflowed")
+        })?;
     }
 
     Ok(QueryResult { columns, rows })
