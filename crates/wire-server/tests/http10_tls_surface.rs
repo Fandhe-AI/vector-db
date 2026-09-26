@@ -30,6 +30,9 @@
 //!   無応答クローズしていた回帰の再発防止）
 //! - TLS-6: `--tls-mode require` 下で同時接続数上限を超過した接続は
 //!   （平文であっても）要求を解釈されずに応答なしで閉じられること（H4）
+//! - TLS-7: TLS レコード 1 個分の暗号文を 1 バイトずつ送り続けても、要求
+//!   読み取りの絶対期限が本番値の近傍で効くこと（`http::deadline_stream`
+//!   の D-E 対応の回帰）
 
 #[path = "http_common/mod.rs"]
 mod http_common;
@@ -74,6 +77,24 @@ fn spawn_router_listener_tls_with_limiter(
     mode: TlsMode,
     limiter: ConnectionLimiter,
 ) -> std::net::SocketAddr {
+    spawn_router_listener_tls_with_limiter_and_read_timeout(
+        users_path,
+        mode,
+        limiter,
+        wire_server::limits::READ_TIMEOUT,
+    )
+}
+
+/// [`spawn_router_listener_tls_with_limiter`] の、要求読み取りの絶対期限
+/// （`read_timeout`）も呼び出し元が指定できる版。TLS-7（トリクル送信下でも
+/// 絶対期限が本番の 30 秒より大幅に延びないことの回帰確認。`http::
+/// deadline_stream` の D-E 対応）を現実的な時間で検証するために使う。
+fn spawn_router_listener_tls_with_limiter_and_read_timeout(
+    users_path: &std::path::Path,
+    mode: TlsMode,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+) -> std::net::SocketAddr {
     let store = wire_server::auth::UserStore::load_from_file(users_path).expect("valid store");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
@@ -87,7 +108,7 @@ fn spawn_router_listener_tls_with_limiter(
         wire_server::http::listener::accept_loop_with_router_tls(
             listener,
             limiter,
-            wire_server::limits::READ_TIMEOUT,
+            read_timeout,
             router,
             tls_config,
             mode,
@@ -591,6 +612,116 @@ fn require_mode_closes_over_capacity_connection_without_response() {
             panic!("expected no HTTP response over capacity when tls-mode=require, got {other:?}")
         }
     }
+
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// TLS-7: TLS レコード 1 個分の暗号文を 1 バイトずつ小さな間隔で送り続けて
+/// も、要求読み取りの絶対期限（Slowloris 対策）が本番の値の近傍で正しく
+/// 効くこと（`http::deadline_stream::DeadlineStream` の D-E 対応の回帰。
+/// 単体テスト `http::deadline_stream::tests::
+/// repeated_reads_are_bounded_by_absolute_deadline_despite_trickle` の
+/// TLS 実プロトコル版）。`DeadlineStream` が無ければ
+/// `TlsStream::fill_from_inner` の内部ループが `read_timeout` を使い回すため、
+/// 接続は絶対期限を大きく超えて（トリクル間隔 × レコードバイト数）保持
+/// されてしまう。
+#[test]
+fn tls_trickle_within_one_record_is_bounded_by_absolute_read_deadline() {
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "wire-server-http10-tls-r7-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&fixture_dir).expect("create fixture dir");
+    let users_path = fixture_dir.join("users.txt");
+    write_user_store_with_alice(&users_path);
+
+    let read_deadline = Duration::from_millis(150);
+    let addr = spawn_router_listener_tls_with_limiter_and_read_timeout(
+        &users_path,
+        TlsMode::Allow,
+        ConnectionLimiter::new(wire_server::limits::MAX_CONNECTIONS),
+        read_deadline,
+    );
+
+    let mut socket = TcpStream::connect(addr).expect("connect");
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("set write timeout");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut client = tls_client::drive_client_handshake_over_socket(&mut socket);
+
+    // request-line 相当のアプリケーションデータを 1 個の TLS レコードへ
+    // 封をした生バイト列を組み立てる（`tls_client::send_application_data`
+    // は `write_all` で一括送出するため使わず、ここでは意図的に 1 バイトずつ
+    // 送る）。中身は正規のリクエストである必要はない（サーバーはヘッダを
+    // 読み切る前に期限切れで閉じるはずなので、パース結果は検証しない）。
+    let payload = b"POST /v1/session HTTP/1.1\r\n";
+    let records = client
+        .sealer
+        .seal_fragmented(
+            wire_server::tls::record::ContentType::ApplicationData,
+            payload,
+        )
+        .expect("valid seal");
+    let mut wire_bytes = Vec::new();
+    for record in &records {
+        record
+            .serialize_into(
+                &mut wire_bytes,
+                wire_server::tls::record::RecordKind::Ciphertext,
+            )
+            .expect("serialize application data record");
+    }
+
+    let started = std::time::Instant::now();
+    let sender = std::thread::spawn(move || {
+        for byte in wire_bytes {
+            if socket.write_all(&[byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        // 送信し切った後も socket の生死判定は呼び出し元に委ねる（サーバーが
+        // 途中で閉じていれば `write_all` は途中で失敗するため無視する）。
+        socket
+    });
+
+    // サーバー側が期限切れで接続を閉じたことは、最終的に read が `Ok(0)`
+    // （TCP FIN）または接続エラーになることで確認する。`CloseSilently`
+    // 経路は `graceful_close`（TLS では `close_notify` 送出。H7）を経て
+    // から `shutdown_both` するため、閉じる直前に `close_notify` アラート
+    // レコードの生バイト列が 1 回分届きうる（本テストは復号しない生読み
+    // のため、これも「まだデータが届いた」に見える）。したがって単発の
+    // `read` では判定せず、`Ok(0)`／エラーに到達するまで読み進める。
+    let mut probe_socket = sender.join().expect("sender thread");
+    let mut buf = [0u8; 16];
+    let closed = loop {
+        match probe_socket.read(&mut buf) {
+            Ok(0) => break true,
+            Ok(_) => continue,
+            Err(_) => break true,
+        }
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        closed,
+        "connection should be closed once the absolute read deadline is exceeded"
+    );
+    // トリクル間隔（60ms）× レコードのバイト数（約 49 バイト）では
+    // 3 秒近くになるが、`DeadlineStream` があれば絶対期限（150ms）+
+    // 十分な許容誤差以内で閉じられているはず。`DeadlineStream` が無い
+    // 回帰では、レコード全体を送り切るまで（3 秒近く）閉じられない。
+    assert!(
+        elapsed < read_deadline + Duration::from_secs(1),
+        "absolute read deadline was not enforced over TLS trickle: elapsed={elapsed:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }

@@ -52,6 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::conn::{self, RequestHandler};
+use crate::http::deadline_stream::DeadlineStream;
 use crate::tls::server_handshake::TlsServerConfig;
 use crate::tls::stream::TlsStream;
 use crate::tls_opt::TlsMode;
@@ -243,7 +244,14 @@ fn serve_tls_connection<H: RequestHandler>(
         return;
     }
 
-    let tls_stream = TlsStream::new(stream, session);
+    // `DeadlineStream` で包んでから `TlsStream` に渡す（D-E）。TlsStream の
+    // 内部レコード読み取りループ（`fill_from_inner`）が `inner.read` を
+    // 複数回呼んでも、各呼び出しの直前に絶対期限までの残り時間を下位
+    // ソケットへ再設定するため、`conn::handle_connection_with` 側が 1 回の
+    // `read` 呼び出し前にしか `set_read_timeout` を呼ばなくても Slowloris
+    // 対策の絶対期限が正しく効く（`crate::http::deadline_stream` モジュール
+    // doc 参照）。
+    let tls_stream = TlsStream::new(DeadlineStream::new(stream), session);
     conn::handle_connection_with(tls_stream, handler, read_timeout);
 }
 
