@@ -561,14 +561,7 @@ struct CompiledCheck {
 
 enum CompiledConjunct {
     Declarative(MetadataFilter),
-    /// `references_embedding` は束縛済み [`BoundExpr`]（`udf_call::
-    /// references_embedding`）から前計算した結果。`ExprProgram` はコンパイル後
-    /// 平坦化されたステップ列のみを保持し元の `BoundExpr` 木を持たないため、
-    /// コンパイル時に判定して一緒に保持する。
-    Expr {
-        references_embedding: bool,
-        program: ExprProgram,
-    },
+    Expr { program: ExprProgram },
 }
 
 impl CompiledChecks {
@@ -623,7 +616,6 @@ impl CompiledChecks {
             }
             for expr in &expr_filters {
                 conjuncts.push(CompiledConjunct::Expr {
-                    references_embedding: udf_call::references_embedding(expr),
                     program: ExprProgram::compile(expr),
                 });
             }
@@ -666,7 +658,6 @@ impl CompiledChecks {
                 .map_err(|e| {
                     TenantWriteError::Catalog(crate::catalog::CatalogError::Invalid(e.to_string()))
                 })?;
-        let dim = embedding.len();
         let mut expr_scratch: Vec<StackValue> = Vec::new();
         for check in &self.checks {
             for conjunct in &check.conjuncts {
@@ -678,33 +669,29 @@ impl CompiledChecks {
                             Some(value) => filter.matches(Some(value)),
                         }
                     }
-                    CompiledConjunct::Expr {
-                        references_embedding,
-                        program,
-                    } => {
-                        // `sql/scan.rs` の WHERE 式評価と同じ判断: embedding を
-                        // 参照する式は `VECTOR` 列が NULL（`dim == 0`）の行では
-                        // 評価せず UNKNOWN として扱う。現状の CHECK 式は `id`／
-                        // `VECTOR` 列のみ参照可能（レーン A 未実装）ため、
-                        // embedding を参照しない式は常に有効な値を持つ。
-                        if *references_embedding && dim == 0 {
-                            true
-                        } else {
-                            match program.eval(id, embedding, &mut expr_scratch) {
-                                Ok(ExprValue::Bool(b)) => b,
-                                // UNKNOWN（NULL）は充足扱いにする（対象ビヘイビア:
-                                // SQL-26。Issue #921。PostgreSQL 互換。上の
-                                // `Declarative` 腕「参照列 NULL は違反にしない」と
-                                // 同じ意図的判断——NULL を返す式を書けるのは DDL
-                                // 権限を持つ主体のみのため制約の迂回にはならない）。
-                                Ok(ExprValue::Null) => true,
-                                Ok(_) => {
-                                    // 束縛段（`bind_where_predicates`）が式述語の
-                                    // 型を Bool に限定済みのため到達しない。
-                                    return Err(TenantWriteError::CheckEvaluationFailed);
-                                }
-                                Err(_) => return Err(TenantWriteError::CheckEvaluationFailed),
+                    CompiledConjunct::Expr { program } => {
+                        // `VECTOR` 列が NULL（`dim == 0`）の行を式が実際に参照する
+                        // 場合の NULL（UNKNOWN）伝播は `program.eval` 自身
+                        // （`ExprStep::PushVector` の空スライス判定。
+                        // `sql::expr_program` 参照）が行う（codex-review P1 指摘
+                        // 対応: 静的な式木走査（`references_embedding`）による
+                        // 事前判定は `CASE` の選ばれない分岐に embedding 参照が
+                        // あるだけの行まで誤って UNKNOWN 扱いにしていたため撤去
+                        // し、評価時点の判定へ一本化した）。
+                        match program.eval(id, embedding, &mut expr_scratch) {
+                            Ok(ExprValue::Bool(b)) => b,
+                            // UNKNOWN（NULL）は充足扱いにする（対象ビヘイビア:
+                            // SQL-26。Issue #921。PostgreSQL 互換。上の
+                            // `Declarative` 腕「参照列 NULL は違反にしない」と
+                            // 同じ意図的判断——NULL を返す式を書けるのは DDL
+                            // 権限を持つ主体のみのため制約の迂回にはならない）。
+                            Ok(ExprValue::Null) => true,
+                            Ok(_) => {
+                                // 束縛段（`bind_where_predicates`）が式述語の
+                                // 型を Bool に限定済みのため到達しない。
+                                return Err(TenantWriteError::CheckEvaluationFailed);
                             }
+                            Err(_) => return Err(TenantWriteError::CheckEvaluationFailed),
                         }
                     }
                 };

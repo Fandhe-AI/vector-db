@@ -59,12 +59,15 @@ pub(crate) enum ExprStep {
     /// 行 `id` を [`id_as_finite_scalar`] 経由でスカラー値として push する。
     PushId,
     /// テーブルの `VECTOR` 列（行の `embedding`）への参照を push する。
-    /// スタック格納値は [`StackValue::VectorRef`]（マーカーのみ。借用そのものは
-    /// 保持しない）で、実際の `Cow::Borrowed(embedding)` は `ExprProgram::eval`
-    /// が当該ステップを消費する時点で `embedding` 引数から都度組み立てる
-    /// （`sql::udf_call::eval` の `BoundExpr::VectorRef` 分岐（Issue #352）と
-    /// 同じ契約——`vec_norm(embedding)` 等の読み取り専用式では確保・複製が
-    /// 一切発生しない）。PR #373 codex-review 指摘対応: 当初は
+    /// `embedding` が空スライス（`VECTOR` 列が NULL。`dim == 0`）の行では
+    /// [`StackValue::Null`] を push し、それ以外では [`StackValue::VectorRef`]
+    /// （マーカーのみ。借用そのものは保持しない）を push する（codex-review P1
+    /// 指摘対応・Issue #921。`sql::udf_call::eval` の `BoundExpr::VectorRef`
+    /// 分岐と同じ判定）。`StackValue::VectorRef` の場合、実際の
+    /// `Cow::Borrowed(embedding)` は `ExprProgram::eval` が当該ステップを消費
+    /// する時点で `embedding` 引数から都度組み立てる（Issue #352 と同じ契約
+    /// ——`vec_norm(embedding)` 等の読み取り専用式では確保・複製が一切発生
+    /// しない）。PR #373 codex-review 指摘対応: 当初は
     /// `Vec<ExprValue<'a>>` をスタックに使い `embedding` と同一ライフタイム `'a`
     /// で行ループの外から使い回そうとしたが、行フックの呼び出し境界ごとに
     /// `'a` が変わる（`sql::exec::on_visible_row` のようにクロージャで
@@ -506,8 +509,22 @@ impl ExprProgram {
                     // マーカーのみを push する（Issue #352 の「借用のみで確保・
                     // 複製なし」契約は、このマーカーを `stack_to_expr_value` で
                     // 消費する際に `Cow::Borrowed(embedding)` として復元する
-                    // ことで維持する）。
-                    scratch.push(StackValue::VectorRef);
+                    // ことで維持する）。`embedding` が空スライスの行は `VECTOR`
+                    // 列が NULL（`dim == 0`。呼び出し元は非 NULL なら実データ・
+                    // NULL なら空スライスで揃えて渡す契約）であるため、この時点で
+                    // `StackValue::Null` を push し NULL として評価する
+                    // （`sql::udf_call::eval` の `BoundExpr::VectorRef` 分岐と同じ
+                    // 判定。codex-review P1 指摘対応: `Case`／`Coalesce` は
+                    // ジャンプ命令で選ばれない分岐のステップを実行しないため、
+                    // 実際に選択された枝が `PushVector` を含む場合にのみ NULL が
+                    // 伝播する。呼び出し元の事前 `references_embedding && dim ==
+                    // 0` ゲートは静的な式木走査で選択されない分岐まで拾って
+                    // しまうため撤去し、この評価時点の判定へ一本化した）。
+                    scratch.push(if embedding.is_empty() {
+                        StackValue::Null
+                    } else {
+                        StackValue::VectorRef
+                    });
                     pc += 1;
                 }
                 ExprStep::Pop => {

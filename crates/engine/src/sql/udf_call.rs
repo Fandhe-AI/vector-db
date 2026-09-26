@@ -381,13 +381,16 @@ pub(crate) const MAX_BUILTIN_ARITY: usize = 2;
 /// あった。Cursor Bugbot 指摘対応・PR #229）。
 fn is_reserved_function_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    // `COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は式文法の
-    // 専用ノード（`Expr::Coalesce`／`Expr::NullIf`）として解析されるため、
-    // 同名の UDF を許すと呼び出し不能な定義が登録できてしまう
-    // （`is_reserved_function_name` docs の既存 `min`/`集計` と同じ理由）。
+    // `CASE`／`COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は式文法の
+    // 専用ノード（`Expr::Case`／`Expr::Coalesce`／`Expr::NullIf`）として解析される
+    // ため、同名の UDF を許すと呼び出し不能な定義が登録できてしまう（`CASE` は
+    // `parse_primary_expr` が `'('` の有無を見ず常に文脈的キーワードとして
+    // 消費するため、`case(...)` という呼び出し形は `WHEN` を期待する CASE
+    // 構文解析へ吸われて `42601` になる。`is_reserved_function_name` docs の
+    // 既存 `min`/`集計` と同じ理由。Bugbot 指摘対応）。
     matches!(
         upper.as_str(),
-        "VISIBLE" | "HYBRID_RRF" | "HYBRID" | "COALESCE" | "NULLIF"
+        "VISIBLE" | "HYBRID_RRF" | "HYBRID" | "CASE" | "COALESCE" | "NULLIF"
     ) || builtin_from_name(name).is_some()
         || crate::sql::allowlist::is_aggregate_function_name(name)
 }
@@ -1374,7 +1377,24 @@ pub fn eval<'a>(
             // fail-closed な確保を行う（下記 `eval_builtin`・`apply_vector_scalar_op`
             // 参照）。呼び出し元が所有データを要する場合は [`into_owned_vector`] で
             // 変換する（確保は投影段など必要な箇所のみへ限定される）。
-            Ok(ExprValue::Vector(Cow::Borrowed(embedding)))
+            //
+            // `embedding` が空スライスの行は `VECTOR` 列が NULL（`dim == 0`。
+            // 呼び出し元は常に「非 NULL なら実データ・NULL なら空スライス」で
+            // 揃えて渡す契約。`sql::scan`・`sql::where_tree`・
+            // `sql::check_constraint`・`sql::exec` 参照）であるため、ここで NULL
+            // として評価する。`CASE`／`COALESCE` は選ばれない分岐を評価しない
+            // （このモジュールの `Case`／`Coalesce` 分岐が短絡する）ため、
+            // 実際に選択された枝が `VectorRef` を含む場合にのみ NULL が伝播する
+            // （codex-review P1 指摘対応: 未選択分岐に embedding 参照があるだけで
+            // 行全体を NULL 扱いにしていた旧実装の修正。呼び出し元の事前
+            // `references_embedding && dim == 0` ゲートは静的な式木走査で
+            // 選択されない分岐まで拾ってしまうため撤去し、この評価時点の判定へ
+            // 一本化した）。
+            if embedding.is_empty() {
+                Ok(ExprValue::Null)
+            } else {
+                Ok(ExprValue::Vector(Cow::Borrowed(embedding)))
+            }
         }
         BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding),
         BoundExpr::Binary { op, lhs, rhs } => {
@@ -2500,6 +2520,19 @@ mod tests {
     }
 
     #[test]
+    fn defining_a_function_named_case_is_rejected() {
+        // Bugbot 指摘の回帰テスト（Issue #921）: `CASE` は `parse_primary_expr`
+        // が `'('` の有無を見ず常に文脈的キーワードとして消費するため、同名の
+        // UDF を許すと `case(...)` という呼び出しが構文解析段で CASE 式に
+        // 吸われ、定義した UDF を呼び出す手段が無くなってしまう。`COALESCE`／
+        // `NULLIF` と同じ理由で定義時に拒否する。
+        let mut registry = UdfRegistry::default();
+        let err =
+            define_function(&mut registry, "case", &["x".to_string()], &ident("x")).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
     fn case_nesting_beyond_limit_is_rejected_at_bind_time() {
         // 束縛段のネスト上限（`MAX_CASE_NESTING`）を、構文段を経由せず直接
         // ネストした `Expr::Coalesce` を組み立てて検査する。
@@ -2560,5 +2593,60 @@ mod tests {
         let (bound, _) =
             bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
         assert!(references_embedding(&bound));
+    }
+
+    #[test]
+    fn vector_ref_evaluates_to_null_when_embedding_is_empty() {
+        // codex-review P1 指摘の回帰テスト（Issue #921）: `embedding` が空スライス
+        // （`VECTOR` 列が NULL。呼び出し元は非 NULL なら実データ・NULL なら空
+        // スライスで揃えて渡す契約）の行では `VectorRef` 自体が NULL として
+        // 評価される。`vec_norm(embedding)` のような builtin もこの NULL を
+        // strict 関数契約（`apply_builtin`）でそのまま伝播する。
+        assert_eq!(
+            eval(&BoundExpr::VectorRef, 1, &[]).unwrap(),
+            ExprValue::Null
+        );
+        let vec_norm_expr = BoundExpr::Builtin {
+            f: BuiltinFn::VecNorm,
+            args: vec![BoundExpr::VectorRef],
+        };
+        assert_eq!(eval(&vec_norm_expr, 1, &[]).unwrap(), ExprValue::Null);
+    }
+
+    #[test]
+    fn case_selected_branch_without_embedding_reference_ignores_empty_embedding() {
+        // codex-review P1 指摘の回帰テスト（Issue #921）: `references_embedding`
+        // は式木全体を静的に走査するため、`CASE` の選ばれない分岐にだけ
+        // embedding 参照があるだけの式を「embedding を参照する式」と誤判定し、
+        // 旧実装はこの誤判定に基づき `dim == 0`（`embedding` が空スライス）の
+        // 行を無条件に NULL 扱いしていた。実際に選択される分岐（`THEN` 側）が
+        // embedding を一切参照しない場合は、`embedding` が空スライスでも
+        // 選ばれた分岐の値がそのまま返る必要がある（`Case` の短絡評価契約。
+        // 本モジュールの `eval` の `Case` 分岐参照）。
+        let expr = bound_case_expr(
+            vec![(
+                BoundExpr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(BoundExpr::IdRef),
+                    rhs: Box::new(BoundExpr::Number(2.0)),
+                },
+                BoundExpr::Number(1.0),
+            )],
+            BoundExpr::Builtin {
+                f: BuiltinFn::VecNorm,
+                args: vec![BoundExpr::VectorRef],
+            },
+        );
+        assert_eq!(eval(&expr, 2, &[]).unwrap(), ExprValue::Scalar(1.0));
+    }
+
+    /// [`references_embedding_true_through_case_branch`] 等の `case_expr`
+    /// ヘルパーは `Expr`（構文段）向けのため、束縛後の `BoundExpr::Case` を
+    /// 直接組み立てる本テスト専用の小さなヘルパー。
+    fn bound_case_expr(whens: Vec<(BoundExpr, BoundExpr)>, else_result: BoundExpr) -> BoundExpr {
+        BoundExpr::Case {
+            whens,
+            else_result: Box::new(else_result),
+        }
     }
 }

@@ -3511,9 +3511,9 @@ fn map_write_error(e: crate::tenant::TenantWriteError, op: &'static str) -> SqlS
 ///
 /// `WHERE` 述語の評価は `sql/scan.rs::execute_scan` の走査ループと同一の意味論
 /// （`declarative_filter::matches_all` → 各 `expr_filters` を `ExprProgram::eval`。
-/// `references_embedding && dim == 0` の行は無条件除外。第 2 の述語評価器を
-/// 作らない）を、候補行列挙のクロージャとして `tenant::delete_rows_where_unchecked`
-/// へ注入する。
+/// `dim == 0`（`VECTOR` 列が NULL）の行を式が実際に参照する場合は `eval` 自身が
+/// `ExprValue::Null` を返し非該当扱いになる。第 2 の述語評価器を作らない）を、
+/// 候補行列挙のクロージャとして `tenant::delete_rows_where_unchecked` へ注入する。
 pub(crate) fn execute_predicate_delete(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
@@ -3546,9 +3546,11 @@ pub(crate) fn execute_predicate_delete(
         }
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
-            if references_embedding && candidate.dim == 0 {
-                return Ok(false);
-            }
+            // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
+            // 自身（`ExprStep::PushVector` の空スライス判定。`sql::expr_program`
+            // 参照）が行う（codex-review P1 指摘対応: 静的な式木走査による事前
+            // 除外は `CASE` の選ばれない分岐に embedding 参照があるだけの行まで
+            // 誤って除外していたため撤去し、評価時点の判定へ一本化した）。
             let embedding: &[f32] = if references_embedding {
                 candidate.embedding
             } else {
@@ -3654,9 +3656,11 @@ pub(crate) fn execute_predicate_update(
         }
         for (expr, program) in expr_filters.iter().zip(&expr_programs) {
             let references_embedding = udf_call::references_embedding(expr);
-            if references_embedding && candidate.dim == 0 {
-                return Ok(false);
-            }
+            // `dim == 0`（`VECTOR` 列が NULL）の行の NULL 伝播は `program.eval`
+            // 自身（`ExprStep::PushVector` の空スライス判定。`sql::expr_program`
+            // 参照）が行う（codex-review P1 指摘対応: 静的な式木走査による事前
+            // 除外は `CASE` の選ばれない分岐に embedding 参照があるだけの行まで
+            // 誤って除外していたため撤去し、評価時点の判定へ一本化した）。
             let embedding: &[f32] = if references_embedding {
                 candidate.embedding
             } else {

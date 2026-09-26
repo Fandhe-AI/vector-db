@@ -2199,14 +2199,23 @@ impl<'a> Parser<'a> {
     fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
         if let Some(Token::Ident(name)) = self.peek() {
             let name = name.clone();
-            // `CASE`／`NULL`（対象ビヘイビア: SQL-26。Issue #921）は `ident '('`
-            // 形ではなく頂点に来るため、既存の「次が `'('` か」判定に加えて
-            // 大小無視で照合する。
-            let starts_case_or_null =
-                name.eq_ignore_ascii_case("CASE") || name.eq_ignore_ascii_case("NULL");
+            // `CASE`（対象ビヘイビア: SQL-26。Issue #921）は `ident '('` 形では
+            // なく頂点に来るため、次が `'('` かに加えて大小無視で照合する。ただし
+            // `WHEN` を伴わない `CASE` は式ではなく既存の列名 `case` の参照
+            // （`SELECT case FROM t` 等）でありうるため、`DISTINCT`／`LIKE` と
+            // 同じ文脈的キーワードの判定方針（1 トークン先読み）で「次が `WHEN`
+            // であるときのみ」式として扱う（codex-review 指摘対応: 先読み無しでは
+            // 既存の列名 `case` の SELECT が構文エラー化する破壊的変更になる）。
+            // `NULL` は後続トークンによる曖昧性解消ができない（`SELECT null FROM t`
+            // は「列 `null` の参照」と「NULL リテラルの投影」のどちらも構文上
+            // 同一の形になる）ため、列名としての後方互換を優先し、ここでは式
+            // トリガーに含めない（`NULL` リテラルは `CASE`／`COALESCE`／`NULLIF`
+            // の内側など `parse_primary_expr` 経由の文脈では従来どおり使える）。
+            let starts_case =
+                name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
             let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
-            if starts_case_or_null || starts_call {
-                let expr = if starts_case_or_null {
+            if starts_case || starts_call {
+                let expr = if starts_case {
                     self.parse_value_expr(0)?
                 } else {
                     self.advance();
@@ -11047,6 +11056,27 @@ mod tests {
             }
             other => panic!("expected SelectItem::Expr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn select_item_named_case_or_null_without_when_is_a_plain_column_reference() {
+        // codex-review P1 指摘対応（Issue #921）: `CASE`／`NULL` を先読み無しで
+        // 常に式のトリガーにすると、既存の列名 `case`／`null` を投影する
+        // `SELECT case, null FROM t` が構文エラー化する破壊的変更になっていた。
+        // `CASE` は直後が `WHEN` のときのみ式として扱い、`NULL` は列名としての
+        // 後方互換を優先して式トリガーに含めない（`parse_select_item` 参照）。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT case, null FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("bare `case`/`null` select items should parse as plain column references");
+        // 全項目が裸の列参照のときは `Projection::Items` ではなく
+        // `Projection::Columns` へ畳み込まれる（`parse_select_list` 参照）。
+        assert_eq!(
+            stmt.projection,
+            Projection::Columns(vec!["case".to_string(), "null".to_string()])
+        );
     }
 
     #[test]
