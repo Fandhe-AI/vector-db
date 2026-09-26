@@ -1158,11 +1158,19 @@ fn build_result(
         let mut plain_iter = base_row.cells.into_iter();
         for pos in 0..total_len {
             if let Some(item_index) = bound.windows().iter().position(|w| w.position == pos) {
+                // `materialize_rows` の走査と `execute_scan_with_budget`（`base_result`）の
+                // 走査は独立実装であり、本来は同一の行集合に一致するはずの不変条件を持つ
+                // （テストで一致を確認済み）。将来のドリフトで行 id が食い違った場合に
+                // 静かに NULL を返すと不正確な結果を返してしまうため、この不一致は
+                // untrusted 入力起因ではない実装バグとして fail-closed にする。
                 let cell = window_values
                     .get(item_index)
-                    .and_then(|m| m.get(&base_row.id))
+                    .ok_or_else(|| window_bug("window item index out of range in build_result"))?
+                    .get(&base_row.id)
                     .cloned()
-                    .unwrap_or(Cell::Null);
+                    .ok_or_else(|| {
+                        window_bug("window_values missing entry for a base scan row id")
+                    })?;
                 cells.push(cell);
             } else {
                 match plain_iter.next() {
