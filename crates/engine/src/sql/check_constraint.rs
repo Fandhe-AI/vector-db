@@ -64,6 +64,22 @@ fn render_predicate(predicate: &WherePredicate) -> String {
             )
         }
         WherePredicate::Expression(expr) => render_expression_predicate(expr),
+        // `parse_check_clause`（構文段）が `CHECK (...)` 本体の `OR` を既に
+        // `42601` で拒否するため到達しない（TASK-208・Issue #912）。網羅性のため
+        // 防御的に括弧付きで描画する。
+        WherePredicate::Or(branches) => {
+            let rendered: Vec<String> = branches
+                .iter()
+                .map(|branch| {
+                    branch
+                        .iter()
+                        .map(render_predicate)
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                })
+                .collect();
+            format!("({})", rendered.join(" OR "))
+        }
     }
 }
 
@@ -163,6 +179,13 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
             | WherePredicate::BoolEquality { .. }
             | WherePredicate::BoolColumn { .. }
             | WherePredicate::Compare { .. } => {}
+            // `parse_check_clause` が構文段で既に拒否するため到達しない
+            // （TASK-208・Issue #912）。防御的に fail-closed で拒否する。
+            WherePredicate::Or(_) => {
+                return Err(SqlSurfaceError::unsupported(
+                    "CHECK constraint predicate must not contain OR",
+                ));
+            }
         }
     }
     Ok(())
@@ -268,7 +291,7 @@ pub(crate) fn recompute_referenced_columns(
     let predicates = crate::sql::allowlist::parse_check_predicate_text(&check.predicate_sql)?;
     reject_forbidden_elements(&predicates)?;
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    let (metadata_filters, expr_filters, _rls_predicate_present) =
+    let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
         crate::sql::parser::bind_where_predicates(
             &predicates,
             schema,
@@ -372,7 +395,7 @@ pub(crate) fn validate_and_build(
         reject_forbidden_elements(&check.predicates)?;
 
         let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-        let (metadata_filters, expr_filters, _rls_predicate_present) =
+        let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
             crate::sql::parser::bind_where_predicates(
                 &check.predicates,
                 schema,
@@ -479,7 +502,7 @@ impl CompiledChecks {
                     .map_err(corrupt_check)?;
             reject_forbidden_elements(&predicates).map_err(corrupt_check)?;
             let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-            let (metadata_filters, expr_filters, _rls_predicate_present) =
+            let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
                 crate::sql::parser::bind_where_predicates(
                     &predicates,
                     schema,
