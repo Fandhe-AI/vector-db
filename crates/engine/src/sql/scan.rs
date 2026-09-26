@@ -1087,6 +1087,18 @@ pub(crate) fn execute_scan_with_budget(
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
                 |dim, scanned, embedding| {
+                    // PR #1096 レビュー指摘 P1（codex-review・cursor Bugbot 双方が
+                    // 独立検出）対応: 順序保証なし経路では物理走査順がそのまま
+                    // 出力順（本モジュールドキュメント「順序」節）のため、`skipped`
+                    // 判定を投影・`byte_budget` 加算より前に確定させる。ここで
+                    // `None` を返す行は「スキップされる行」であり、大きな
+                    // `TEXT`/`VECTOR` を含んでいても投影・予算計上を一切行わない
+                    // （既存の「スキップ行は投影・予算計上しない」契約。逆順にすると
+                    // OFFSET が大きいだけで不要に `54000` を返す回帰になる）。
+                    if skipped < bound.offset {
+                        skipped += 1;
+                        return Ok(None);
+                    }
                     // `cells`／`rows` 確保前に累計予算を検証（確保そのものを
                     // 許可する前に拒否できるよう `Vec::try_reserve` 系より先に
                     // 判定する）。
@@ -1105,11 +1117,11 @@ pub(crate) fn execute_scan_with_budget(
                         &mut byte_budget,
                         max_result_bytes,
                     )?;
-                    Ok(ResultRow {
+                    Ok(Some(ResultRow {
                         id,
                         score: 0.0,
                         cells,
-                    })
+                    }))
                 },
             )
         };
@@ -1126,15 +1138,9 @@ pub(crate) fn execute_scan_with_budget(
             let (k, v) = entry.map_err(storage_internal)?;
             let (key_tenant, id) = k.value();
             let buf = v.value();
-            if let Some(row) = build_visible_row(key_tenant, id, buf)? {
-                // Issue #916・SQL-25 (b)・TASK-209: 順序保証なし経路では物理走査順が
-                // そのまま出力順（本モジュールドキュメント「順序」節）のため、投影・
-                // `cells` 確保より前に読み飛ばしてもソート確定後にスキップする契約
-                // （`docs/design/sql-offset-paging.md`）と等価。
-                if skipped < bound.offset {
-                    skipped += 1;
-                    continue;
-                }
+            // `build_visible_row` が `Some(None)` を返すのは「可視かつ WHERE を
+            // 満たすが OFFSET でスキップされる行」（投影・予算計上済みでない）。
+            if let Some(Some(row)) = build_visible_row(key_tenant, id, buf)? {
                 rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
                     detail: format!("failed to reserve scan result rows: {e}"),
                 })?;
@@ -1164,6 +1170,16 @@ pub(crate) fn execute_scan_with_budget(
                 &mut embedding_scratch,
                 &mut where_expr_scratch,
                 |dim, scanned, embedding| {
+                    // PR #1096 レビュー指摘 P1（codex-review・cursor Bugbot 双方が
+                    // 独立検出）対応: 経路 (A) は物理走査順が疑似列 `id` による
+                    // ソート確定順と一致するため、`skipped` 判定を投影・
+                    // `byte_budget` 加算より前に確定させる（unordered 経路と同じ
+                    // 理由。スキップされる行の大きな `TEXT`/`VECTOR` で不要に
+                    // `54000` を返す回帰を避ける）。
+                    if skipped < bound.offset {
+                        skipped += 1;
+                        return Ok(None);
+                    }
                     byte_budget =
                         try_accumulate_budget(byte_budget, per_row_struct_bytes, max_result_bytes)?;
                     let cells = build_projected_cells(
@@ -1179,11 +1195,11 @@ pub(crate) fn execute_scan_with_budget(
                         &mut byte_budget,
                         max_result_bytes,
                     )?;
-                    Ok(ResultRow {
+                    Ok(Some(ResultRow {
                         id,
                         score: 0.0,
                         cells,
-                    })
+                    }))
                 },
             )
         };
@@ -1207,15 +1223,9 @@ pub(crate) fn execute_scan_with_budget(
                 let (k, v) = entry.map_err(storage_internal)?;
                 let (key_tenant, id) = k.value();
                 let buf = v.value();
-                if let Some(row) = build_visible_row(key_tenant, id, buf)? {
-                    // Issue #916・SQL-25 (b)・TASK-209: 経路 (A) は物理走査順が
-                    // 疑似列 `id` によるソート確定順（本関数の呼び出し元契約）と
-                    // 一致するため、ここで読み飛ばしても「ソート確定後に OFFSET を
-                    // 適用する」契約と等価。
-                    if skipped < bound.offset {
-                        skipped += 1;
-                        continue;
-                    }
+                // `build_visible_row` が `Some(None)` を返すのは「可視かつ WHERE
+                // を満たすが OFFSET でスキップされる行」（投影・予算計上済みでない）。
+                if let Some(Some(row)) = build_visible_row(key_tenant, id, buf)? {
                     rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
                         detail: format!("failed to reserve scan result rows: {e}"),
                     })?;
@@ -1230,15 +1240,7 @@ pub(crate) fn execute_scan_with_budget(
                 let (k, v) = entry.map_err(storage_internal)?;
                 let (key_tenant, id) = k.value();
                 let buf = v.value();
-                if let Some(row) = build_visible_row(key_tenant, id, buf)? {
-                    // Issue #916・SQL-25 (b)・TASK-209: 経路 (A) は物理走査順が
-                    // 疑似列 `id` によるソート確定順（本関数の呼び出し元契約）と
-                    // 一致するため、ここで読み飛ばしても「ソート確定後に OFFSET を
-                    // 適用する」契約と等価。
-                    if skipped < bound.offset {
-                        skipped += 1;
-                        continue;
-                    }
+                if let Some(Some(row)) = build_visible_row(key_tenant, id, buf)? {
                     rows.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
                         detail: format!("failed to reserve scan result rows: {e}"),
                     })?;
@@ -1642,6 +1644,49 @@ mod tests {
         let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
         // 不可視行が計数に混入すれば 1 件目からずれて `[2, 3]` にならない。
         assert_eq!(ids, vec![2, 3]);
+    }
+
+    /// PR #1096 レビュー指摘 P1（codex-review・cursor Bugbot 双方が独立検出）の
+    /// 回帰: `OFFSET` で読み飛ばす行は投影・`byte_budget` 加算のいずれも行わない
+    /// （既存の「スキップ行は投影・予算計上しない」契約）。修正前は
+    /// `build_visible_row` が可視性・`WHERE` 判定後に投影・予算計上を終えてから
+    /// `skipped < bound.offset` を判定していたため、読み飛ばされる行が大きい
+    /// `VECTOR` を持つだけで返却対象でない行の分まで予算に計上され、不要に
+    /// `54000`（payload_too_large）になっていた。読み飛ばし行の分を除けば収まる
+    /// 予算で、実際に収まることを確認する。
+    #[test]
+    fn offset_skipped_rows_do_not_count_toward_result_byte_budget() {
+        let path = unique_db_path("scan-offset-skip-budget");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        // 大きめの VECTOR（次元 5000 = 20000 バイト/行）で、スキップ行の予算
+        // 誤計上が閾値超過として顕在化するようにする。
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(5000), true)],
+        );
+        storage.create_table(&schema).expect("create table");
+        let big_embedding = vec![1.0f32; 5000];
+        // id 1..=5: OFFSET で読み飛ばされる行（返却されない）。
+        for id in 1..=5u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &big_embedding);
+        }
+        // id 6..=7: 返却される行。
+        for id in 6..=7u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &big_embedding);
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut bound = bound_star_scan(10);
+        bound.offset = 5;
+
+        // 返却される 2 行分（約 40000 バイト＋構造体分）は収まるが、スキップ
+        // される 5 行分まで誤って計上すると（約 140000 バイト）超過する予算。
+        let result = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 60_000)
+            .expect("skipped rows must not count toward the result byte budget");
+        let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![6, 7]);
     }
 
     /// `vec_norm(embedding)` を投影する `Computed` 列を持つ `BoundScan` を組み立てる
