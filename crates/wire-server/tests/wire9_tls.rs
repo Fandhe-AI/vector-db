@@ -590,6 +590,23 @@ fn assert_server_still_accepts_normal_connections(port: u16) {
     assert_eq!(rows, vec!["1".to_string()]);
 }
 
+/// fatal alert 送出後、接続が実際に閉じており追加のバイトが一切来ないこと
+/// を確認する。読み取りタイムアウト（`TimedOut`／`WouldBlock`）を空読み
+/// （`n=0`）と区別せず握りつぶすと、サーバーが接続を開いたまま応答しない
+/// fail-open の退行が「無応答で正常」と誤認され pass してしまうため、
+/// タイムアウトは明示的に `panic!` させる。
+fn assert_connection_closed_with_no_trailing_bytes(stream: &mut impl Read) {
+    let mut trailing = [0u8; 1];
+    match stream.read(&mut trailing) {
+        Ok(0) => {}
+        Ok(n) => panic!("connection must be closed after the alert; got {n} trailing byte(s)"),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!(
+            "connection must be closed (EOF) after the alert, not hang or error otherwise: {e:?}"
+        ),
+    }
+}
+
 /// 平文の fatal alert レコード（ClientHello 段階。まだ暗号化されていない）
 /// を読み、`(level, description)` を返す。
 fn read_plaintext_alert(stream: &mut impl Read) -> (u8, u8) {
@@ -663,12 +680,7 @@ fn tls12_only_client_hello_without_supported_versions_gets_protocol_version_aler
     assert_eq!(level, 2, "expected fatal alert level");
     assert_eq!(description, 70, "expected protocol_version alert");
 
-    let mut buf = [0u8; 1];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    assert_eq!(
-        n, 0,
-        "connection must be closed after the alert; no pg wire bytes"
-    );
+    assert_connection_closed_with_no_trailing_bytes(&mut stream);
 
     assert_server_still_accepts_normal_connections(port);
     drop(server);
@@ -703,12 +715,7 @@ fn supported_versions_with_only_tls12_gets_protocol_version_alert() {
     assert_eq!(level, 2, "expected fatal alert level");
     assert_eq!(description, 70, "expected protocol_version alert");
 
-    let mut buf = [0u8; 1];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    assert_eq!(
-        n, 0,
-        "connection must be closed after the alert; no pg wire bytes"
-    );
+    assert_connection_closed_with_no_trailing_bytes(&mut stream);
 
     assert_server_still_accepts_normal_connections(port);
     drop(server);
@@ -776,12 +783,7 @@ fn tampered_application_data_record_gets_bad_record_mac_and_closes() {
     assert_eq!(opened.content[0], 2, "expected fatal alert level");
     assert_eq!(opened.content[1], 20, "expected bad_record_mac alert");
 
-    let mut trailing = [0u8; 1];
-    let n = socket.read(&mut trailing).unwrap_or(0);
-    assert_eq!(
-        n, 0,
-        "connection must be closed after the alert; no 'R' byte"
-    );
+    assert_connection_closed_with_no_trailing_bytes(&mut socket);
 
     assert_server_still_accepts_normal_connections(port);
     drop(server);
@@ -833,12 +835,7 @@ fn oversized_record_length_is_rejected_without_processing() {
     assert_eq!(opened.content[0], 2, "expected fatal alert level");
     assert_eq!(opened.content[1], 22, "expected record_overflow alert");
 
-    let mut trailing = [0u8; 1];
-    let n = socket.read(&mut trailing).unwrap_or(0);
-    assert_eq!(
-        n, 0,
-        "connection must be closed after the alert; no 'R' byte"
-    );
+    assert_connection_closed_with_no_trailing_bytes(&mut socket);
 
     assert_server_still_accepts_normal_connections(port);
     drop(server);
@@ -885,14 +882,25 @@ fn truncated_client_hello_record_then_eof_closes_without_server_hello() {
     // ならないことで確認する。alert が来る場合と無応答 EOF になる場合の
     // 両方を許容しつつ、ServerHello（Handshake かつ非 Alert）だけは
     // 明確に拒否する。
+    // 実測: `record::read_record` は宣言長に届く前の EOF を
+    // `RecordError::Truncated` として検出し、`alert_description()` が
+    // `None` を返すため（`Truncated`／`Io` は無応答）、サーバーは alert を
+    // 送らずそのまま切断する。`read_to_end` の `Err`（特に `TimedOut`）を
+    // 黙って握りつぶすと fail-open（応答なしで接続を開いたまま保持する
+    // 退行）が「無応答」と誤認され pass してしまうため、明示的に区別する。
     let mut buf = Vec::new();
-    let _ = socket.read_to_end(&mut buf);
-    if !buf.is_empty() {
-        assert_ne!(
-            buf[0], 22,
-            "server must not send a Handshake-type record (ServerHello) for a truncated ClientHello"
-        );
+    match socket.read_to_end(&mut buf) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!(
+            "server must close the connection cleanly (EOF) for a truncated ClientHello, \
+             not hang or error otherwise: {e:?} (partial={buf:?})"
+        ),
     }
+    assert!(
+        buf.is_empty(),
+        "server must send no bytes (no alert, no ServerHello) for a truncated ClientHello; got {buf:?}"
+    );
 
     assert_server_still_accepts_normal_connections(port);
     drop(server);
@@ -931,14 +939,22 @@ fn truncated_record_header_then_eof_closes() {
         .shutdown(std::net::Shutdown::Write)
         .expect("half-close write side");
 
+    // 実測: レコードヘッダ自体の read_exact が UnexpectedEof で失敗し
+    // `RecordError::Io` となる（`alert_description()` は `None`）ため、
+    // 上記 neg5 と同じく無応答のまま切断される。
     let mut buf = Vec::new();
-    let _ = socket.read_to_end(&mut buf);
-    if !buf.is_empty() {
-        assert_ne!(
-            buf[0], 22,
-            "server must not send a Handshake-type record for a header-truncated ClientHello"
-        );
+    match socket.read_to_end(&mut buf) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!(
+            "server must close the connection cleanly (EOF) for a header-truncated ClientHello, \
+             not hang or error otherwise: {e:?} (partial={buf:?})"
+        ),
     }
+    assert!(
+        buf.is_empty(),
+        "server must send no bytes for a header-truncated ClientHello; got {buf:?}"
+    );
 
     assert_server_still_accepts_normal_connections(port);
     drop(server);
@@ -967,19 +983,31 @@ fn handshake_abandoned_before_client_finished_closes_without_wire_data() {
     let resp = read_exact_n(&mut socket, 1);
     assert_eq!(&resp, b"S");
 
-    let _client = tls_client::drive_client_handshake_stop_before_finished(&mut socket);
+    let client = tls_client::drive_client_handshake_stop_before_finished(&mut socket);
     socket
         .shutdown(std::net::Shutdown::Write)
         .expect("half-close write side");
 
+    // 実測: server flight 送出後に client Finished 待ちで EOF に達すると
+    // `Ok(None)`（driver）→ `RecordError::Truncated` として shutdown する
+    // （alert は送らない。neg5／neg6 と同じ経路）。pg wire バイトはおろか
+    // 暗号化 alert すら一切届かない。`_client`（handshake 鍵導入済み）は
+    // 万一暗号化データが来た場合に備えて保持するが、実測どおり無応答なので
+    // 復号の出番はない。
+    let _client = client;
     let mut buf = Vec::new();
-    let _ = socket.read_to_end(&mut buf);
-    // pg wire の平文 'R'（Authentication*）が生バイトのまま出てくることは
-    // 決してない（TLS 越しなので常に暗号化されているはずだが、fail-open の
-    // 検出として明示的に禁止する）。
+    match socket.read_to_end(&mut buf) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!(
+            "server must close the connection cleanly (EOF) when client Finished is never sent, \
+             not hang or error otherwise: {e:?} (partial={buf:?})"
+        ),
+    }
     assert!(
-        !buf.contains(&b'R') || buf.first() == Some(&21),
-        "no plaintext pg wire byte may leak; observed={buf:?}"
+        buf.is_empty(),
+        "server must send no bytes (no alert, no pg wire data) when client Finished is \
+         withheld; got {buf:?}"
     );
 
     assert_server_still_accepts_normal_connections(port);

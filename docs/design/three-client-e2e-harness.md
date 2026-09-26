@@ -756,11 +756,13 @@ fail-closed で切断されるか」を検証する（新設ファイル
   - レコード長が `MAX_CIPHERTEXT_LEN`（2^14+256）を超えるヘッダのみ送信
     （本体は待たずに拒否）→ `record_overflow`（22）
   - ClientHello レコードの宣言長より短い本体で半クローズ／レコードヘッダ
-    自体を切り詰めて半クローズ → いずれも ServerHello（Handshake 型
-    レコード）を送らずに切断（alert の有無は実装依存のため、
-    Handshake 型レコードが出ないことのみを固定する）
-  - server flight 受信後・client Finished 送出前に半クローズ → pg wire の
-    平文バイトが一切届かずに切断
+    自体を切り詰めて半クローズ → `RecordError::Truncated`／`Io` は
+    `alert_description()` が `None`（レコード層コメント参照）を返すため、
+    サーバーは alert を一切送らず無応答のまま接続を閉じる（実測: 受信
+    バイト列が空のまま EOF）ことを固定する
+  - server flight 受信後・client Finished 送出前に半クローズ → 同じく
+    `RecordError::Truncated` 経路のため、pg wire バイトはおろか暗号化
+    alert すら一切届かずに無応答のまま切断される（実測: 受信バイト列は空）
 - **層 B（`#[ignore]`。`make e2e-three-client-tls` から明示実行）**: 無改造の
   `psql`（`sslmode=require`）・Python `psycopg`（`sslmode=require`）・
   Node.js `pg`（`ssl: { rejectUnauthorized: false }`）が `--tls-mode require`
