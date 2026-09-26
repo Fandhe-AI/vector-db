@@ -114,7 +114,7 @@ TASK-228 で自作した TLS 1.3 実装（対象コミット: origin/main
 | ---- | -------- | -------- | ---- |
 | TLS レコード長 | `record.rs`（`MAX_CIPHERTEXT_LEN`／`MAX_PLAINTEXT_LEN`） | 確保・`read_exact` の前に上限と照合 | OK |
 | ハンドシェイクメッセージ長 | `handshake.rs`（`MAX_HANDSHAKE_WIRE_BODY_LEN`／`MAX_HANDSHAKE_MESSAGE_LEN`） | 24 ビット長を確保前にクランプ・再組み立てバッファに上限 | OK |
-| `ClientHello` 拡張ベクタ長 | `client_hello.rs` | 各ベクタ長を残りバッファ長と照合。TLS 1.3 以外・未知拡張は fail-closed 拒否 | OK |
+| `ClientHello` 拡張ベクタ長 | `client_hello.rs` | 各ベクタ長を残りバッファ長と照合。TLS 1.3 以外は fail-closed 拒否。未知拡張は RFC 8446 §4.2/§4.1.2 のとおり中身を見ずに無視して受理する（拒否ではない。長さ検証自体は行われるため未検証アロケーションにはならない） | OK |
 | DER 長 | `der.rs`（`MAX_DER_NESTING_DEPTH`） | long-form 長のオクテット数上限・checked 演算・不定長形式の拒否 | OK |
 | 証明書 DER 長 | `x509.rs`（`MAX_CERTIFICATE_DER_LEN`） | 確保前に照合 | OK |
 | PEM/PKCS#8 | `pem.rs`・`pkcs8.rs` | ファイル長・ブロック数上限 | OK |
