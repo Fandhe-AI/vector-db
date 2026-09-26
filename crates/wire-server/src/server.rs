@@ -116,7 +116,15 @@ pub fn accept_loop_with_limiter(
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
-    accept_loop_inner(listener, store, None, None, limiter, read_timeout)
+    accept_loop_inner(
+        listener,
+        store,
+        None,
+        None,
+        crate::tls_opt::TlsMode::Allow,
+        limiter,
+        read_timeout,
+    )
 }
 
 /// engine（SQL 表層）を接続した接続受け付けループ（TASK-73・WIRE-1）。
@@ -131,14 +139,28 @@ pub fn accept_loop_with_engine(
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
-    accept_loop_inner(listener, store, Some(engine), None, limiter, read_timeout)
+    accept_loop_inner(
+        listener,
+        store,
+        Some(engine),
+        None,
+        crate::tls_opt::TlsMode::Allow,
+        limiter,
+        read_timeout,
+    )
 }
 
 /// TLS opt-in を含む接続受け付けループ（Issue #966）。`tls` が `Some` の
 /// 場合に限り、各接続で `SSLRequest` へ `'S'` を返し TLS ハンドシェイクへ
 /// 進む（[`crate::handshake::handle_connection_with_options`]）。`None` の
 /// 場合は [`accept_loop_with_engine`] とビット単位で同一の平文経路になる。
-/// CLI からの証明書・鍵読み込みと `tls` の構築自体は対象外（#967）。
+///
+/// **`--tls-mode` opt-in（Issue #967）**: 本関数は常に
+/// [`crate::tls_opt::TlsMode::Allow`]（`tls` が `Some` のとき `SSLRequest`
+/// を経ない平文 StartupMessage も受理する。#966 時点の既存挙動）で
+/// [`accept_loop_with_tls_mode`] へ委譲する後方互換ラッパーとして維持する
+/// （AGENTS.md 公開 API 互換方針）。`--tls-mode require` の平文拒否は新規
+/// エントリポイント [`accept_loop_with_tls_mode`] が担う。
 pub fn accept_loop_with_tls(
     listener: TcpListener,
     store: Arc<UserStore>,
@@ -147,7 +169,33 @@ pub fn accept_loop_with_tls(
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
-    accept_loop_inner(listener, store, engine, tls, limiter, read_timeout)
+    accept_loop_with_tls_mode(
+        listener,
+        store,
+        engine,
+        tls,
+        crate::tls_opt::TlsMode::Allow,
+        limiter,
+        read_timeout,
+    )
+}
+
+/// TLS opt-in と平文接続ポリシー（[`crate::tls_opt::TlsMode`]）の双方を
+/// 含む接続受け付けループ（Issue #967。`main.rs::run_server` の `--tls-cert`／
+/// `--tls-key`／`--tls-mode` opt-in から呼ばれる想定）。`tls` が `None` の
+/// 場合、`mode` は無視され [`accept_loop_with_engine`] とビット単位で同一の
+/// 平文経路になる。各接続の実処理は
+/// [`crate::handshake::handle_connection_with_tls_mode`] が担う。
+pub fn accept_loop_with_tls_mode(
+    listener: TcpListener,
+    store: Arc<UserStore>,
+    engine: Option<Arc<EngineCore>>,
+    tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+    mode: crate::tls_opt::TlsMode,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+) {
+    accept_loop_inner(listener, store, engine, tls, mode, limiter, read_timeout)
 }
 
 fn accept_loop_inner(
@@ -155,6 +203,7 @@ fn accept_loop_inner(
     store: Arc<UserStore>,
     engine: Option<Arc<EngineCore>>,
     tls: Option<Arc<crate::tls::server_handshake::TlsServerConfig>>,
+    mode: crate::tls_opt::TlsMode,
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
@@ -248,13 +297,15 @@ fn accept_loop_inner(
             // いずれも）に Drop で確実に枠を解放する。
             let _permit = permit;
             // `tls` が `None` の間は既存の 2 エントリポイントをそのまま呼び、
-            // ビット単位で従来と同一の平文経路を維持する（受入基準 2）。
+            // ビット単位で従来と同一の平文経路を維持する（受入基準 2。`mode` は
+            // `tls` が `None` の間は意味を持たない）。
             let result = match (&engine, &tls) {
-                (_, Some(_)) => crate::handshake::handle_connection_with_options(
+                (_, Some(_)) => crate::handshake::handle_connection_with_tls_mode(
                     stream,
                     &store,
                     engine.as_deref(),
                     tls,
+                    mode,
                 ),
                 (Some(engine), None) => {
                     crate::handshake::handle_connection_with_engine(stream, &store, engine)

@@ -127,12 +127,58 @@ pipelined_plaintext_after_ssl_request_is_not_processed_as_startup` で
 - `tls::stream::TlsStream`（新設）
 - `tls::server_handshake::TlsSession::seal_fatal_alert`（新設）
 - `handshake::handle_connection_with_options`（新設。TLS opt-in を含む
-  新しい公開入口。`tls: None` で既存 2 関数とビット同一）
+  新しい公開入口。`tls: None` で既存 2 関数とビット同一。Issue #967 以降は
+  常に `TlsMode::Allow` で `handle_connection_with_tls_mode` へ委譲する
+  後方互換ラッパー）
 - `server::accept_loop_with_tls`（新設。`tls: None` で
-  `accept_loop_with_engine` とビット同一）
+  `accept_loop_with_engine` とビット同一。Issue #967 以降は常に
+  `TlsMode::Allow` で `accept_loop_with_tls_mode` へ委譲する後方互換
+  ラッパー）
 - 既存の `handle_connection_bounded`・`handle_connection_with_engine`・
   `handle_connection`（deprecated）・`accept_loop_with_limiter`・
   `accept_loop_with_engine` はシグネチャ・挙動とも無変更
+
+## CLI opt-in と平文ポリシー（Issue #967・親 #941・TASK-228）
+
+`--tls-cert`／`--tls-key`／`--tls-mode`（`tls_opt.rs`。新設）が
+`TlsServerConfig` を組み立てる唯一の CLI 入口。手順・組合せ検証・平文
+ポリシー（`require`／`allow`）・秘密値の非出力方針は README「wire-server
+の起動」節を参照（spec 本文の転記を避けるため詳細はそちらに集約する）。
+
+- `handshake::TlsMode`（`tls_opt.rs` から re-export 相当。`#[non_exhaustive]`）・
+  `handshake::handle_connection_with_tls_mode`（新設。`handle_connection_with_options`
+  が `Allow` で委譲する先）・`negotiate_startup_or_upgrade` への `mode`
+  パラメータ追加・`PreTlsOutcome::PlaintextRejected`（`require` 下で平文
+  StartupMessage を startup パラメータ非解釈のまま拒否する。D8）。
+- `server::accept_loop_with_tls_mode`（新設。`accept_loop_with_tls` が
+  `Allow` で委譲する先）。
+- `bind_guard::TransportSecurity` へ `TlsRequired`（非ループバック bind を
+  許可。WIRE-9）・`TlsOptional`（`Cleartext` と同じくループバック限定。
+  D1）を追加。`#[non_exhaustive]` のため下流の exhaustive match は破壊
+  しない。
+- **D1（意図的な逸脱）**: Issue 本文は「非ループバック × `allow` は警告
+  のみ」だが、`allow` は平文接続を受理する以上 WIRE-9（非ループバックでは
+  TLS 必須）を満たせないため、警告に留めず起動拒否へ倒した。`bind_guard`
+  の既存ガード（`GuardedBindAddrs::resolve`）と同じ場所・同じ判定順序で
+  拒否し、`--tls-mode allow` から `require` への切り替えを促す hint 行を
+  `main.rs` が追加で出す。
+- **D5**: `--surface nosql` と TLS フラグの併用は拒否する（HTTP リスナーは
+  #968 まで平文のまま。TLS フラグと組み合わせると bind ガードだけが
+  `TlsRequired`／`TlsOptional` へ緩み、平文 HTTP が非ループバックへ露出
+  しうるため）。
+- 依存追加なし。`unsafe` なし。秘密値（鍵の seed・PKCS#8 本文）に依存する
+  分岐は作らない。
+
+`crates/wire-server/tests/wire_tls_cli.rs`（新設）: 実バイナリを子プロセスと
+して起動し、既定不変（R1）・`require` の完走とログ（R2）・`require` の
+平文拒否（R3）・`allow` の TLS/平文双方の受理（R4）・組合せ不正/値欠落/
+重複/読み込み失敗（不存在ファイル・不正 PEM・鍵証明書不一致・期限切れ）/
+`nosql` 併用の起動拒否（R5）・非ループバック × `allow` の起動拒否と hint
+（R6）・秘密値の非出力（R7）を検証する。`tests/common/tls_client.rs` へ
+validity 指定可能な葉証明書ビルダー・PEM ラップ（`pem_wrap`）・Ed25519
+PKCS#8 DER/PEM 生成（`ed25519_pkcs8_der`／`ed25519_pkcs8_pem`。RFC 8032
+§7.1 TEST 1 seed に固定プレフィクス `302e020100300506032b657004220420`
+を連結する最小形）を追加した。
 
 ## テスト
 
@@ -161,8 +207,8 @@ pipelined_plaintext_after_ssl_request_is_not_processed_as_startup` で
 
 ## 対象外（後続 sub-issue）
 
-- CLI からの証明書・鍵読み込みと平文ポリシー（#967）。`bind_guard::
-  TransportSecurity` にも触れていない
+- CLI からの証明書・鍵読み込みと平文ポリシーは Issue #967 として実装済み
+  （上記「CLI opt-in と平文ポリシー」節参照）
 - HTTPS 表層（#968。`http/` 配下は無変更）
 - 実クライアント（psql・openssl s_client 等）3 種での接続試験（#969）
 - channel binding（#970）
