@@ -1495,3 +1495,174 @@ mod limit_tests {
         assert_eq!(err.wire_code(), "54000");
     }
 }
+#[cfg(test)]
+mod budget_regression_tests {
+    //! `execute_window_scan`（`pub(crate)`）を低レベル API で直接呼ぶ回帰テスト
+    //! （PR #930 2 回目レビュー指摘 2・3）。`sql::scan::
+    //! execute_scan_with_budget_honors_caller_supplied_cap`／`sql::aggregate::
+    //! execute_aggregate_with_cache_honors_caller_supplied_result_byte_budget_
+    //! for_text_min_max` と同じ検証形（既定に近い予算では成功・呼び出し元が
+    //! 指定した小さい予算では `54000` で早期失敗）を踏襲する。
+
+    use super::*;
+    use crate::catalog::ColumnDef;
+    use crate::sql::allowlist::AggregateFunc;
+    use crate::storage::{RowInput, Storage, Visibility};
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+    use redb::ReadableDatabase;
+
+    /// `body`（TEXT・nullable）1 列のみのテーブル（`MIN(body) OVER (...)` の
+    /// 検証専用）。
+    fn schema_with_text() -> TableSchema {
+        TableSchema::new("docs", vec![ColumnDef::new("body", ColumnType::Text, true)])
+    }
+
+    /// 低レベル API（`storage::encode_row`）で `body` 列の値を直接書き込む
+    /// （`sql::aggregate` の同種テストヘルパと同方針。公開 INSERT 経路を経由しない）。
+    fn write_text_row(
+        storage: &Storage,
+        schema: &TableSchema,
+        tenant_id: &str,
+        id: u64,
+        body: &str,
+    ) {
+        let metadata =
+            row_codec::encode_scalar_columns(schema, &[row_codec::Value::Text(body.to_string())])
+                .expect("encode scalar columns");
+        let buf = crate::storage::encode_row(&RowInput {
+            tenant_id,
+            visibility: Visibility::Public,
+            embedding: &[],
+            metadata: &metadata,
+        })
+        .expect("encode row");
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(catalog::user_rows_table_def(
+                    &catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            table
+                .insert((tenant_id, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    /// `SELECT id, MIN(body) OVER () FROM docs LIMIT 10` 相当の `BoundScan`
+    /// （`AggregateFunc` は不使用。`window_func_to_aggregate_func` が変換する）。
+    fn bound_min_body_over() -> BoundScan {
+        BoundScan {
+            table: "docs".to_string(),
+            projection: vec![ProjectedColumn::Id],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            or_filters: Vec::new(),
+            limit: 10,
+            offset: 0,
+            windows: vec![BoundWindowItem {
+                position: 1,
+                func: WindowFunc::Min,
+                input: Some(AggregateInput::TextColumn(0)),
+                partition_by: Vec::new(),
+                order_by: Vec::new(),
+                name: "min_body".to_string(),
+            }],
+        }
+    }
+
+    /// レビュー指摘 2 の回帰: `execute_window_scan` の `max_result_bytes` は
+    /// 従来ウィンドウ以外の投影列（本テストでは疑似列 `id` のみ）しか計上せず、
+    /// 後から差し込む `MIN(<TEXT 列>)` の `Cell::Text` を無視していた。十分に
+    /// 長い `body` 値では、「`id` 単体なら収まるが `MIN(body)` を足すと収まらない」
+    /// 予算で `54000` になることを固定する（`AggregateFunc` を経由しない点以外は
+    /// `execute_aggregate_with_cache_honors_caller_supplied_result_byte_budget_
+    /// for_text_min_max` と同じ検証形）。
+    #[test]
+    fn window_result_byte_budget_accounts_for_added_text_cell() {
+        let path = unique_db_path("window-result-budget-text");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text();
+        storage.create_table(&schema).expect("create table");
+        let long_body = "x".repeat(10_000);
+        write_text_row(&storage, &schema, "tenant-a", 1, &long_body);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = bound_min_body_over();
+
+        // 既定に近い十分な予算では成功する。
+        execute_window_scan(&read_txn, &ctx, &schema, &bound, 1_000_000)
+            .expect("ample budget should succeed");
+
+        // `id` 単体の投影であれば収まるが、`MIN(body)`（10,000 バイトの TEXT）を
+        // 足すと収まらない予算では `54000` を返す（修正前は window セルの
+        // バイト数を一切計上しないため、この予算でも誤って成功していた）。
+        let err = execute_window_scan(&read_txn, &ctx, &schema, &bound, 256)
+            .expect_err("budget that only fits the plain id column must still reject");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// レビュー指摘 3 の回帰: `MAX_WINDOW_STATE_BYTES` は materialize 段だけを
+    /// 計上し、評価段（`evaluate_window_item`／`evaluate_partition`）が確保する
+    /// `partitions` マップ・結果ベクタ・複製した `Cell` を計上していなかった。
+    /// materialize 段だけでちょうど収まる `state_cap`（評価段の余地がゼロ）を
+    /// 注入すると、評価段の確保で `54000` になることを固定する。
+    #[test]
+    fn evaluation_stage_allocations_are_charged_against_state_budget() {
+        let path = unique_db_path("window-state-budget-eval");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text();
+        storage.create_table(&schema).expect("create table");
+        let body = "y".repeat(4_000);
+        write_text_row(&storage, &schema, "tenant-a", 1, &body);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = bound_min_body_over();
+
+        let (_materialized, materialize_only_bytes) =
+            materialize_rows(&read_txn, &ctx, &schema, &bound, usize::MAX)
+                .expect("materialize should succeed with an unbounded cap");
+
+        // materialize 段だけでちょうど収まる cap（評価段の追加確保の余地がない）。
+        // 修正前は評価段が state_bytes を一切計上しなかったため、この cap でも
+        // 誤って成功していた。
+        let err = execute_window_scan_with_caps(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            1_000_000,
+            materialize_only_bytes,
+        )
+        .expect_err("cap with no headroom for the evaluation stage must reject");
+        assert_eq!(err.wire_code(), "54000");
+
+        // 評価段の分の余裕を足せば成功する。
+        execute_window_scan_with_caps(
+            &read_txn,
+            &ctx,
+            &schema,
+            &bound,
+            1_000_000,
+            materialize_only_bytes.saturating_add(1_000_000),
+        )
+        .expect("cap with headroom for the evaluation stage should succeed");
+    }
+
+    /// `window_func_to_aggregate_func` が `AggregateFunc::Min` へ変換すること
+    /// （上記 2 テストが構成する `BoundWindowItem::func = WindowFunc::Min` の
+    /// 前提を明示する。到達不能分岐の検出用ではなく、`use` の未使用警告回避も兼ねる）。
+    #[test]
+    fn min_window_func_maps_to_min_aggregate_func() {
+        assert_eq!(
+            window_func_to_aggregate_func(WindowFunc::Min).unwrap(),
+            AggregateFunc::Min
+        );
+    }
+}

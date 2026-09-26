@@ -1066,6 +1066,53 @@ fn window_values_are_invariant_to_other_tenants_rows() {
     assert_eq!(a_only_vals, a_and_b_vals);
 }
 
+#[test]
+fn window_values_stay_correct_when_multiple_tenants_share_the_same_row_id() {
+    // レビュー指摘（P1・テナント境界）: 行の物理キーは `(tenant_id, id)` だが、
+    // 以前の実装はウィンドウ値を疑似列 `id` だけをキーにした `HashMap` に
+    // 保存・取得していた。`PolicyContext::is_visible` は他テナントの
+    // `Public` 行も可視にするため、異なるテナントに同じ `id` の可視行が
+    // あると値が上書きされ、順位・集計値が誤った行に付いてしまう。
+    //
+    // テナント A・B にそれぞれ `id=1` の `Public` 行を、score を違えて置く
+    // （テナント A から見るとどちらも可視で `id` が重複した 2 行になる）。
+    // 修正前は評価段の `HashMap<u64, Cell>` が `id=1` の 1 エントリしか
+    // 持てず、`ORDER BY score` で最後に処理された行の row_number で
+    // 上書きされ、2 行とも同じ row_number（2）になっていた。
+    let path = unique_db_path("window-tenant-id-collision");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let ctx_a = ctx_for("tenant-a");
+    let ctx_b = ctx_for("tenant-b");
+    insert_row(&storage, &ctx_a, 1, "ja", 100);
+    insert_row(&storage, &ctx_b, 1, "ja", 999);
+    // テナント B の Private 行（id=2）は引き続き不可視のままであることも
+    // あわせて確認する（他テナントの存在情報を漏らさない）。
+    insert_row_with_visibility(&storage, &ctx_b, 2, "ja", 1, Visibility::Private);
+    let core = new_core(storage);
+
+    let result = expect_query(core.execute_sql(
+        &ctx_a,
+        "SELECT id, score, ROW_NUMBER() OVER (ORDER BY score) FROM docs LIMIT 10",
+    ));
+    // テナント B の Private 行は不可視のまま（2 行のみ可視）。
+    assert_eq!(result.rows.len(), 2);
+    // `id` が重複していても row_map（`id` キー）に頼らず、score で行を識別する
+    // （row_map 自体が同じ衝突を起こしうるため、本テストでは意図的に使わない）。
+    let mut by_score: Vec<(i64, u64)> = result
+        .rows
+        .iter()
+        .map(|r| (cell_signed(&r.cells[1]), cell_int(&r.cells[2])))
+        .collect();
+    by_score.sort_by_key(|(score, _)| *score);
+    assert_eq!(
+        by_score,
+        vec![(100, 1), (999, 2)],
+        "each id=1 row must keep its own row_number instead of being overwritten"
+    );
+}
+
 // ---------- cursor / COPY TO ----------
 
 #[test]
