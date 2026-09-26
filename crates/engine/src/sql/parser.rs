@@ -1065,6 +1065,11 @@ fn bind_ranking(
 fn default_expr_alias(expr: &Expr) -> String {
     match expr {
         Expr::Call { name, .. } => name.clone(),
+        // PostgreSQL にならった既定エイリアス（対象ビヘイビア: SQL-26。
+        // Issue #921）。
+        Expr::Case { .. } => "case".to_string(),
+        Expr::Coalesce(_) => "coalesce".to_string(),
+        Expr::NullIf(..) => "nullif".to_string(),
         _ => "expr".to_string(),
     }
 }
