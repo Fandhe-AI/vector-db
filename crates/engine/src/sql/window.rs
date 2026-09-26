@@ -108,6 +108,46 @@ fn try_accumulate_state_budget(
     Ok(next)
 }
 
+/// 新規パーティション追加前に [`MAX_WINDOW_PARTITIONS`] 上限を検査する
+/// （受入基準 2）。`cap` を引数化しているのは、実データを大量投入せずに
+/// 上限判定ロジックそのものを単体テストできるようにするため（本体は常に
+/// [`MAX_WINDOW_PARTITIONS`] を渡す。PR #930 最終レビュー指摘 2）。
+fn check_new_partition_capacity(
+    existing_partition_count: usize,
+    cap: usize,
+) -> Result<(), SqlSurfaceError> {
+    if existing_partition_count >= cap {
+        return Err(SqlSurfaceError::payload_too_large(
+            "window PARTITION BY produces too many partitions",
+        ));
+    }
+    Ok(())
+}
+
+/// 1 パーティションの行数が [`MAX_WINDOW_FRAME_ROWS`] 上限を超えないことを
+/// 検査する（受入基準 2。`cap` 引数化の理由は
+/// [`check_new_partition_capacity`] と同じ）。
+fn check_partition_row_count(count: usize, cap: usize) -> Result<(), SqlSurfaceError> {
+    if count > cap {
+        return Err(SqlSurfaceError::payload_too_large(
+            "window partition exceeds the allowed row count",
+        ));
+    }
+    Ok(())
+}
+
+/// materialize 段で集計済みの総行数が [`MAX_WINDOW_ROWS`] 上限を超えないことを
+/// 検査する（受入基準 2。`cap` 引数化の理由は [`check_new_partition_capacity`]
+/// と同じ）。
+fn check_total_row_count(count: usize, cap: usize) -> Result<(), SqlSurfaceError> {
+    if count > cap {
+        return Err(SqlSurfaceError::payload_too_large(
+            "window scan materializes too many rows",
+        ));
+    }
+    Ok(())
+}
+
 /// ウィンドウの `PARTITION BY`／`ORDER BY` キー 1 つの値（[`WindowKeyRef`] の
 /// 実行時表現。NULL は `Option::None` で表す）。
 #[derive(Debug, Clone)]
@@ -349,18 +389,12 @@ fn materialize_rows(
                 let partition_bytes = partition_key_bytes(&pkeys);
                 let counts = &mut partition_counts[item_index];
                 let is_new_partition = !counts.contains_key(&partition_bytes);
-                if is_new_partition && counts.len() >= MAX_WINDOW_PARTITIONS {
-                    return Err(SqlSurfaceError::payload_too_large(
-                        "window PARTITION BY produces too many partitions",
-                    ));
+                if is_new_partition {
+                    check_new_partition_capacity(counts.len(), MAX_WINDOW_PARTITIONS)?;
                 }
                 let count = counts.entry(partition_bytes).or_insert(0);
                 *count += 1;
-                if *count > MAX_WINDOW_FRAME_ROWS {
-                    return Err(SqlSurfaceError::payload_too_large(
-                        "window partition exceeds the allowed row count",
-                    ));
-                }
+                check_partition_row_count(*count, MAX_WINDOW_FRAME_ROWS)?;
 
                 let mut okeys = Vec::with_capacity(item.order_by.len());
                 for (key, _descending) in &item.order_by {
@@ -398,11 +432,7 @@ fn materialize_rows(
                 order_keys,
                 agg_values,
             });
-            if materialized.len() > MAX_WINDOW_ROWS {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "window scan materializes too many rows",
-                ));
-            }
+            check_total_row_count(materialized.len(), MAX_WINDOW_ROWS)?;
             seq = seq.checked_add(1).ok_or_else(|| {
                 SqlSurfaceError::payload_too_large("window scan row count overflowed")
             })?;
@@ -1208,4 +1238,68 @@ fn build_result(
     }
 
     Ok(QueryResult { columns, rows })
+}
+
+#[cfg(test)]
+mod limit_tests {
+    //! [`MAX_WINDOW_PARTITIONS`]／[`MAX_WINDOW_ROWS`]／[`MAX_WINDOW_FRAME_ROWS`]／
+    //! [`MAX_WINDOW_STATE_BYTES`] の実行時超過が `54000`
+    //! （[`SqlSurfaceError::payload_too_large`]）で fail-closed に拒否されることの
+    //! 単体テスト（PR #930 最終レビュー指摘 2）。`MAX_WINDOW_ROWS`／
+    //! `MAX_WINDOW_FRAME_ROWS` は実装既定値が 100 万行と大きく、実データでの
+    //! 結合テストは重すぎるため、判定ロジックを切り出した
+    //! [`check_new_partition_capacity`]／[`check_partition_row_count`]／
+    //! [`check_total_row_count`] を小さい `cap` を渡して直接検証する
+    //! （本体は常に実装既定の `MAX_WINDOW_*` 定数を渡すため、この単体テストは
+    //! 定数値そのものではなく比較ロジック〔`>=`/`>`〕の正しさを固定する）。
+    //! `MAX_WINDOW_PARTITIONS`（`sql::group_by::MAX_GROUPS` = 10,000）超過は
+    //! 実データでも現実的なため `tests/sql30_window.rs` に別途結合テストを持つ
+    //! （本モジュールの単体テストと二重に固定することで、判定ロジックと実行系
+    //! 統合の両方を回帰対象にする）。
+
+    use super::*;
+
+    #[test]
+    fn new_partition_capacity_accepts_up_to_cap_and_rejects_beyond() {
+        let cap = 3usize;
+        // 既存パーティション数が cap 未満なら新規パーティションを受理する。
+        assert!(check_new_partition_capacity(0, cap).is_ok());
+        assert!(check_new_partition_capacity(cap - 1, cap).is_ok());
+        // 既存パーティション数が cap に達した状態で新規パーティションを
+        // 追加しようとすると拒否する（`>=` 比較。ちょうど cap 件までは
+        // 既存パーティションとして許容し、cap+1 件目の新規作成を拒否する）。
+        let err = check_new_partition_capacity(cap, cap).expect_err("cap 到達時は拒否");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn partition_row_count_accepts_up_to_cap_and_rejects_beyond() {
+        let cap = 5usize;
+        assert!(check_partition_row_count(cap, cap).is_ok());
+        let err = check_partition_row_count(cap + 1, cap).expect_err("cap 超過時は拒否");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn total_row_count_accepts_up_to_cap_and_rejects_beyond() {
+        let cap = 7usize;
+        assert!(check_total_row_count(cap, cap).is_ok());
+        let err = check_total_row_count(cap + 1, cap).expect_err("cap 超過時は拒否");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn state_budget_accepts_up_to_cap_and_rejects_beyond() {
+        let cap = 100usize;
+        assert_eq!(try_accumulate_state_budget(90, 10, cap).unwrap(), 100);
+        let err = try_accumulate_state_budget(90, 11, cap).expect_err("cap 超過時は拒否");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn state_budget_rejects_on_addition_overflow() {
+        let err = try_accumulate_state_budget(usize::MAX, 1, usize::MAX)
+            .expect_err("オーバーフローは拒否");
+        assert_eq!(err.wire_code(), "54000");
+    }
 }
