@@ -72,7 +72,8 @@ Ed25519 の署名アルゴリズムに対応するダイジェストを libpq �
 を使いたい運用（`channel_binding=require` かつクライアント側が本
 サーバーの制約を把握している場合）は
 `TlsServerConfig::with_scram_channel_binding(true)` の opt-in で有効化
-できる。CLI からの結線は #967 の担当範囲。
+できる。CLI からの結線は `--tls-scram-channel-binding enable|disable`
+（既定 `disable`。`crates/wire-server/src/tls_opt.rs`）が担う。
 
 ## 受け入れ基準への対応
 
@@ -85,7 +86,6 @@ Ed25519 の署名アルゴリズムに対応するダイジェストを libpq �
 
 ## スコープ外
 
-- CLI からの `--scram-channel-binding` 相当のフラグ結線（#967）
 - HTTPS 表層（NoSQL・HTTP-10）へのチャネルバインディング適用
 - libpq 以外のクライアント（psycopg・node-postgres 等）での相互運用実測
 - `PLUS` 提示 opt-in 時に libpq 側の制約を回避する追加実装（証明書の
@@ -100,6 +100,9 @@ Ed25519 の署名アルゴリズムに対応するダイジェストを libpq �
 - `crates/wire-server/src/tls/channel_binding.rs`
 - `crates/wire-server/src/tls/server_handshake.rs`
   （`TlsServerConfig::with_scram_channel_binding`）
+- `crates/wire-server/src/tls_opt.rs`（`--tls-scram-channel-binding` CLI 結線）
 - `crates/wire-server/tests/tls_channel_binding.rs`
 - `crates/wire-server/tests/wire_scram_plus_tls.rs`
 - `crates/wire-server/tests/wire_scram_plus_psql_interop.rs`（手動専用）
+- `crates/wire-server/tests/wire_tls_cli.rs`（R8: `--tls-scram-channel-binding`
+  の CLI 結線・機構リスト反映の結合テスト）
