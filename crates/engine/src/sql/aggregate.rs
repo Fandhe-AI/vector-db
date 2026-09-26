@@ -144,6 +144,48 @@ fn accumulate_text_budget(
     Ok(())
 }
 
+/// `Accumulator::observe` 1 回分の呼び出しと、`MIN`/`MAX(<TEXT 列>)`・
+/// `COUNT(DISTINCT)`（SQL-25 (c)・TASK-209）の両方の累計予算判定をまとめた
+/// 薄いヘルパ。`sql::aggregate` 内の 3 つの observe 呼び出し箇所
+/// （`execute_aggregate_with_cache` の Fast 経路・全走査、
+/// `observe_candidate_slots`）が共有する（`sql::group_by::accumulate_row` は
+/// 独自のグループキー累計・`ResultBudget` 判定を持つため別実装のまま）。
+/// `COUNT(DISTINCT)` の増分は [`Accumulator::distinct_footprint`] の
+/// before/after 差分から求め、新規キー 1 件の確定時のみ
+/// [`crate::sql::distinct::DistinctBudget::charge`] を呼ぶ（既存キーへの
+/// 再ヒットでは計上しない）。
+#[allow(clippy::too_many_arguments)]
+fn observe_with_budgets(
+    accumulator: &mut Accumulator,
+    input: &AggregateInput,
+    id: u64,
+    vector: &RowVector<'_>,
+    scanned: &[Option<row_codec::ScalarRef<'_>>],
+    scratch: &mut Vec<StackValue>,
+    total_text_accumulator_bytes: &mut usize,
+    max_result_bytes: usize,
+    distinct_budget: &mut crate::sql::distinct::DistinctBudget,
+) -> Result<(), SqlSurfaceError> {
+    let text_before = accumulator.text_len();
+    let (entries_before, bytes_before) = accumulator.distinct_footprint();
+    accumulator.observe(input, id, vector, scanned, scratch)?;
+    let text_after = accumulator.text_len();
+    accumulate_text_budget(
+        text_before,
+        text_after,
+        total_text_accumulator_bytes,
+        max_result_bytes,
+    )?;
+    let (entries_after, bytes_after) = accumulator.distinct_footprint();
+    if entries_after > entries_before {
+        let delta = bytes_after.checked_sub(bytes_before).ok_or_else(|| {
+            accumulator_bug("COUNT(DISTINCT) footprint bytes decreased unexpectedly")
+        })?;
+        distinct_budget.charge(delta)?;
+    }
+    Ok(())
+}
+
 /// 可視行 1 件から取り出した `VECTOR` 列の値のビュー（Issue #350）。
 /// [`ReferencedColumns::needs_embedding`] に応じて呼び出し元（`execute_aggregate`・
 /// `sql::group_by::execute_grouped_aggregate`）が `values` を実際にデコード済みの
@@ -430,9 +472,61 @@ pub(crate) enum Accumulator {
     /// 全順序比較。
     TimestampMin(Option<i64>),
     TimestampMax(Option<i64>),
+    /// `COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）。`seen` は正準化済み
+    /// キー（[`Accumulator::observe_distinct`]）の集合、`bytes` はそのキーの
+    /// 累計バイト数（[`Accumulator::distinct_footprint`] が呼び出し元へ公開する
+    /// before/after 差分の元。`sql::group_by::accumulate_row`／
+    /// `sql::aggregate` の各 observe 呼び出し箇所が、この差分を
+    /// [`crate::sql::distinct::DistinctBudget`] へ計上する）。`HashSet` は
+    /// 標準の SipHash（ランダム鍵）で構築されるため hash flooding に強い
+    /// （`.claude/rules/security.md`「不安全な設計」対応。追加の依存を要しない）。
+    CountDistinct {
+        seen: std::collections::HashSet<Vec<u8>>,
+        bytes: usize,
+    },
 }
 
 impl Accumulator {
+    /// [`crate::sql::parser::BoundAggregateItem`] からアキュムレータを作る
+    /// （SQL-25 (c)・TASK-209）。`item.distinct` が `true` なら
+    /// [`Accumulator::CountDistinct`] を、それ以外は既存の [`Self::new`] へ
+    /// 委譲する。`sql::aggregate::execute_aggregate_with_cache`・
+    /// `sql::aggregate::try_scalar_index_aggregate`・
+    /// `sql::group_by::new_accumulators` の 3 箇所（`Accumulator::new` の全直接
+    /// 呼び出し箇所）がこの入口へ切り替わる。
+    pub(crate) fn for_item(
+        item: &crate::sql::parser::BoundAggregateItem,
+    ) -> Result<Self, SqlSurfaceError> {
+        if item.distinct {
+            // 構文層（`Parser::parse_aggregate_item`）・束縛層
+            // （`resolve_count_distinct_input`）が `COUNT` 以外での `distinct`
+            // を構造的に拒否済みのため、ここへ到達する `item.func` は常に
+            // `Count`。念のため多層防御として確認する（`accumulator_bug` は
+            // untrusted 入力起因ではなく実装バグ検出用）。
+            if item.func != AggregateFunc::Count {
+                return Err(accumulator_bug(
+                    "distinct flag set on a non-COUNT aggregate item",
+                ));
+            }
+            return Ok(Accumulator::CountDistinct {
+                seen: std::collections::HashSet::new(),
+                bytes: 0,
+            });
+        }
+        Self::new(item.func, &item.input)
+    }
+
+    /// `CountDistinct` が現在保持しているエントリ数・累計バイト数（それ以外の
+    /// 集計種別は常に `(0, 0)`）。呼び出し元が `observe` 前後でこの値を比較し、
+    /// 新規に確定した増分だけを [`crate::sql::distinct::DistinctBudget::charge`]
+    /// へ計上する（`Self::text_len` の before/after パターンと同じ設計）。
+    pub(crate) fn distinct_footprint(&self) -> (usize, usize) {
+        match self {
+            Accumulator::CountDistinct { seen, bytes } => (seen.len(), *bytes),
+            _ => (0, 0),
+        }
+    }
+
     /// `bind_aggregate`（[`crate::sql::parser::resolve_aggregate_input`]）が型検査
     /// 済みの `(func, input)` から初期状態を作る。ここで到達しない組み合わせが
     /// あれば `bind_aggregate` 側のバグであり、[`accumulator_bug`] で fail-closed に
@@ -550,6 +644,15 @@ impl Accumulator {
         scanned: &[Option<row_codec::ScalarRef<'_>>],
         scratch: &mut Vec<StackValue>,
     ) -> Result<(), SqlSurfaceError> {
+        // SQL-25 (c)・TASK-209: `CountDistinct` は「存在のみを数える」既存の
+        // `observe_present` 系ではなく、実値を正準化したキーの集合で異なり数を
+        // 判定する独立経路（[`Self::observe_distinct`]）を使う。予算計上
+        // （[`crate::sql::distinct::DistinctBudget`]）は呼び出し元が
+        // [`Self::distinct_footprint`] の before/after 差分で行う（本メソッドは
+        // 予算超過を判定しない）。
+        if matches!(self, Accumulator::CountDistinct { .. }) {
+            return self.observe_distinct(input, id, vector, scanned, scratch);
+        }
         match input {
             AggregateInput::AllVisible => self.observe_present(),
             // nullable な `VECTOR` 列（TABLE-5 の `ALTER TABLE ADD COLUMN` で追加
@@ -775,6 +878,205 @@ impl Accumulator {
                 }
             }
         }
+    }
+
+    /// [`Accumulator::CountDistinct`] 専用の観測経路（SQL-25 (c)・TASK-209）。
+    /// `input` の型ごとに実値を正準化した `Vec<u8>` キー（NULL は `None`。
+    /// `COUNT(DISTINCT)` は NULL を除外する PostgreSQL 互換契約）を作り、集合へ
+    /// 挿入する。予算判定はここでは行わず、挿入後のサイズ・累計バイト数の増分
+    /// （[`Self::distinct_footprint`]）を呼び出し元
+    /// （`sql::aggregate`／`sql::group_by::accumulate_row`）が
+    /// [`crate::sql::distinct::DistinctBudget::charge`] へ計上する。
+    fn observe_distinct(
+        &mut self,
+        input: &AggregateInput,
+        id: u64,
+        vector: &RowVector<'_>,
+        scanned: &[Option<row_codec::ScalarRef<'_>>],
+        scratch: &mut Vec<StackValue>,
+    ) -> Result<(), SqlSurfaceError> {
+        let key: Option<Vec<u8>> = match input {
+            AggregateInput::IdU64 => Some(id.to_be_bytes().to_vec()),
+            AggregateInput::TextColumn(index) => scanned
+                .get(*index)
+                .copied()
+                .flatten()
+                .and_then(|v| v.as_text())
+                .map(|s| s.as_bytes().to_vec()),
+            AggregateInput::IntegerColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::Integer(v)) => Some(v.to_be_bytes().to_vec()),
+                Some(_) => {
+                    return Err(accumulator_bug(
+                        "IntegerColumn observed a ScalarRef that is not Integer (distinct)",
+                    ))
+                }
+                None => None,
+            },
+            AggregateInput::BigIntColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::BigInt(v)) => Some(v.to_be_bytes().to_vec()),
+                Some(_) => {
+                    return Err(accumulator_bug(
+                        "BigIntColumn observed a ScalarRef that is not BigInt (distinct)",
+                    ))
+                }
+                None => None,
+            },
+            AggregateInput::RealColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::Real(v)) => {
+                    Some(crate::sql::distinct::canon_f64(f64::from(v)).to_vec())
+                }
+                Some(_) => {
+                    return Err(accumulator_bug(
+                        "RealColumn observed a ScalarRef that is not Real (distinct)",
+                    ))
+                }
+                None => None,
+            },
+            AggregateInput::DoubleColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::Double(v)) => {
+                    Some(crate::sql::distinct::canon_f64(v).to_vec())
+                }
+                Some(_) => {
+                    return Err(accumulator_bug(
+                        "DoubleColumn observed a ScalarRef that is not Double (distinct)",
+                    ))
+                }
+                None => None,
+            },
+            AggregateInput::BooleanColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::Bool(b)) => Some(vec![u8::from(b)]),
+                Some(_) => {
+                    return Err(accumulator_bug(
+                        "BooleanColumn observed a ScalarRef that is not Bool (distinct)",
+                    ))
+                }
+                None => None,
+            },
+            AggregateInput::DateColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(v) => Some(
+                    v.as_date()
+                        .ok_or_else(|| {
+                            accumulator_bug(
+                                "DateColumn observed a ScalarRef that is not Date (distinct)",
+                            )
+                        })?
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
+                None => None,
+            },
+            AggregateInput::TimestampColumn(index) => match scanned.get(*index).copied().flatten()
+            {
+                Some(v) => Some(
+                    v.as_timestamp()
+                        .ok_or_else(|| {
+                            accumulator_bug(
+                                "TimestampColumn observed a ScalarRef that is not Timestamp (distinct)",
+                            )
+                        })?
+                        .to_be_bytes()
+                        .to_vec(),
+                ),
+                None => None,
+            },
+            AggregateInput::ByteaColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::Bytes(b)) => Some(b.to_vec()),
+                Some(_) => {
+                    return Err(accumulator_bug(
+                        "ByteaColumn observed a ScalarRef that is not Bytes (distinct)",
+                    ))
+                }
+                None => None,
+            },
+            AggregateInput::EnumColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::Enum(s)) => Some(s.as_bytes().to_vec()),
+                Some(_) => {
+                    return Err(accumulator_bug(
+                        "EnumColumn observed a ScalarRef that is not Enum (distinct)",
+                    ))
+                }
+                None => None,
+            },
+            AggregateInput::UuidColumn(index) => match scanned.get(*index).copied().flatten() {
+                Some(row_codec::ScalarRef::Uuid(u)) => Some(u.as_bytes().to_vec()),
+                Some(_) => {
+                    return Err(accumulator_bug(
+                        "UuidColumn observed a ScalarRef that is not Uuid (distinct)",
+                    ))
+                }
+                None => None,
+            },
+            AggregateInput::NumericColumn { index, scale, .. } => {
+                match scanned.get(*index).copied().flatten() {
+                    Some(row_codec::ScalarRef::Numeric(d)) => {
+                        if d.scale() != *scale {
+                            return Err(accumulator_bug(
+                                "NumericColumn observed a Decimal whose scale does not match the column (distinct)",
+                            ));
+                        }
+                        Some(d.unscaled().to_be_bytes().to_vec())
+                    }
+                    Some(_) => {
+                        return Err(accumulator_bug(
+                            "NumericColumn observed a ScalarRef that is not Numeric (distinct)",
+                        ))
+                    }
+                    None => None,
+                }
+            }
+            AggregateInput::ScalarExpr { source, program } => {
+                let embedding: &[f32] = if udf_call::references_embedding(source) {
+                    match vector.values {
+                        Some(v) => v,
+                        None => {
+                            return Err(accumulator_bug(
+                                "ScalarExpr references the VECTOR column but the row's embedding was not decoded (distinct)",
+                            ))
+                        }
+                    }
+                } else {
+                    &[]
+                };
+                match program.eval(id, embedding, scratch)? {
+                    ExprValue::Scalar(v) => Some(crate::sql::distinct::canon_f64(v).to_vec()),
+                    _ => {
+                        return Err(accumulator_bug(
+                            "scalar-typed BoundExpr evaluated to a non-scalar value (distinct)",
+                        ))
+                    }
+                }
+            }
+            // `resolve_count_distinct_input` は `AllVisible`／
+            // `VectorColumnPresence`／`ArrayColumn`／`JsonColumn` をいずれも
+            // 生成しない（`VECTOR`／`ARRAY`／`JSON` 列は `22000` で束縛段階で
+            // 拒否し、`COUNT(DISTINCT *)` は構文段階で `42601` で拒否済み）。
+            // 到達したら束縛層の実装バグ。
+            AggregateInput::AllVisible
+            | AggregateInput::VectorColumnPresence
+            | AggregateInput::ArrayColumn(_)
+            | AggregateInput::JsonColumn(_) => {
+                return Err(accumulator_bug(
+                    "COUNT(DISTINCT) accumulator observed an input type that bind-time resolution should have rejected",
+                ))
+            }
+        };
+
+        let (seen, bytes) = match self {
+            Accumulator::CountDistinct { seen, bytes } => (seen, bytes),
+            _ => {
+                return Err(accumulator_bug(
+                    "observe_distinct called on a non-CountDistinct accumulator",
+                ))
+            }
+        };
+        if let Some(key) = key {
+            if seen.insert(key.clone()) {
+                *bytes = bytes.checked_add(key.len()).ok_or_else(|| {
+                    accumulator_bug("COUNT(DISTINCT) accumulated byte count overflowed")
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// NULL・非存在の概念を持たない入力（`*`・`id`・`Scalar` 式）を数えるだけの
@@ -1291,6 +1593,10 @@ impl Accumulator {
             Accumulator::DateMax(m) => m.map(Cell::Date).unwrap_or(Cell::Null),
             Accumulator::TimestampMin(m) => m.map(Cell::Timestamp).unwrap_or(Cell::Null),
             Accumulator::TimestampMax(m) => m.map(Cell::Timestamp).unwrap_or(Cell::Null),
+            // SQL-25 (c)・TASK-209: 空集合・全 NULL はいずれも `0`
+            // （PostgreSQL の `COUNT(DISTINCT ...)` と同じ契約。`COUNT` 一般の
+            // 「空集合で NULL ではなく 0」という既存契約とも一致する）。
+            Accumulator::CountDistinct { seen, .. } => Cell::Integer(seen.len() as u64),
         })
     }
 }
@@ -1415,8 +1721,13 @@ pub(crate) fn execute_aggregate_with_cache(
 
     let mut accumulators = Vec::with_capacity(bound.items.len());
     for item in &bound.items {
-        accumulators.push(Accumulator::new(item.func, &item.input)?);
+        accumulators.push(Accumulator::for_item(item)?);
     }
+    // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
+    // （`GROUP BY` なしの単一行集計なので `accumulators` の全項目の合計）で
+    // 1 つ。Fast 経路（`visible_ids` のみ走査）・全走査のどちらから observe
+    // されても同じ予算を共有する（[`observe_with_budgets`] 参照）。
+    let mut distinct_budget = crate::sql::distinct::DistinctBudget::new();
     // `VECTOR` 列を宣言するスキーマのみ次元検証を行う（`VECTOR` 列を持たない
     // テーブルは `row_codec`/`storage` 側で常に埋め込み次元 0 として符号化される
     // ため検証対象がない）。`arena.rs::validated_vector_dim_in_txn` と異なり
@@ -1501,14 +1812,24 @@ pub(crate) fn execute_aggregate_with_cache(
                     dim: 0,
                     values: None,
                 };
+                // `TextMin`/`TextMax` はこの経路（`AllVisible`/`IdU64`/
+                // `COUNT(DISTINCT id)` のみ到達）には現れないため、`TEXT` 予算の
+                // 累計はこの分岐専用のローカル変数で十分（後続の全走査分岐とは
+                // 独立）。`COUNT(DISTINCT)` の予算（`distinct_budget`）は関数
+                // 全体で共有する。
+                let mut fast_path_text_accumulator_bytes: usize = 0;
                 for &id in snapshot.visible_ids() {
                     for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-                        accumulator.observe(
+                        observe_with_budgets(
+                            accumulator,
                             &item.input,
                             id,
                             &empty_vector,
                             &[],
                             &mut expr_scratch,
+                            &mut fast_path_text_accumulator_bytes,
+                            max_result_bytes,
+                            &mut distinct_budget,
                         )?;
                     }
                 }
@@ -1749,14 +2070,16 @@ pub(crate) fn execute_aggregate_with_cache(
                 },
             };
             for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-                let before = accumulator.text_len();
-                accumulator.observe(&item.input, id, &vector, &scanned, &mut expr_scratch)?;
-                let after = accumulator.text_len();
-                accumulate_text_budget(
-                    before,
-                    after,
+                observe_with_budgets(
+                    accumulator,
+                    &item.input,
+                    id,
+                    &vector,
+                    &scanned,
+                    &mut expr_scratch,
                     &mut total_text_accumulator_bytes,
                     max_result_bytes,
+                    &mut distinct_budget,
                 )?;
             }
         }
@@ -1844,6 +2167,13 @@ pub(crate) fn count_star_only(items: &[crate::sql::parser::BoundAggregateItem]) 
         && items.iter().all(|item| {
             item.func == crate::sql::allowlist::AggregateFunc::Count
                 && matches!(item.input, AggregateInput::AllVisible)
+                // SQL-25 (c)・TASK-209: `COUNT(DISTINCT *)` は構文段
+                // （`Parser::parse_aggregate_item`）で既に `42601` として拒否
+                // 済みのため `AggregateInput::AllVisible` と `distinct: true` が
+                // 両立することはないはずだが、多層防御としてここでも明示的に
+                // 除外する（索引経由の候補数カウントは異なり値の判定を行わない
+                // ため、`distinct` 項目を誤って通すと不正な結果になる）。
+                && !item.distinct
         })
 }
 
@@ -1909,7 +2239,7 @@ fn try_scalar_index_aggregate(
 
     let mut accumulators = Vec::with_capacity(bound.items.len());
     for item in &bound.items {
-        accumulators.push(Accumulator::new(item.func, &item.input)?);
+        accumulators.push(Accumulator::for_item(item)?);
     }
     if count_star_only(&bound.items) {
         // 索引で完全被覆された述語のみ（`classify_scalar_plan` が `PlainScan`
@@ -2094,6 +2424,13 @@ pub(crate) fn observe_candidate_slots(
     let arena = snapshot.arena();
     let mut expr_scratch: Vec<StackValue> = Vec::new();
     let mut total_text_accumulator_bytes: usize = 0;
+    // SQL-25 (c)・TASK-209: `COUNT(DISTINCT)` の中間状態はクエリ全体
+    // （`accumulators` の全項目の合計）で 1 つ。索引経路が超過した場合は
+    // `is_aggregate_text_budget_error` に一致しない別文言のため呼び出し元
+    // （`try_scalar_index_aggregate`）が全走査へフォールバックせず、そのまま
+    // `54000` を返す（異なり値の集合は処理順序に依存しない単調増加のため、
+    // 索引経路と全走査で成否が変わってはならない）。
+    let mut distinct_budget = crate::sql::distinct::DistinctBudget::new();
     'candidates: for &slot in slots {
         let slot_idx = usize::try_from(slot)
             .map_err(|_| accumulator_bug("candidate slot does not fit in usize"))?;
@@ -2169,14 +2506,16 @@ pub(crate) fn observe_candidate_slots(
             },
         };
         for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-            let before = accumulator.text_len();
-            accumulator.observe(&item.input, id, &vector, &scanned, &mut expr_scratch)?;
-            let after = accumulator.text_len();
-            accumulate_text_budget(
-                before,
-                after,
+            observe_with_budgets(
+                accumulator,
+                &item.input,
+                id,
+                &vector,
+                &scanned,
+                &mut expr_scratch,
                 &mut total_text_accumulator_bytes,
                 max_result_bytes,
+                &mut distinct_budget,
             )?;
         }
     }
@@ -2377,6 +2716,7 @@ mod tests {
                 func,
                 input,
                 name: "result".to_string(),
+                distinct: false,
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
@@ -2401,6 +2741,7 @@ mod tests {
                 func,
                 input: input.clone(),
                 name: format!("result_{i}"),
+                distinct: false,
             })
             .collect();
         let projection = (0..count)
@@ -3462,6 +3803,7 @@ mod tests {
                 func: AggregateFunc::Count,
                 input: input.clone(),
                 name: "result".to_string(),
+                distinct: false,
             }];
             let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
             assert!(
@@ -3502,6 +3844,7 @@ mod tests {
             func: AggregateFunc::Count,
             input: AggregateInput::AllVisible,
             name: "result".to_string(),
+            distinct: false,
         }];
         let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
         assert_eq!(select_decode_tier(&referenced, false), DecodeTier::Fast);
@@ -3516,6 +3859,7 @@ mod tests {
             func: AggregateFunc::Count,
             input: AggregateInput::VectorColumnPresence,
             name: "result".to_string(),
+            distinct: false,
         }];
         let referenced = ReferencedColumns::derive(&schema, &items, &[], &[], &[], &[]);
         assert!(!referenced.needs_embedding());
