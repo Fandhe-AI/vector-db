@@ -258,8 +258,9 @@ JSON 本文の構文受理規則は `engine::json`（NOSQL-8）に従う: ネス
 応答には `score` 列相当が一切含まれない（`ORDER BY`／`hybrid` を経由しないため
 合成スコア列が構造上存在しない）。
 
-`explain: true` は `scan`（SQL-15 の bare 形）への `EXPLAIN` 前置が拒否される
-契約の写像として `42601`。
+`explain: true` は NOSQL-16（Issue #948）で対応するまで `42601`（SQL 表層は
+Issue #922・SQL-27 で `scan` 相当の広域取得への `EXPLAIN` 前置を受理済みだが、
+NoSQL 表層の束縛済み計画向けエントリはまだこれを結線していない）。
 
 ### `aggregate`
 
@@ -573,8 +574,9 @@ SQL `EXPLAIN SELECT ... USING PLAN(...)` と同一内容を返す。
 
 - `vector` 指定＋`explain: true` → `42601`
 - `plan` 欠落＋`explain: true`（`vector`も欠落）→ `42601`
-- `scan`／`aggregate` への `explain: true` → `42601`（別 op なので `search` の
-  上記条件とは独立に、各 op のハンドラが拒否する）
+- `scan`／`aggregate` への `explain: true` → `42601`（NOSQL-16・Issue #948 で
+  対応するまで。別 op なので `search` の上記条件とは独立に、各 op のハンドラが
+  拒否する）
 
 検証コード: `crates/wire-server/tests/nosql10_explain.rs`・`wire_explain.rs`。
 
