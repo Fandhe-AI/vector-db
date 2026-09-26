@@ -952,9 +952,18 @@ impl PartialOrd for HeapEntry {
 }
 
 /// `entry` が保持するバイト量の概算（TEXT キーの所有バイト・`tenant_id`・
-/// 構造体分。予算計上・解放の対称な単位として使う。Issue #915）。
+/// `keys` 配列自体のヒープ確保量（容量ベース）・構造体分。予算計上・解放の
+/// 対称な単位として使う（Issue #915・codex-review PR #1096 P1 是正:
+/// `keys: Vec<Option<OrderValue>>` の配列容量が未計上だと、複数キー・大きい
+/// `LIMIT + OFFSET` で配列本体が `max_result_bytes` の外側に蓄積し得た）。
 fn heap_entry_bytes(entry: &HeapEntry) -> usize {
     let mut bytes = std::mem::size_of::<HeapEntry>();
+    bytes = bytes.saturating_add(
+        entry
+            .keys
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<OrderValue>>()),
+    );
     for key in &entry.keys {
         if let Some(OrderValue::Bytes(b)) = key {
             bytes = bytes.saturating_add(b.len());
@@ -1689,6 +1698,34 @@ mod tests {
             "combined candidate+result bytes must exceed the caller-supplied cap on path (B)",
         );
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// codex-review PR #1096 P1 是正の回帰: `heap_entry_bytes` が `keys:
+    /// Vec<Option<OrderValue>>` 配列自体の確保量（容量ベース）を計上することを
+    /// 検証する。旧実装は構造体本体・TEXT 実体・`tenant_id` のみを数え、複数
+    /// キー指定時の配列本体を予算の外側に置いていた（Issue #915）。
+    #[test]
+    fn heap_entry_bytes_accounts_for_keys_array_capacity() {
+        let spec: Rc<[BoundOrderKey]> = Rc::from(Vec::<BoundOrderKey>::new());
+        let make_entry = |key_count: usize| HeapEntry {
+            keys: vec![None; key_count],
+            tenant_id: "tenant-a".to_string(),
+            id: 1,
+            spec: Rc::clone(&spec),
+        };
+
+        let one_key = make_entry(1);
+        let eight_keys = make_entry(8);
+        let option_order_value_size = std::mem::size_of::<Option<OrderValue>>();
+
+        // 8 キー分の配列は 1 キー分より少なくとも 7 要素分（`Option<OrderValue>`
+        // 換算）大きい。未計上のまま容量を無視すると差分は 0 になる。
+        let diff = heap_entry_bytes(&eight_keys) - heap_entry_bytes(&one_key);
+        assert!(
+            diff >= option_order_value_size * 7,
+            "keys 配列の容量差が heap_entry_bytes に反映されていない: diff={diff}, \
+             option_order_value_size={option_order_value_size}"
+        );
     }
 
     #[test]
